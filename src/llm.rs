@@ -115,7 +115,7 @@ pub fn request_phrase(
         Ok(p) => p,
         Err(err) => {
             warn_once(&err.to_string());
-            on_done(None);
+            glib::idle_add_local_once(move || on_done(None));
             return request;
         }
     };
@@ -307,6 +307,15 @@ mod tests {
         let got = run_request(r#"command = ["echo", "こんにちは"]"#, "prompt");
         // echo は引数を空白連結で 1 行に出力するため "こんにちは prompt" になる
         assert_eq!(got.as_deref(), Some("こんにちは prompt"));
+    }
+
+    #[test]
+    fn request_phrase_reports_spawn_failure() {
+        let got = run_request(
+            r#"command = ["/nonexistent-miryam-test-cmd"]"#,
+            "prompt",
+        );
+        assert!(got.is_none(), "spawn 失敗は None のはず");
     }
 
     #[test]
