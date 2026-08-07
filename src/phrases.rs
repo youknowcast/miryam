@@ -212,7 +212,6 @@ impl PhraseBook {
         self.llm.as_ref()
     }
 
-    #[allow(dead_code)]
     pub fn skin(&self) -> Option<&str> {
         self.skin.as_ref().map(|s| s.name.as_str())
     }
