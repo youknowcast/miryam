@@ -5,10 +5,12 @@ mod system;
 mod ui;
 
 use gtk4 as gtk;
-use gtk::{glib, prelude::*};
-use std::cell::RefCell;
+use gtk::{gio, glib, prelude::*};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+const QUIT_DELAY_SECS: u64 = 2;
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder()
@@ -39,13 +41,43 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     let book = Rc::new(phrases::PhraseBook::load()?);
     let ui = Rc::new(ui::build(app, book.skin())?);
     let timers = Rc::new(RefCell::new(Timers::default()));
+    let muted = Rc::new(Cell::new(false));
+    let quitting = Rc::new(Cell::new(false));
 
-    schedule_next_speech(book.clone(), ui.clone(), timers.clone(), started_at);
+    register_actions(app, &book, &ui, &timers, &muted, &quitting, started_at);
 
-    let (book_c, ui_c, timers_c) = (book.clone(), ui.clone(), timers.clone());
+    schedule_next_speech(
+        book.clone(), ui.clone(), timers.clone(),
+        muted.clone(), quitting.clone(), started_at,
+    );
+    schedule_chime(
+        book.clone(), ui.clone(), timers.clone(),
+        muted.clone(), quitting.clone(), started_at,
+    );
+
+    // 起動挨拶 (1 秒後)
+    {
+        let (book, ui, timers, quitting) =
+            (book.clone(), ui.clone(), timers.clone(), quitting.clone());
+        glib::timeout_add_local_once(Duration::from_secs(1), move || {
+            if !quitting.get() {
+                speak_event(&book, &ui, &timers, phrases::EventKind::Boot, started_at);
+            }
+        });
+    }
+
+    let (book_c, ui_c, timers_c, muted_c, quitting_c) = (
+        book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+    );
     ui.connect_character_clicked(move || {
+        if quitting_c.get() {
+            return;
+        }
         speak(&book_c, &ui_c, &timers_c, started_at);
-        schedule_next_speech(book_c.clone(), ui_c.clone(), timers_c.clone(), started_at);
+        schedule_next_speech(
+            book_c.clone(), ui_c.clone(), timers_c.clone(),
+            muted_c.clone(), quitting_c.clone(), started_at,
+        );
     });
 
     Ok(())
@@ -80,7 +112,30 @@ fn speak(
     if let Some(req) = pending {
         req.cancel();
     }
-    show_text(ui, timers, book.pick(&phrases::Snapshot::current(started_at)));
+    let now = phrases::Snapshot::current(started_at);
+    let text = phrases::substitute_placeholders(book.pick(&now), &now);
+    show_text(ui, timers, &text);
+}
+
+/// イベント台詞を選んで表示する。プールが空なら何もせず false
+fn speak_event(
+    book: &Rc<phrases::PhraseBook>,
+    ui: &Rc<ui::MascotUi>,
+    timers: &Rc<RefCell<Timers>>,
+    event: phrases::EventKind,
+    started_at: Instant,
+) -> bool {
+    let now = phrases::Snapshot::current(started_at);
+    let Some(text) = book.pick_event(event, &now) else {
+        return false;
+    };
+    let text = phrases::substitute_placeholders(text, &now);
+    let pending = timers.borrow_mut().llm_request.take();
+    if let Some(req) = pending {
+        req.cancel();
+    }
+    show_text(ui, timers, &text);
+    true
 }
 
 /// 定期発話: [llm] 有効 かつ 確率に当選 かつ in-flight なし なら LLM、それ以外は辞書
@@ -117,6 +172,8 @@ fn schedule_next_speech(
     book: Rc<phrases::PhraseBook>,
     ui: Rc<ui::MascotUi>,
     timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
     started_at: Instant,
 ) {
     if let Some(id) = timers.borrow_mut().next_speech.take() {
@@ -125,8 +182,99 @@ fn schedule_next_speech(
     let timers_c = timers.clone();
     let id = glib::timeout_add_local_once(scheduler::next_speech_interval(), move || {
         timers_c.borrow_mut().next_speech = None;
-        scheduled_speak(&book, &ui, &timers_c, started_at);
-        schedule_next_speech(book.clone(), ui.clone(), timers_c.clone(), started_at);
+        if !quitting.get() && !muted.get() {
+            scheduled_speak(&book, &ui, &timers_c, started_at);
+        }
+        schedule_next_speech(
+            book.clone(), ui.clone(), timers_c.clone(),
+            muted.clone(), quitting.clone(), started_at,
+        );
     });
     timers.borrow_mut().next_speech = Some(id);
+}
+
+/// 次の毎時 0 分に時報を予約する。発火後は再帰的に再予約 (毎回現在時刻から再計算)
+fn schedule_chime(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    started_at: Instant,
+) {
+    use chrono::Timelike;
+    let local = chrono::Local::now();
+    let wait = scheduler::duration_until_next_hour(local.minute(), local.second());
+    glib::timeout_add_local_once(wait, move || {
+        if !quitting.get() && !muted.get() {
+            speak_event(&book, &ui, &timers, phrases::EventKind::Chime, started_at);
+        }
+        schedule_chime(
+            book.clone(), ui.clone(), timers.clone(),
+            muted.clone(), quitting.clone(), started_at,
+        );
+    });
+}
+
+fn register_actions(
+    app: &gtk::Application,
+    book: &Rc<phrases::PhraseBook>,
+    ui: &Rc<ui::MascotUi>,
+    timers: &Rc<RefCell<Timers>>,
+    muted: &Rc<Cell<bool>>,
+    quitting: &Rc<Cell<bool>>,
+    started_at: Instant,
+) {
+    let speak_now = gio::SimpleAction::new("speak-now", None);
+    {
+        let (book, ui, timers, muted_r, quitting) = (
+            book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+        );
+        speak_now.connect_activate(move |_, _| {
+            if quitting.get() {
+                return;
+            }
+            speak(&book, &ui, &timers, started_at);
+            schedule_next_speech(
+                book.clone(), ui.clone(), timers.clone(),
+                muted_r.clone(), quitting.clone(), started_at,
+            );
+        });
+    }
+    app.add_action(&speak_now);
+
+    let mute = gio::SimpleAction::new_stateful("mute", None, &false.to_variant());
+    {
+        let muted = muted.clone();
+        mute.connect_activate(move |action, _| {
+            let next = !muted.get();
+            muted.set(next);
+            action.set_state(&next.to_variant());
+        });
+    }
+    app.add_action(&mute);
+
+    let quit_request = gio::SimpleAction::new("quit-request", None);
+    {
+        let app_weak = app.downgrade();
+        let (book, ui, timers, quitting) =
+            (book.clone(), ui.clone(), timers.clone(), quitting.clone());
+        quit_request.connect_activate(move |_, _| {
+            if quitting.replace(true) {
+                return;
+            }
+            let spoke = speak_event(&book, &ui, &timers, phrases::EventKind::Quit, started_at);
+            let app_weak = app_weak.clone();
+            if spoke {
+                glib::timeout_add_local_once(Duration::from_secs(QUIT_DELAY_SECS), move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        app.quit();
+                    }
+                });
+            } else if let Some(app) = app_weak.upgrade() {
+                app.quit();
+            }
+        });
+    }
+    app.add_action(&quit_request);
 }
