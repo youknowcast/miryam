@@ -321,4 +321,31 @@ mod tests {
         assert!(elapsed.as_secs() >= 1, "即時失敗ではなくタイムアウト経路を通るはず");
         assert!(elapsed.as_secs() < 10, "1 秒タイムアウトが効いていない");
     }
+
+    #[test]
+    fn cancelled_request_never_calls_on_done() {
+        let _lock = MAIN_CONTEXT_LOCK.lock().unwrap();
+        let cfg: LlmConfig =
+            toml::from_str(r#"command = ["bash", "-c", "sleep 2"]"#).unwrap();
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().unwrap();
+        let ml = glib::MainLoop::new(None, false);
+        let called = Rc::new(Cell::new(false));
+
+        let called_c = called.clone();
+        let req = request_phrase(&cfg, "prompt", move |_| {
+            called_c.set(true);
+        });
+
+        // 200ms 後にキャンセルし、その後 1.5 秒でループを抜けて未呼び出しを確認
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            req.cancel();
+        });
+        let ml_c = ml.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+            ml_c.quit();
+        });
+        ml.run();
+        assert!(!called.get(), "cancel されたリクエストの on_done は呼ばれないはず");
+    }
 }
