@@ -1,0 +1,12 @@
+[package]
+name = "miryam"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+anyhow = "1"
