@@ -27,6 +27,7 @@ fn main() -> glib::ExitCode {
 struct Timers {
     next_speech: Option<glib::SourceId>,
     hide_bubble: Option<glib::SourceId>,
+    llm_request: Option<llm::LlmRequest>,
 }
 
 fn activate(app: &gtk::Application) -> anyhow::Result<()> {
@@ -50,14 +51,9 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 台詞を表示し、6 秒後の自動消去タイマーを張り直す
-fn speak(
-    book: &Rc<phrases::PhraseBook>,
-    ui: &Rc<ui::MascotUi>,
-    timers: &Rc<RefCell<Timers>>,
-    started_at: Instant,
-) {
-    ui.show_bubble(book.pick(&phrases::Snapshot::current(started_at)));
+/// テキストを吹き出しに表示し、6 秒後の自動消去タイマーを張り直す
+fn show_text(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text: &str) {
+    ui.show_bubble(text);
     if let Some(id) = timers.borrow_mut().hide_bubble.take() {
         id.remove();
     }
@@ -73,6 +69,48 @@ fn speak(
     timers.borrow_mut().hide_bubble = Some(id);
 }
 
+/// 辞書から台詞を選んで表示する。進行中の LLM リクエストはキャンセルする (キャンセル規則)
+fn speak(
+    book: &Rc<phrases::PhraseBook>,
+    ui: &Rc<ui::MascotUi>,
+    timers: &Rc<RefCell<Timers>>,
+    started_at: Instant,
+) {
+    if let Some(req) = timers.borrow_mut().llm_request.take() {
+        req.cancel();
+    }
+    show_text(ui, timers, book.pick(&phrases::Snapshot::current(started_at)));
+}
+
+/// 定期発話: [llm] 有効 かつ 確率に当選 かつ in-flight なし なら LLM、それ以外は辞書
+fn scheduled_speak(
+    book: &Rc<phrases::PhraseBook>,
+    ui: &Rc<ui::MascotUi>,
+    timers: &Rc<RefCell<Timers>>,
+    started_at: Instant,
+) {
+    let use_llm = book.llm().is_some_and(|cfg| {
+        use rand::RngExt;
+        timers.borrow().llm_request.is_none()
+            && rand::rng().random_range(0.0..1.0) < cfg.probability
+    });
+    if !use_llm {
+        speak(book, ui, timers, started_at);
+        return;
+    }
+    let cfg = book.llm().expect("use_llm なら Some");
+    let prompt = llm::build_prompt(cfg, &phrases::Snapshot::current(started_at));
+    let (book_c, ui_c, timers_c) = (book.clone(), ui.clone(), timers.clone());
+    let req = llm::request_phrase(cfg, &prompt, move |result| {
+        timers_c.borrow_mut().llm_request = None;
+        match result {
+            Some(text) => show_text(&ui_c, &timers_c, &text),
+            None => speak(&book_c, &ui_c, &timers_c, started_at),
+        }
+    });
+    timers.borrow_mut().llm_request = Some(req);
+}
+
 /// 30〜90 秒後の次回発話をスケジュールする。既存の予約はキャンセルする
 fn schedule_next_speech(
     book: Rc<phrases::PhraseBook>,
@@ -86,7 +124,7 @@ fn schedule_next_speech(
     let timers_c = timers.clone();
     let id = glib::timeout_add_local_once(scheduler::next_speech_interval(), move || {
         timers_c.borrow_mut().next_speech = None;
-        speak(&book, &ui, &timers_c, started_at);
+        scheduled_speak(&book, &ui, &timers_c, started_at);
         schedule_next_speech(book.clone(), ui.clone(), timers_c.clone(), started_at);
     });
     timers.borrow_mut().next_speech = Some(id);
