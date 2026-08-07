@@ -44,6 +44,75 @@ impl PhraseBook {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TimeBand {
+    Morning,
+    Daytime,
+    Evening,
+    Night,
+}
+
+impl TimeBand {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        Ok(match s {
+            "morning" => Self::Morning,
+            "daytime" => Self::Daytime,
+            "evening" => Self::Evening,
+            "night" => Self::Night,
+            other => anyhow::bail!(
+                "不明な時間帯です: {other} (morning / daytime / evening / night)"
+            ),
+        })
+    }
+
+    fn contains(self, hour: u32) -> bool {
+        match self {
+            Self::Morning => (5..11).contains(&hour),
+            Self::Daytime => (11..17).contains(&hour),
+            Self::Evening => (17..22).contains(&hour),
+            Self::Night => hour >= 22 || hour < 5,
+        }
+    }
+}
+
+fn parse_weekday(s: &str) -> anyhow::Result<chrono::Weekday> {
+    use chrono::Weekday::*;
+    Ok(match s {
+        "mon" => Mon,
+        "tue" => Tue,
+        "wed" => Wed,
+        "thu" => Thu,
+        "fri" => Fri,
+        "sat" => Sat,
+        "sun" => Sun,
+        other => anyhow::bail!("不明な曜日です: {other} (mon/tue/wed/thu/fri/sat/sun)"),
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct MonthDay {
+    month: u32,
+    day: u32,
+}
+
+impl MonthDay {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let (m, d) = s
+            .split_once('-')
+            .with_context(|| format!("日付は MM-DD 形式で指定してください: {s}"))?;
+        if m.len() != 2 || d.len() != 2 {
+            anyhow::bail!("日付は MM-DD 形式 (ゼロ埋め 2 桁) で指定してください: {s}");
+        }
+        let month: u32 = m.parse().with_context(|| format!("月が数値ではありません: {s}"))?;
+        let day: u32 = d.parse().with_context(|| format!("日が数値ではありません: {s}"))?;
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            anyhow::bail!("日付が範囲外です: {s} (月 01-12, 日 01-31)");
+        }
+        Ok(Self { month, day })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +145,56 @@ mod tests {
     fn embedded_default_is_valid() {
         let book = PhraseBook::from_toml_str(DEFAULT_PHRASES_TOML).unwrap();
         assert!(!book.phrases.is_empty());
+    }
+
+    #[test]
+    fn time_band_boundaries() {
+        use TimeBand::*;
+        for (hour, band) in [
+            (0, Night),
+            (4, Night),
+            (5, Morning),
+            (10, Morning),
+            (11, Daytime),
+            (16, Daytime),
+            (17, Evening),
+            (21, Evening),
+            (22, Night),
+            (23, Night),
+        ] {
+            assert!(band.contains(hour), "hour {hour} は {band:?} のはず");
+        }
+        assert!(!Morning.contains(4));
+        assert!(!Night.contains(5));
+        assert!(!Daytime.contains(17));
+        assert!(!Evening.contains(22));
+    }
+
+    #[test]
+    fn parses_time_band_names() {
+        assert_eq!(TimeBand::parse("morning").unwrap(), TimeBand::Morning);
+        assert_eq!(TimeBand::parse("daytime").unwrap(), TimeBand::Daytime);
+        assert_eq!(TimeBand::parse("evening").unwrap(), TimeBand::Evening);
+        assert_eq!(TimeBand::parse("night").unwrap(), TimeBand::Night);
+        assert!(TimeBand::parse("noon").is_err());
+        assert!(TimeBand::parse("Morning").is_err());
+    }
+
+    #[test]
+    fn parses_weekday_names() {
+        use chrono::Weekday;
+        assert_eq!(parse_weekday("mon").unwrap(), Weekday::Mon);
+        assert_eq!(parse_weekday("sun").unwrap(), Weekday::Sun);
+        assert!(parse_weekday("monday").is_err());
+        assert!(parse_weekday("MON").is_err());
+    }
+
+    #[test]
+    fn parses_month_day() {
+        assert_eq!(MonthDay::parse("12-25").unwrap(), MonthDay { month: 12, day: 25 });
+        assert_eq!(MonthDay::parse("02-29").unwrap(), MonthDay { month: 2, day: 29 });
+        for bad in ["1-1", "13-01", "12-32", "00-10", "12-00", "1225", "12-2x", "12/25"] {
+            assert!(MonthDay::parse(bad).is_err(), "{bad} はエラーのはず");
+        }
     }
 }
