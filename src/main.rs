@@ -1,3 +1,4 @@
+mod control;
 mod llm;
 mod phrases;
 mod scheduler;
