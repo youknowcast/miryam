@@ -1,6 +1,6 @@
 use anyhow::Context;
 use gtk4 as gtk;
-use gtk::{gdk, gio, glib, prelude::*};
+use gtk::{gdk, gdk_pixbuf, gio, glib, prelude::*};
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
 const DEFAULT_CHARACTER_PNG: &[u8] = include_bytes!("../assets/character.png");
@@ -110,11 +110,15 @@ fn skin_character_path(config_dir: &std::path::Path, name: &str) -> std::path::P
 }
 
 /// 解決順序: [skin] 指定 (欠落は起動エラー) → 旧 character.png → 埋め込み仮画像
+///
+/// いずれの経路も表示上限 (CHARACTER_WIDTH x CHARACTER_HEIGHT) に収まるよう
+/// アスペクト比を保って縮小デコードする (窓サイズが画像の元ピクセルサイズに
+/// 膨張するのを防ぐため)。
 fn load_character_texture(skin: Option<&str>) -> anyhow::Result<gdk::Texture> {
     let config_dir = glib::user_config_dir();
     if let Some(name) = skin {
         let path = skin_character_path(&config_dir, name);
-        return gdk::Texture::from_filename(&path).with_context(|| {
+        return texture_from_file_scaled(&path).with_context(|| {
             format!(
                 "スキン \"{name}\" の画像を読み込めません: {}",
                 path.display()
@@ -123,11 +127,43 @@ fn load_character_texture(skin: Option<&str>) -> anyhow::Result<gdk::Texture> {
     }
     let legacy = config_dir.join("miryam").join("character.png");
     if legacy.exists() {
-        return gdk::Texture::from_filename(&legacy)
+        return texture_from_file_scaled(&legacy)
             .with_context(|| format!("{} の読み込みに失敗しました", legacy.display()));
     }
-    gdk::Texture::from_bytes(&glib::Bytes::from_static(DEFAULT_CHARACTER_PNG))
+    texture_from_bytes_scaled(DEFAULT_CHARACTER_PNG)
         .context("埋め込みキャラクター画像のデコードに失敗しました")
+}
+
+/// ファイルパスの画像を表示上限に収まるよう縮小デコードしてテクスチャ化する
+fn texture_from_file_scaled(path: &std::path::Path) -> anyhow::Result<gdk::Texture> {
+    let pixbuf =
+        gdk_pixbuf::Pixbuf::from_file_at_scale(path, CHARACTER_WIDTH, CHARACTER_HEIGHT, true)?;
+    Ok(gdk::Texture::for_pixbuf(&pixbuf))
+}
+
+/// 埋め込みバイト列を表示上限に収まるよう縮小デコードしてテクスチャ化する
+fn texture_from_bytes_scaled(bytes: &'static [u8]) -> anyhow::Result<gdk::Texture> {
+    let loader = gdk_pixbuf::PixbufLoader::new();
+    loader.write(bytes)?;
+    loader.close()?;
+    let pixbuf = loader.pixbuf().context("デコード結果を取得できませんでした")?;
+    let pixbuf = scale_to_fit(&pixbuf, CHARACTER_WIDTH, CHARACTER_HEIGHT);
+    Ok(gdk::Texture::for_pixbuf(&pixbuf))
+}
+
+/// アスペクト比を保ったまま (max_w, max_h) の枠に収まるよう縮小する。
+/// 既に枠内に収まっている場合はそのまま返す (拡大はしない)。
+fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_w: i32, max_h: i32) -> gdk_pixbuf::Pixbuf {
+    let (w, h) = (pixbuf.width(), pixbuf.height());
+    if w <= max_w && h <= max_h {
+        return pixbuf.clone();
+    }
+    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+    let dest_w = ((w as f64 * scale).round() as i32).max(1);
+    let dest_h = ((h as f64 * scale).round() as i32).max(1);
+    pixbuf
+        .scale_simple(dest_w, dest_h, gdk_pixbuf::InterpType::Bilinear)
+        .unwrap_or_else(|| pixbuf.clone())
 }
 
 /// クリックを受けるのはキャラ画像の矩形のみ。透明部分と吹き出しは下のアプリへ素通し
