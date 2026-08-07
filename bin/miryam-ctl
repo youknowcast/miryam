@@ -1,0 +1,37 @@
+#!/bin/sh
+# miryam を外部から操作する CLI (gdbus ラッパー)
+# usage: miryam-ctl say <text...>
+#        miryam-ctl timer <duration(s|m|h)> [message...]
+set -eu
+
+usage() {
+    echo "usage: miryam-ctl say <text...>" >&2
+    echo "       miryam-ctl timer <duration(s|m|h)> [message...]" >&2
+    exit 2
+}
+
+[ "$#" -ge 2 ] || usage
+action=$1
+shift
+case "$action" in
+    say | timer) ;;
+    *) usage ;;
+esac
+text="$*"
+
+# GVariant テキスト形式のエスケープ: バックスラッシュ → シングルクォート → 改行 の順
+escaped=$(printf '%s' "$text" \
+    | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g" \
+    | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g')
+
+if ! out=$(gdbus call --session \
+    --dest dev.youknow.miryam \
+    --object-path /dev/youknow/miryam \
+    --method org.gtk.Actions.Activate \
+    "$action" "[<'$escaped'>]" "{}" 2>&1); then
+    case "$out" in
+        *ServiceUnknown*) echo "miryam-ctl: miryam is not running" >&2 ;;
+        *) echo "miryam-ctl: $out" >&2 ;;
+    esac
+    exit 1
+fi

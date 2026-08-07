@@ -118,6 +118,31 @@ fn speak(
     show_text(ui, timers, &text);
 }
 
+/// 外部由来テキストの発話 (postprocess 済み前提): LLM キャンセル + 表示 + 次回定期発話の張り直し
+fn external_speak(
+    book: &Rc<phrases::PhraseBook>,
+    ui: &Rc<ui::MascotUi>,
+    timers: &Rc<RefCell<Timers>>,
+    muted: &Rc<Cell<bool>>,
+    quitting: &Rc<Cell<bool>>,
+    started_at: Instant,
+    text: &str,
+) {
+    let pending = timers.borrow_mut().llm_request.take();
+    if let Some(req) = pending {
+        req.cancel();
+    }
+    show_text(ui, timers, text);
+    schedule_next_speech(
+        book.clone(),
+        ui.clone(),
+        timers.clone(),
+        muted.clone(),
+        quitting.clone(),
+        started_at,
+    );
+}
+
 /// イベント台詞を選んで表示する。プールが空なら何もせず false
 fn speak_event(
     book: &Rc<phrases::PhraseBook>,
@@ -278,4 +303,89 @@ fn register_actions(
         });
     }
     app.add_action(&quit_request);
+
+    // 外部発話: miryam-ctl say <text>
+    let say = gio::SimpleAction::new("say", Some(glib::VariantTy::STRING));
+    {
+        let (book, ui, timers, muted_r, quitting) = (
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+        );
+        say.connect_activate(move |_, param| {
+            if quitting.get() {
+                return;
+            }
+            let Some(raw) = param.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            let Some(text) = llm::postprocess(&raw) else {
+                return;
+            };
+            external_speak(&book, &ui, &timers, &muted_r, &quitting, started_at, &text);
+        });
+    }
+    app.add_action(&say);
+
+    // 外部タイマー: miryam-ctl timer <duration> [message...]
+    let timer_action = gio::SimpleAction::new("timer", Some(glib::VariantTy::STRING));
+    {
+        let (book, ui, timers, muted_r, quitting) = (
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+        );
+        let app_weak = app.downgrade();
+        timer_action.connect_activate(move |_, param| {
+            if quitting.get() {
+                return;
+            }
+            let Some(spec) = param.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            match control::parse_timer_spec(&spec) {
+                Ok((wait, message)) => {
+                    let text = llm::postprocess(&message)
+                        .unwrap_or_else(|| control::DEFAULT_TIMER_MESSAGE.to_string());
+                    let (book, ui, timers, muted_r, quitting) = (
+                        book.clone(),
+                        ui.clone(),
+                        timers.clone(),
+                        muted_r.clone(),
+                        quitting.clone(),
+                    );
+                    let app_weak = app_weak.clone();
+                    glib::timeout_add_local_once(wait, move || {
+                        if quitting.get() {
+                            return;
+                        }
+                        external_speak(
+                            &book, &ui, &timers, &muted_r, &quitting, started_at, &text,
+                        );
+                        if let Some(app) = app_weak.upgrade() {
+                            let n = gio::Notification::new("miryam");
+                            n.set_body(Some(&text));
+                            app.send_notification(None, &n);
+                        }
+                    });
+                }
+                Err(_) => {
+                    external_speak(
+                        &book,
+                        &ui,
+                        &timers,
+                        &muted_r,
+                        &quitting,
+                        started_at,
+                        "タイマーの指定がわかりません",
+                    );
+                }
+            }
+        });
+    }
+    app.add_action(&timer_action);
 }
