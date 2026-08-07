@@ -134,10 +134,11 @@ fn load_character_texture(skin: Option<&str>) -> anyhow::Result<gdk::Texture> {
         .context("埋め込みキャラクター画像のデコードに失敗しました")
 }
 
-/// ファイルパスの画像を表示上限に収まるよう縮小デコードしてテクスチャ化する
+/// ファイルパスの画像を表示上限に収まるよう縮小デコードしてテクスチャ化する。
+/// 上限より小さい画像を拡大することはない (scale_to_fit を参照)。
 fn texture_from_file_scaled(path: &std::path::Path) -> anyhow::Result<gdk::Texture> {
-    let pixbuf =
-        gdk_pixbuf::Pixbuf::from_file_at_scale(path, CHARACTER_WIDTH, CHARACTER_HEIGHT, true)?;
+    let pixbuf = gdk_pixbuf::Pixbuf::from_file(path)?;
+    let pixbuf = scale_to_fit(&pixbuf, CHARACTER_WIDTH, CHARACTER_HEIGHT);
     Ok(gdk::Texture::for_pixbuf(&pixbuf))
 }
 
