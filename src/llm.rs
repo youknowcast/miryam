@@ -1,3 +1,9 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use gtk4 as gtk;
+use gtk::{gio, glib, prelude::*};
 use serde::Deserialize;
 
 use crate::phrases::Snapshot;
@@ -62,6 +68,109 @@ pub fn build_prompt(config: &LlmConfig, now: &Snapshot) -> String {
 pub fn postprocess(stdout: &str) -> Option<String> {
     let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
     Some(line.chars().take(60).collect())
+}
+
+/// 進行中の LLM リクエストのハンドル。cancel() すると結果は破棄され on_done は呼ばれない
+pub struct LlmRequest {
+    cancellable: gio::Cancellable,
+    cancelled: Rc<Cell<bool>>,
+}
+
+impl LlmRequest {
+    pub fn cancel(&self) {
+        self.cancelled.set(true);
+        self.cancellable.cancel();
+    }
+}
+
+fn warn_once(detail: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("miryam: LLM 台詞の生成に失敗しました (辞書にフォールバック): {detail}");
+    }
+}
+
+/// CLI を非同期実行し、完了時に on_done をメインループ上で呼ぶ。
+/// 失敗 (spawn 失敗・非ゼロ終了・タイムアウト・空出力) は on_done(None)。
+/// 呼び出し元が cancel() した場合は on_done を呼ばない。
+pub fn request_phrase(
+    config: &LlmConfig,
+    prompt: &str,
+    on_done: impl FnOnce(Option<String>) + 'static,
+) -> LlmRequest {
+    let cancellable = gio::Cancellable::new();
+    let cancelled = Rc::new(Cell::new(false));
+    let request = LlmRequest {
+        cancellable: cancellable.clone(),
+        cancelled: cancelled.clone(),
+    };
+
+    let mut argv: Vec<&std::ffi::OsStr> = config.command.iter().map(|s| s.as_ref()).collect();
+    argv.push(prompt.as_ref());
+
+    let subprocess = match gio::Subprocess::newv(
+        &argv,
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            warn_once(&err.to_string());
+            on_done(None);
+            return request;
+        }
+    };
+
+    // タイムアウト: cancel + kill。スロットは「発火時に自分で None にする」既存不変条件に従う
+    let timeout_slot: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let id = glib::timeout_add_local_once(std::time::Duration::from_secs(config.timeout_secs), {
+        let slot = timeout_slot.clone();
+        let cancellable = cancellable.clone();
+        let subprocess = subprocess.clone();
+        move || {
+            slot.borrow_mut().take();
+            cancellable.cancel();
+            subprocess.force_exit();
+        }
+    });
+    *timeout_slot.borrow_mut() = Some(id);
+
+    let subprocess_c = subprocess.clone();
+    subprocess.communicate_utf8_async(None, Some(&cancellable), move |result| {
+        if let Some(id) = timeout_slot.borrow_mut().take() {
+            id.remove();
+        }
+        if cancelled.get() {
+            return; // 呼び出し元キャンセル: 何もしない (on_done は drop される)
+        }
+        match result {
+            Ok((stdout, stderr)) if subprocess_c.is_successful() => {
+                let text = stdout.as_deref().unwrap_or("");
+                match postprocess(text) {
+                    Some(phrase) => on_done(Some(phrase)),
+                    None => {
+                        warn_once("出力が空でした");
+                        let _ = stderr;
+                        on_done(None);
+                    }
+                }
+            }
+            Ok((_, stderr)) => {
+                let head = stderr
+                    .as_deref()
+                    .and_then(|s| s.lines().next())
+                    .unwrap_or("")
+                    .to_string();
+                warn_once(&format!("CLI が失敗しました: {head}"));
+                on_done(None);
+            }
+            Err(err) => {
+                warn_once(&err.to_string());
+                on_done(None);
+            }
+        }
+    });
+
+    request
 }
 
 fn weekday_name(w: chrono::Weekday) -> &'static str {
@@ -170,5 +279,44 @@ mod tests {
     fn postprocess_empty_is_none() {
         assert!(postprocess("").is_none());
         assert!(postprocess("  \n \n").is_none());
+    }
+
+    use std::sync::Mutex;
+
+    static MAIN_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
+
+    fn run_request(config_toml: &str, prompt: &str) -> Option<String> {
+        let _lock = MAIN_CONTEXT_LOCK.lock().unwrap();
+        let cfg: LlmConfig = toml::from_str(config_toml).unwrap();
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().unwrap();
+        let ml = glib::MainLoop::new(None, false);
+        let result: Rc<RefCell<Option<Option<String>>>> = Rc::new(RefCell::new(None));
+        let (ml_c, result_c) = (ml.clone(), result.clone());
+        let _req = request_phrase(&cfg, prompt, move |r| {
+            *result_c.borrow_mut() = Some(r);
+            ml_c.quit();
+        });
+        ml.run();
+        let got = result.borrow_mut().take();
+        got.expect("on_done が呼ばれていない")
+    }
+
+    #[test]
+    fn request_phrase_returns_cli_output() {
+        let got = run_request(r#"command = ["echo", "こんにちは"]"#, "prompt");
+        // echo は引数を空白連結で 1 行に出力するため "こんにちは prompt" になる
+        assert_eq!(got.as_deref(), Some("こんにちは prompt"));
+    }
+
+    #[test]
+    fn request_phrase_times_out() {
+        let started = std::time::Instant::now();
+        let got = run_request(
+            "command = [\"sleep\", \"60\"]\ntimeout_secs = 1",
+            "prompt",
+        );
+        assert!(got.is_none(), "タイムアウトは None のはず");
+        assert!(started.elapsed().as_secs() < 10, "1 秒タイムアウトが効いていない");
     }
 }
