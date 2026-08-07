@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::Deserialize;
+use std::time::{Duration, Instant};
 
 const DEFAULT_PHRASES_TOML: &str = include_str!("../assets/phrases.toml");
 
@@ -56,6 +57,46 @@ impl GroupRaw {
     }
 }
 
+/// 条件評価に使う現在状態。時刻取得と評価を分離しテスト可能にする
+pub struct Snapshot {
+    pub hour: u32,
+    pub weekday: chrono::Weekday,
+    pub month: u32,
+    pub day: u32,
+    pub uptime: Duration,
+}
+
+impl Snapshot {
+    /// 現在のローカル時刻と起動時刻から構築する
+    pub fn current(started_at: Instant) -> Self {
+        use chrono::{Datelike, Timelike};
+        let now = chrono::Local::now();
+        Self {
+            hour: now.hour(),
+            weekday: now.weekday(),
+            month: now.month(),
+            day: now.day(),
+            uptime: started_at.elapsed(),
+        }
+    }
+}
+
+impl Group {
+    fn matches(&self, now: &Snapshot) -> bool {
+        self.time
+            .as_ref()
+            .is_none_or(|bands| bands.iter().any(|b| b.contains(now.hour)))
+            && self.days.as_ref().is_none_or(|ds| ds.contains(&now.weekday))
+            && self
+                .dates
+                .as_ref()
+                .is_none_or(|ds| ds.iter().any(|d| d.month == now.month && d.day == now.day))
+            && self
+                .uptime_hours
+                .is_none_or(|h| now.uptime >= Duration::from_secs(h * 3600))
+    }
+}
+
 pub struct PhraseBook {
     groups: Vec<Group>,
 }
@@ -105,14 +146,21 @@ impl PhraseBook {
         }
     }
 
-    /// 暫定: 全グループの全台詞からランダム選択 (Task 3 で条件対応に変更)
-    pub fn pick(&self) -> &str {
+    pub fn pick(&self, now: &Snapshot) -> &str {
         use rand::RngExt;
-        let pool: Vec<&str> = self
+        let mut pool: Vec<&str> = self
             .groups
             .iter()
+            .filter(|g| g.matches(now))
             .flat_map(|g| g.phrases.iter().map(String::as_str))
             .collect();
+        if pool.is_empty() {
+            pool = self
+                .groups
+                .iter()
+                .flat_map(|g| g.phrases.iter().map(String::as_str))
+                .collect();
+        }
         pool[rand::rng().random_range(0..pool.len())]
     }
 }
@@ -200,12 +248,109 @@ mod tests {
         assert!(PhraseBook::from_toml_str("phrases = []").is_err());
     }
 
+    fn snap(hour: u32, weekday: chrono::Weekday, month: u32, day: u32, uptime_h: u64) -> Snapshot {
+        Snapshot {
+            hour,
+            weekday,
+            month,
+            day,
+            uptime: std::time::Duration::from_secs(uptime_h * 3600),
+        }
+    }
+
     #[test]
     fn pick_returns_a_defined_phrase() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x", "y", "z"]"#).unwrap();
+        let now = snap(12, chrono::Weekday::Mon, 6, 15, 0);
         for _ in 0..50 {
-            assert!(["x", "y", "z"].contains(&book.pick()));
+            assert!(["x", "y", "z"].contains(&book.pick(&now)));
         }
+    }
+
+    #[test]
+    fn unconditional_group_always_matches() {
+        let toml = r#"
+            [[group]]
+            phrases = ["always"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert!(book.groups[0].matches(&snap(3, chrono::Weekday::Sun, 1, 1, 0)));
+    }
+
+    #[test]
+    fn conditions_within_array_are_or() {
+        let toml = r#"
+            [[group]]
+            time = ["morning", "night"]
+            phrases = ["x"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let g = &book.groups[0];
+        assert!(g.matches(&snap(6, chrono::Weekday::Mon, 6, 15, 0)), "morning");
+        assert!(g.matches(&snap(23, chrono::Weekday::Mon, 6, 15, 0)), "night");
+        assert!(!g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)), "daytime は不一致");
+    }
+
+    #[test]
+    fn conditions_across_keys_are_and() {
+        let toml = r#"
+            [[group]]
+            time = ["morning"]
+            days = ["mon"]
+            phrases = ["x"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let g = &book.groups[0];
+        assert!(g.matches(&snap(6, chrono::Weekday::Mon, 6, 15, 0)));
+        assert!(!g.matches(&snap(6, chrono::Weekday::Tue, 6, 15, 0)), "曜日不一致");
+        assert!(!g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)), "時間帯不一致");
+    }
+
+    #[test]
+    fn date_and_uptime_conditions_match() {
+        let toml = r#"
+            [[group]]
+            dates = ["12-25"]
+            phrases = ["xmas"]
+
+            [[group]]
+            uptime_hours = 4
+            phrases = ["rest"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert!(book.groups[0].matches(&snap(0, chrono::Weekday::Fri, 12, 25, 0)));
+        assert!(!book.groups[0].matches(&snap(0, chrono::Weekday::Fri, 12, 26, 0)));
+        assert!(book.groups[1].matches(&snap(0, chrono::Weekday::Fri, 1, 1, 4)), "ちょうど 4h は一致");
+        assert!(!book.groups[1].matches(&snap(0, chrono::Weekday::Fri, 1, 1, 3)));
+    }
+
+    #[test]
+    fn pick_pools_only_matching_groups() {
+        let toml = r#"
+            [[group]]
+            phrases = ["always"]
+
+            [[group]]
+            time = ["morning"]
+            phrases = ["morning-only"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
+        for _ in 0..50 {
+            assert_eq!(book.pick(&night), "always", "夜は always のみのはず");
+        }
+    }
+
+    #[test]
+    fn pick_falls_back_to_all_when_nothing_matches() {
+        let toml = r#"
+            [[group]]
+            time = ["morning"]
+            phrases = ["morning-only"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
+        assert_eq!(book.pick(&night), "morning-only", "空プールは全台詞にフォールバック");
     }
 
     #[test]
