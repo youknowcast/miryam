@@ -1,25 +1,93 @@
-use anyhow::{bail, Context};
+use anyhow::Context;
 use serde::Deserialize;
 
 const DEFAULT_PHRASES_TOML: &str = include_str!("../assets/phrases.toml");
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PhrasesFile {
+    phrases: Option<Vec<String>>,
+    #[serde(default)]
+    group: Vec<GroupRaw>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRaw {
+    time: Option<Vec<String>>,
+    days: Option<Vec<String>>,
+    dates: Option<Vec<String>>,
+    uptime_hours: Option<u64>,
     phrases: Vec<String>,
 }
 
-pub struct PhraseBook {
+struct Group {
+    time: Option<Vec<TimeBand>>,
+    days: Option<Vec<chrono::Weekday>>,
+    dates: Option<Vec<MonthDay>>,
+    uptime_hours: Option<u64>,
     phrases: Vec<String>,
+}
+
+impl GroupRaw {
+    fn validate(self) -> anyhow::Result<Group> {
+        if self.phrases.is_empty() {
+            anyhow::bail!("phrases が空のグループがあります");
+        }
+        if self.uptime_hours == Some(0) {
+            anyhow::bail!("uptime_hours は 1 以上を指定してください");
+        }
+        Ok(Group {
+            time: self
+                .time
+                .map(|v| v.iter().map(|s| TimeBand::parse(s)).collect::<anyhow::Result<Vec<_>>>())
+                .transpose()?,
+            days: self
+                .days
+                .map(|v| v.iter().map(|s| parse_weekday(s)).collect::<anyhow::Result<Vec<_>>>())
+                .transpose()?,
+            dates: self
+                .dates
+                .map(|v| v.iter().map(|s| MonthDay::parse(s)).collect::<anyhow::Result<Vec<_>>>())
+                .transpose()?,
+            uptime_hours: self.uptime_hours,
+            phrases: self.phrases,
+        })
+    }
+}
+
+pub struct PhraseBook {
+    groups: Vec<Group>,
 }
 
 impl PhraseBook {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
         let file: PhrasesFile =
             toml::from_str(s).context("phrases.toml のパースに失敗しました")?;
-        if file.phrases.is_empty() {
-            bail!("phrases.toml に台詞が 1 つもありません");
-        }
-        Ok(Self { phrases: file.phrases })
+        let groups = match (file.phrases, file.group.is_empty()) {
+            (Some(_), false) => anyhow::bail!(
+                "旧形式 (トップレベル phrases) と新形式 ([[group]]) は併用できません"
+            ),
+            (Some(phrases), true) => {
+                if phrases.is_empty() {
+                    anyhow::bail!("phrases.toml に台詞が 1 つもありません");
+                }
+                vec![Group {
+                    time: None,
+                    days: None,
+                    dates: None,
+                    uptime_hours: None,
+                    phrases,
+                }]
+            }
+            (None, true) => anyhow::bail!("phrases.toml に台詞が 1 つもありません"),
+            (None, false) => file
+                .group
+                .into_iter()
+                .map(GroupRaw::validate)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        };
+        Ok(Self { groups })
     }
 
     /// $XDG_CONFIG_HOME/miryam/phrases.toml があればそれを、無ければ埋め込みデフォルトを読む
@@ -37,10 +105,15 @@ impl PhraseBook {
         }
     }
 
+    /// 暫定: 全グループの全台詞からランダム選択 (Task 3 で条件対応に変更)
     pub fn pick(&self) -> &str {
         use rand::RngExt;
-        let idx = rand::rng().random_range(0..self.phrases.len());
-        &self.phrases[idx]
+        let pool: Vec<&str> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.phrases.iter().map(String::as_str))
+            .collect();
+        pool[rand::rng().random_range(0..pool.len())]
     }
 }
 
@@ -118,12 +191,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_valid_toml() {
-        let book = PhraseBook::from_toml_str(r#"phrases = ["a", "b"]"#).unwrap();
-        assert_eq!(book.phrases, vec!["a", "b"]);
-    }
-
-    #[test]
     fn rejects_invalid_toml() {
         assert!(PhraseBook::from_toml_str("this is not toml =").is_err());
     }
@@ -144,7 +211,109 @@ mod tests {
     #[test]
     fn embedded_default_is_valid() {
         let book = PhraseBook::from_toml_str(DEFAULT_PHRASES_TOML).unwrap();
-        assert!(!book.phrases.is_empty());
+        assert!(!book.groups.is_empty());
+    }
+
+    #[test]
+    fn parses_legacy_format_as_one_group() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["a", "b"]"#).unwrap();
+        assert_eq!(book.groups.len(), 1);
+        assert_eq!(book.groups[0].phrases, vec!["a", "b"]);
+        assert!(book.groups[0].time.is_none());
+    }
+
+    #[test]
+    fn parses_group_format() {
+        let toml = r#"
+            [[group]]
+            phrases = ["always"]
+
+            [[group]]
+            time = ["morning", "night"]
+            days = ["mon"]
+            dates = ["12-25"]
+            uptime_hours = 4
+            phrases = ["conditional"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.groups.len(), 2);
+        assert!(book.groups[0].time.is_none());
+        assert_eq!(
+            book.groups[1].time,
+            Some(vec![TimeBand::Morning, TimeBand::Night])
+        );
+        assert_eq!(book.groups[1].days, Some(vec![chrono::Weekday::Mon]));
+        assert_eq!(book.groups[1].dates, Some(vec![MonthDay { month: 12, day: 25 }]));
+        assert_eq!(book.groups[1].uptime_hours, Some(4));
+    }
+
+    #[test]
+    fn rejects_mixed_formats() {
+        let toml = r#"
+            phrases = ["top"]
+
+            [[group]]
+            phrases = ["grouped"]
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_file() {
+        assert!(PhraseBook::from_toml_str("").is_err());
+    }
+
+    #[test]
+    fn rejects_group_with_no_phrases() {
+        let toml = r#"
+            [[group]]
+            time = ["morning"]
+            phrases = []
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_uptime_hours() {
+        let toml = r#"
+            [[group]]
+            uptime_hours = 0
+            phrases = ["x"]
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_keys() {
+        let toml = r#"
+            [[group]]
+            day = ["mon"]
+            phrases = ["x"]
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err(), "day (typo) は拒否されるはず");
+    }
+
+    #[test]
+    fn rejects_invalid_condition_values() {
+        for toml in [
+            r#"
+                [[group]]
+                time = ["noon"]
+                phrases = ["x"]
+            "#,
+            r#"
+                [[group]]
+                days = ["monday"]
+                phrases = ["x"]
+            "#,
+            r#"
+                [[group]]
+                dates = ["13-01"]
+                phrases = ["x"]
+            "#,
+        ] {
+            assert!(PhraseBook::from_toml_str(toml).is_err(), "{toml} はエラーのはず");
+        }
     }
 
     #[test]
