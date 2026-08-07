@@ -313,10 +313,12 @@ mod tests {
     fn request_phrase_times_out() {
         let started = std::time::Instant::now();
         let got = run_request(
-            "command = [\"sleep\", \"60\"]\ntimeout_secs = 1",
+            "command = [\"bash\", \"-c\", \"sleep 60\"]\ntimeout_secs = 1",
             "prompt",
         );
+        let elapsed = started.elapsed();
         assert!(got.is_none(), "タイムアウトは None のはず");
-        assert!(started.elapsed().as_secs() < 10, "1 秒タイムアウトが効いていない");
+        assert!(elapsed.as_secs() >= 1, "即時失敗ではなくタイムアウト経路を通るはず");
+        assert!(elapsed.as_secs() < 10, "1 秒タイムアウトが効いていない");
     }
 }
