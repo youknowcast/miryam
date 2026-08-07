@@ -115,7 +115,16 @@ fn load_character_texture() -> anyhow::Result<gdk::Texture> {
 fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture) {
     let window_weak = window.downgrade();
     let picture_weak = picture.downgrade();
+    // map シグナルはコンポジタ都合の再マップ等で複数回発火しうる。connect_layout の
+    // ハンドラを毎回追加登録すると同じ GdkSurface に購読が際限なく積み重なるため、
+    // 初回のみ登録するようフラグで防ぐ。
+    let layout_handler_registered = std::cell::Cell::new(false);
     window.connect_map(move |w| {
+        if layout_handler_registered.get() {
+            return;
+        }
+        layout_handler_registered.set(true);
+
         let Some(surface) = w.surface() else { return };
         let window_weak = window_weak.clone();
         let picture_weak = picture_weak.clone();
