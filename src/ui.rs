@@ -5,7 +5,8 @@ use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
 const DEFAULT_CHARACTER_PNG: &[u8] = include_bytes!("../assets/character.png");
 const WINDOW_MARGIN: i32 = 24;
-const CHARACTER_SIZE: i32 = 200;
+const CHARACTER_WIDTH: i32 = 200;
+const CHARACTER_HEIGHT: i32 = 300;
 const CONTENT_WIDTH: i32 = 260;
 
 const CSS: &str = "
@@ -24,7 +25,7 @@ pub struct MascotUi {
     picture: gtk::Picture,
 }
 
-pub fn build(app: &gtk::Application) -> anyhow::Result<MascotUi> {
+pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<MascotUi> {
     anyhow::ensure!(
         gtk4_layer_shell::is_supported(),
         "gtk4-layer-shell がこの環境で利用できません (Wayland + layer-shell 対応コンポジタが必要です)"
@@ -32,9 +33,9 @@ pub fn build(app: &gtk::Application) -> anyhow::Result<MascotUi> {
 
     load_css();
 
-    let texture = load_character_texture()?;
+    let texture = load_character_texture(skin)?;
     let picture = gtk::Picture::for_paintable(&texture);
-    picture.set_size_request(CHARACTER_SIZE, CHARACTER_SIZE);
+    picture.set_size_request(CHARACTER_WIDTH, CHARACTER_HEIGHT);
     picture.set_halign(gtk::Align::Center);
 
     // 吹き出しは opacity で表示制御する (レイアウトを常に確保して
@@ -99,16 +100,34 @@ fn load_css() {
     }
 }
 
-/// $XDG_CONFIG_HOME/miryam/character.png があればそれを、無ければ埋め込み仮画像を使う
-fn load_character_texture() -> anyhow::Result<gdk::Texture> {
-    let user_path = glib::user_config_dir().join("miryam").join("character.png");
-    if user_path.exists() {
-        gdk::Texture::from_filename(&user_path)
-            .with_context(|| format!("{} の読み込みに失敗しました", user_path.display()))
-    } else {
-        gdk::Texture::from_bytes(&glib::Bytes::from_static(DEFAULT_CHARACTER_PNG))
-            .context("埋め込みキャラクター画像のデコードに失敗しました")
+/// スキン名から character.png のパスを構築する
+fn skin_character_path(config_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    config_dir
+        .join("miryam")
+        .join("skins")
+        .join(name)
+        .join("character.png")
+}
+
+/// 解決順序: [skin] 指定 (欠落は起動エラー) → 旧 character.png → 埋め込み仮画像
+fn load_character_texture(skin: Option<&str>) -> anyhow::Result<gdk::Texture> {
+    let config_dir = glib::user_config_dir();
+    if let Some(name) = skin {
+        let path = skin_character_path(&config_dir, name);
+        return gdk::Texture::from_filename(&path).with_context(|| {
+            format!(
+                "スキン \"{name}\" の画像を読み込めません: {}",
+                path.display()
+            )
+        });
     }
+    let legacy = config_dir.join("miryam").join("character.png");
+    if legacy.exists() {
+        return gdk::Texture::from_filename(&legacy)
+            .with_context(|| format!("{} の読み込みに失敗しました", legacy.display()));
+    }
+    gdk::Texture::from_bytes(&glib::Bytes::from_static(DEFAULT_CHARACTER_PNG))
+        .context("埋め込みキャラクター画像のデコードに失敗しました")
 }
 
 /// クリックを受けるのはキャラ画像の矩形のみ。透明部分と吹き出しは下のアプリへ素通し
@@ -170,4 +189,18 @@ fn setup_quit_menu(app: &gtk::Application, window: &gtk::ApplicationWindow) {
         popover_ref.popup();
     });
     window.add_controller(gesture);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skin_path_layout() {
+        let p = skin_character_path(std::path::Path::new("/cfg"), "asha");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/cfg/miryam/skins/asha/character.png")
+        );
+    }
 }
