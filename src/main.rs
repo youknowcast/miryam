@@ -1,5 +1,6 @@
 mod phrases;
 mod scheduler;
+mod system;
 mod ui;
 
 use gtk4 as gtk;
