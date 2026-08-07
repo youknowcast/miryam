@@ -13,6 +13,8 @@ struct PhrasesFile {
     group: Vec<GroupRaw>,
     #[serde(default)]
     llm: Option<crate::llm::LlmConfig>,
+    #[serde(default)]
+    skin: Option<SkinConfig>,
 }
 
 #[derive(Deserialize)]
@@ -25,6 +27,27 @@ struct GroupRaw {
     cpu: Option<Vec<String>>,
     mem: Option<Vec<String>>,
     phrases: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkinConfig {
+    name: String,
+}
+
+impl SkinConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.name.is_empty() {
+            anyhow::bail!("[skin] name が空です");
+        }
+        if self.name.contains('/') || self.name.contains("..") {
+            anyhow::bail!(
+                "[skin] name にはディレクトリ名のみ指定できます (パス区切りや .. は不可): {}",
+                self.name
+            );
+        }
+        Ok(())
+    }
 }
 
 struct Group {
@@ -139,6 +162,7 @@ impl Group {
 pub struct PhraseBook {
     groups: Vec<Group>,
     llm: Option<crate::llm::LlmConfig>,
+    skin: Option<SkinConfig>,
 }
 
 impl PhraseBook {
@@ -149,9 +173,13 @@ impl PhraseBook {
             phrases: top_level,
             group,
             llm,
+            skin,
         } = file;
         if let Some(cfg) = &llm {
             cfg.validate().context("[llm] の設定が不正です")?;
+        }
+        if let Some(cfg) = &skin {
+            cfg.validate().context("[skin] の設定が不正です")?;
         }
         let groups = match (top_level, group.is_empty()) {
             (Some(_), false) => anyhow::bail!(
@@ -177,11 +205,16 @@ impl PhraseBook {
                 .map(GroupRaw::validate)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         };
-        Ok(Self { groups, llm })
+        Ok(Self { groups, llm, skin })
     }
 
     pub fn llm(&self) -> Option<&crate::llm::LlmConfig> {
         self.llm.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub fn skin(&self) -> Option<&str> {
+        self.skin.as_ref().map(|s| s.name.as_str())
     }
 
     /// $XDG_CONFIG_HOME/miryam/phrases.toml があればそれを、無ければ埋め込みデフォルトを読む
@@ -689,5 +722,65 @@ mod tests {
     fn llm_absent_is_none() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
         assert!(book.llm().is_none());
+    }
+
+    #[test]
+    fn parses_skin_section() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [skin]
+            name = "asha"
+
+            [llm]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.skin(), Some("asha"));
+        assert!(book.llm().is_some(), "[llm] と共存できるはず");
+    }
+
+    #[test]
+    fn rejects_empty_skin_name() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [skin]
+            name = ""
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_skin_name_with_path_components() {
+        for name in ["a/b", "../up", "..", "skins/other"] {
+            let toml = format!(
+                "[[group]]\nphrases = [\"x\"]\n\n[skin]\nname = \"{name}\"\n"
+            );
+            assert!(
+                PhraseBook::from_toml_str(&toml).is_err(),
+                "{name} は拒否されるはず"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_skin_keys() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [skin]
+            name = "asha"
+            path = "/tmp"
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn skin_absent_is_none() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
+        assert!(book.skin().is_none());
     }
 }
