@@ -1,8 +1,19 @@
 [[group]]
 phrases = [
-  "CPUは平静です",
   "そのターミナル、昨日から開いていませんか",
 ]
+
+[[group]]
+cpu = ["idle"]
+phrases = ["CPUは平静です"]
+
+[[group]]
+cpu = ["high"]
+phrases = ["ファンが頑張っていますね"]
+
+[[group]]
+mem = ["high"]
+phrases = ["メモリが残りわずかです"]
 
 [[group]]
 time = ["morning"]
