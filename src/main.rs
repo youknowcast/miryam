@@ -4,6 +4,9 @@ mod ui;
 
 use gtk4 as gtk;
 use gtk::{glib, prelude::*};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder()
@@ -18,8 +21,60 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+#[derive(Default)]
+struct Timers {
+    next_speech: Option<glib::SourceId>,
+    hide_bubble: Option<glib::SourceId>,
+}
+
 fn activate(app: &gtk::Application) -> anyhow::Result<()> {
-    let ui = ui::build(app)?;
-    ui.show_bubble("動作確認用の吹き出しです");
+    let book = Rc::new(phrases::PhraseBook::load()?);
+    let ui = Rc::new(ui::build(app)?);
+    let timers = Rc::new(RefCell::new(Timers::default()));
+
+    schedule_next_speech(book.clone(), ui.clone(), timers.clone());
+
+    let (book_c, ui_c, timers_c) = (book.clone(), ui.clone(), timers.clone());
+    ui.connect_character_clicked(move || {
+        speak(&book_c, &ui_c, &timers_c);
+        schedule_next_speech(book_c.clone(), ui_c.clone(), timers_c.clone());
+    });
+
     Ok(())
+}
+
+/// 台詞を表示し、6 秒後の自動消去タイマーを張り直す
+fn speak(book: &Rc<phrases::PhraseBook>, ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>) {
+    ui.show_bubble(book.pick());
+    if let Some(id) = timers.borrow_mut().hide_bubble.take() {
+        id.remove();
+    }
+    let ui_c = ui.clone();
+    let timers_c = timers.clone();
+    let id = glib::timeout_add_local_once(
+        Duration::from_secs(scheduler::BUBBLE_VISIBLE_SECS),
+        move || {
+            timers_c.borrow_mut().hide_bubble = None;
+            ui_c.hide_bubble();
+        },
+    );
+    timers.borrow_mut().hide_bubble = Some(id);
+}
+
+/// 30〜90 秒後の次回発話をスケジュールする。既存の予約はキャンセルする
+fn schedule_next_speech(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+) {
+    if let Some(id) = timers.borrow_mut().next_speech.take() {
+        id.remove();
+    }
+    let timers_c = timers.clone();
+    let id = glib::timeout_add_local_once(scheduler::next_speech_interval(), move || {
+        timers_c.borrow_mut().next_speech = None;
+        speak(&book, &ui, &timers_c);
+        schedule_next_speech(book.clone(), ui.clone(), timers_c.clone());
+    });
+    timers.borrow_mut().next_speech = Some(id);
 }
