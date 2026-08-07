@@ -119,6 +119,7 @@ fn speak(
 }
 
 /// 外部由来テキストの発話 (postprocess 済み前提): LLM キャンセル + 表示 + 次回定期発話の張り直し
+/// ミュート中でも表示する (自動発話でなく明示的な外部要求のため — mute チェックを足さないこと)
 fn external_speak(
     book: &Rc<phrases::PhraseBook>,
     ui: &Rc<ui::MascotUi>,
