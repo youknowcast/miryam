@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn embedded_default_is_valid() {
         let book = PhraseBook::from_toml_str(DEFAULT_PHRASES_TOML).unwrap();
-        assert!(!book.groups.is_empty());
+        assert!(book.groups.len() >= 2, "新形式の複数グループのはず");
     }
 
     #[test]
