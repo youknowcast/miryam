@@ -235,6 +235,19 @@ impl TimeBand {
     }
 }
 
+/// 時間帯名 (LLM プロンプト用)。しきい値は TimeBand と同一
+pub(crate) fn time_band_name(hour: u32) -> &'static str {
+    if TimeBand::Morning.contains(hour) {
+        "morning"
+    } else if TimeBand::Daytime.contains(hour) {
+        "daytime"
+    } else if TimeBand::Evening.contains(hour) {
+        "evening"
+    } else {
+        "night"
+    }
+}
+
 fn parse_weekday(s: &str) -> anyhow::Result<chrono::Weekday> {
     use chrono::Weekday::*;
     Ok(match s {
@@ -611,5 +624,14 @@ mod tests {
         };
         assert!(!g.matches(&cpu_only), "mem 不一致なら AND で不成立");
         assert!(!g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)));
+    }
+
+    #[test]
+    fn time_band_name_matches_bands() {
+        assert_eq!(time_band_name(6), "morning");
+        assert_eq!(time_band_name(12), "daytime");
+        assert_eq!(time_band_name(18), "evening");
+        assert_eq!(time_band_name(23), "night");
+        assert_eq!(time_band_name(3), "night");
     }
 }
