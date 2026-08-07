@@ -74,12 +74,16 @@ pub fn postprocess(stdout: &str) -> Option<String> {
 pub struct LlmRequest {
     cancellable: gio::Cancellable,
     cancelled: Rc<Cell<bool>>,
+    subprocess: Option<gio::Subprocess>,
 }
 
 impl LlmRequest {
     pub fn cancel(&self) {
         self.cancelled.set(true);
         self.cancellable.cancel();
+        if let Some(p) = &self.subprocess {
+            p.force_exit();
+        }
     }
 }
 
@@ -100,10 +104,6 @@ pub fn request_phrase(
 ) -> LlmRequest {
     let cancellable = gio::Cancellable::new();
     let cancelled = Rc::new(Cell::new(false));
-    let request = LlmRequest {
-        cancellable: cancellable.clone(),
-        cancelled: cancelled.clone(),
-    };
 
     let mut argv: Vec<&std::ffi::OsStr> = config.command.iter().map(|s| s.as_ref()).collect();
     argv.push(prompt.as_ref());
@@ -115,9 +115,24 @@ pub fn request_phrase(
         Ok(p) => p,
         Err(err) => {
             warn_once(&err.to_string());
-            glib::idle_add_local_once(move || on_done(None));
-            return request;
+            let cancelled_c = cancelled.clone();
+            glib::idle_add_local_once(move || {
+                if !cancelled_c.get() {
+                    on_done(None);
+                }
+            });
+            return LlmRequest {
+                cancellable,
+                cancelled,
+                subprocess: None,
+            };
         }
+    };
+
+    let request = LlmRequest {
+        cancellable: cancellable.clone(),
+        cancelled: cancelled.clone(),
+        subprocess: Some(subprocess.clone()),
     };
 
     // タイムアウト: cancel + kill。スロットは「発火時に自分で None にする」既存不変条件に従う
@@ -356,5 +371,29 @@ mod tests {
         });
         ml.run();
         assert!(!called.get(), "cancel されたリクエストの on_done は呼ばれないはず");
+    }
+
+    #[test]
+    fn cancelled_spawn_failure_never_calls_on_done() {
+        let _lock = MAIN_CONTEXT_LOCK.lock().unwrap();
+        let cfg: LlmConfig =
+            toml::from_str(r#"command = ["/nonexistent-miryam-test-cmd"]"#).unwrap();
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().unwrap();
+        let ml = glib::MainLoop::new(None, false);
+        let called = Rc::new(Cell::new(false));
+
+        let called_c = called.clone();
+        let req = request_phrase(&cfg, "prompt", move |_| {
+            called_c.set(true);
+        });
+        req.cancel(); // idle 発火前に即キャンセル
+
+        let ml_c = ml.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            ml_c.quit();
+        });
+        ml.run();
+        assert!(!called.get(), "cancel 後の spawn 失敗 on_done は呼ばれないはず");
     }
 }

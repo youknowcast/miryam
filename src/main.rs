@@ -76,7 +76,8 @@ fn speak(
     timers: &Rc<RefCell<Timers>>,
     started_at: Instant,
 ) {
-    if let Some(req) = timers.borrow_mut().llm_request.take() {
+    let pending = timers.borrow_mut().llm_request.take();
+    if let Some(req) = pending {
         req.cancel();
     }
     show_text(ui, timers, book.pick(&phrases::Snapshot::current(started_at)));
