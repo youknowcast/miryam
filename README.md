@@ -45,6 +45,8 @@ cargo build --release
 
 - `~/.config/miryam/character.png` — キャラクター画像 (透過 PNG 推奨、200x200 目安)
 
+配置したファイルが不正な場合 (TOML の構文エラー、画像のデコード失敗など) はフォールバックせず起動エラーになります。自動起動で反映されない場合は `cargo run` を手動実行してエラーメッセージを確認してください。
+
 ## Hyprland で自動起動する
 
 `~/.config/hypr/hyprland.conf` (Omarchy では `~/.config/hypr/autostart.conf`) に追記:

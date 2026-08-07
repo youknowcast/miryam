@@ -28,6 +28,9 @@ struct Timers {
 }
 
 fn activate(app: &gtk::Application) -> anyhow::Result<()> {
+    if app.active_window().is_some() {
+        return Ok(());
+    }
     let book = Rc::new(phrases::PhraseBook::load()?);
     let ui = Rc::new(ui::build(app)?);
     let timers = Rc::new(RefCell::new(Timers::default()));
