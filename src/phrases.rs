@@ -93,7 +93,7 @@ impl Group {
                 .is_none_or(|ds| ds.iter().any(|d| d.month == now.month && d.day == now.day))
             && self
                 .uptime_hours
-                .is_none_or(|h| now.uptime >= Duration::from_secs(h * 3600))
+                .is_none_or(|h| now.uptime >= Duration::from_secs(h.saturating_mul(3600)))
     }
 }
 
@@ -223,6 +223,9 @@ impl MonthDay {
             .split_once('-')
             .with_context(|| format!("日付は MM-DD 形式で指定してください: {s}"))?;
         if m.len() != 2 || d.len() != 2 {
+            anyhow::bail!("日付は MM-DD 形式 (ゼロ埋め 2 桁) で指定してください: {s}");
+        }
+        if !m.bytes().all(|b| b.is_ascii_digit()) || !d.bytes().all(|b| b.is_ascii_digit()) {
             anyhow::bail!("日付は MM-DD 形式 (ゼロ埋め 2 桁) で指定してください: {s}");
         }
         let month: u32 = m.parse().with_context(|| format!("月が数値ではありません: {s}"))?;
@@ -507,7 +510,7 @@ mod tests {
     fn parses_month_day() {
         assert_eq!(MonthDay::parse("12-25").unwrap(), MonthDay { month: 12, day: 25 });
         assert_eq!(MonthDay::parse("02-29").unwrap(), MonthDay { month: 2, day: 29 });
-        for bad in ["1-1", "13-01", "12-32", "00-10", "12-00", "1225", "12-2x", "12/25"] {
+        for bad in ["1-1", "13-01", "12-32", "00-10", "12-00", "1225", "12-2x", "12/25", "12-+5", "+2-05"] {
             assert!(MonthDay::parse(bad).is_err(), "{bad} はエラーのはず");
         }
     }
