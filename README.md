@@ -68,6 +68,12 @@ alias memo='miryam-ctl memo'                          # シェルからの入力
 
 - **Quick Capture**: `miryam-ctl memo` で 1 行 (複数行も可) を Inbox にノート化します。タイトルは先頭行 60 文字、本文に `Source: miryam-ctl` と日付が付きます。失敗時はキャラが知らせ、詳細は stderr に出ます
 - **Inbox 見守り**: 起動 30 秒後と 6 時間ごとに Inbox の件数を確認し、しきい値以上なら 1 日 1 回だけ「Inbox に N 件たまっています」と知らせます (ミュート中は黙ります)
+- glib のタイマーはサスペンド中に進まないため、見守りタイマーもラップトップを閉じていた時間だけ次回確認が遅れます (say/timer と同じ注意)
+- note 本文の上限は 1 MiB です。超過した場合は保存失敗としてキャラが「Inkdrop に届きませんでした」と知らせます
+- walker 等のランチャーから 1 行入力をそのまま渡すこともできます (例: `walker --dmenu` 系が無い環境では `rofi` などでも可):
+  ```bash
+  miryam-ctl memo "$(rofi -dmenu -p memo)"   # rofi で 1 行入力してそのまま Inbox にキャプチャ
+  ```
 - Inkdrop 側の準備: 設定で Local HTTP Server を有効化 (Preferences の保存が効かない場合は Inkdrop 終了後に `~/.config/inkdrop/config.json` の `*.core.server` に `{"enabled": true, "port": 19840, "bindAddress": "127.0.0.1", "auth": {"username": "...", "password": "..."}}` を直接書く) → Inkdrop 再起動
 - 認証情報が入るため `chmod 600 ~/.config/miryam/phrases.toml` を推奨します。phrases.toml を共有・公開する際は `[inkdrop]` を必ず除いてください
 

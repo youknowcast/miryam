@@ -63,12 +63,14 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
         muted.clone(), quitting.clone(), started_at,
     );
 
-    schedule_inbox_check(
-        book.clone(), ui.clone(), timers.clone(),
-        muted.clone(), quitting.clone(),
-        book_id_cache.clone(), inbox_last_notified.clone(),
-        INBOX_CHECK_FIRST_DELAY_SECS,
-    );
+    if book.inkdrop().is_some_and(|c| c.inbox_threshold > 0) {
+        schedule_inbox_check(
+            book.clone(), ui.clone(), timers.clone(),
+            muted.clone(), quitting.clone(),
+            book_id_cache.clone(), inbox_last_notified.clone(),
+            INBOX_CHECK_FIRST_DELAY_SECS,
+        );
+    }
 
     // 起動挨拶 (1 秒後)
     {
@@ -158,20 +160,28 @@ fn external_speak(
     );
 }
 
-/// book 名を ID に解決して cont を呼ぶ (キャッシュあり)。解決不能時は cont(None)
+/// resolve_book_id の失敗理由
+enum ResolveError {
+    /// /books は取れたが名前一致なし
+    NotFound,
+    /// /books のリクエスト自体が失敗
+    Request(inkdrop::RequestError),
+}
+
+/// book 名を ID に解決して cont を呼ぶ (キャッシュあり)。呼び出し側がエラー種別に応じて発話/ログを判断する
 fn resolve_book_id(
     book: Rc<phrases::PhraseBook>,
     quitting: Rc<Cell<bool>>,
     cache: Rc<RefCell<Option<String>>>,
-    cont: impl FnOnce(Option<String>) + 'static,
+    cont: impl FnOnce(Result<String, ResolveError>) + 'static,
 ) {
     let cached = cache.borrow().clone();
     if let Some(id) = cached {
-        cont(Some(id));
+        cont(Ok(id));
         return;
     }
     let Some(cfg) = book.inkdrop() else {
-        cont(None);
+        cont(Err(ResolveError::NotFound));
         return;
     };
     let name = cfg.book.clone();
@@ -188,17 +198,11 @@ fn resolve_book_id(
                         );
                     }
                     *cache.borrow_mut() = Some(id.clone());
-                    cont(Some(id));
+                    cont(Ok(id));
                 }
-                None => {
-                    eprintln!("miryam: ノートブック \"{name}\" が見つかりません");
-                    cont(None);
-                }
+                None => cont(Err(ResolveError::NotFound)),
             },
-            Err(err) => {
-                eprintln!("miryam: Inkdrop /books の取得に失敗しました: {}", err.detail);
-                cont(None);
-            }
+            Err(err) => cont(Err(ResolveError::Request(err))),
         }
     });
 }
@@ -217,17 +221,32 @@ fn capture_to_inkdrop(
     let (book_r, ui_r, timers_r, muted_r, quitting_r) = (
         book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
     );
-    resolve_book_id(book.clone(), quitting.clone(), cache, move |book_id| {
+    resolve_book_id(book.clone(), quitting.clone(), cache, move |resolved| {
         if quitting_r.get() {
             return;
         }
-        let Some(book_id) = book_id else {
-            let name = book_r.inkdrop().map(|c| c.book.clone()).unwrap_or_default();
-            external_speak(
-                &book_r, &ui_r, &timers_r, &muted_r, &quitting_r, started_at,
-                &format!("ノートブック \"{name}\" が見つかりません"),
-            );
-            return;
+        let book_id = match resolved {
+            Ok(id) => id,
+            Err(ResolveError::NotFound) => {
+                let name = book_r.inkdrop().map(|c| c.book.clone()).unwrap_or_default();
+                eprintln!("miryam: ノートブック \"{name}\" が見つかりません");
+                external_speak(
+                    &book_r, &ui_r, &timers_r, &muted_r, &quitting_r, started_at,
+                    &format!("ノートブック \"{name}\" が見つかりません"),
+                );
+                return;
+            }
+            Err(ResolveError::Request(err)) => {
+                eprintln!(
+                    "miryam: Inkdrop への接続に失敗しました (curl exit {:?}): {}",
+                    err.curl_exit, err.detail
+                );
+                external_speak(
+                    &book_r, &ui_r, &timers_r, &muted_r, &quitting_r, started_at,
+                    "Inkdrop に届きませんでした",
+                );
+                return;
+            }
         };
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let (title, body_text) = inkdrop::capture_note(&text, &date);
@@ -320,10 +339,17 @@ fn run_inbox_check(
     let (book_r, ui_r, timers_r, muted_r, quitting_r) = (
         book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
     );
-    resolve_book_id(book.clone(), quitting.clone(), cache, move |book_id| {
-        let Some(book_id) = book_id else {
-            warn_inbox_once("ノートブック解決に失敗");
-            return;
+    resolve_book_id(book.clone(), quitting.clone(), cache, move |resolved| {
+        let book_id = match resolved {
+            Ok(id) => id,
+            Err(ResolveError::NotFound) => {
+                warn_inbox_once("ノートブック解決に失敗 (名前不一致)");
+                return;
+            }
+            Err(ResolveError::Request(err)) => {
+                warn_inbox_once(&format!("curl exit {:?}: {}", err.curl_exit, err.detail));
+                return;
+            }
         };
         let cfg = book_r.inkdrop().expect("見守りは inkdrop 有効時のみ");
         let path = format!(
