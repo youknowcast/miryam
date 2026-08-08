@@ -1,4 +1,6 @@
 use anyhow::bail;
+use gtk4 as gtk;
+use gtk::gio;
 use serde::Deserialize;
 
 fn default_port() -> u16 {
@@ -117,6 +119,78 @@ pub fn format_count(n: usize, limit: usize) -> String {
     }
 }
 
+/// curl 実行の失敗。curl_exit: 7=接続不可, 22=HTTP エラー, 28=タイムアウト
+#[derive(Debug)]
+pub struct RequestError {
+    pub curl_exit: Option<i32>,
+    pub detail: String,
+}
+
+/// Inkdrop Local Server へ curl でリクエストする (argv 固定、シェル不経由)。
+/// 完了時 on_done がメインループ上で呼ばれる。キャンセル機構は持たない (短時間・冪等)
+pub fn request(
+    cfg: &InkdropConfig,
+    method: &str,
+    path_and_query: &str,
+    body: Option<String>,
+    on_done: impl FnOnce(Result<String, RequestError>) + 'static,
+) {
+    let url = format!("http://127.0.0.1:{}{}", cfg.port, path_and_query);
+    let auth = format!("{}:{}", cfg.username, cfg.password);
+    let mut argv_owned: Vec<String> = vec![
+        "curl".into(),
+        "-sf".into(),
+        "-m".into(),
+        "10".into(),
+        "-u".into(),
+        auth,
+        "-X".into(),
+        method.into(),
+    ];
+    if body.is_some() {
+        argv_owned.push("-H".into());
+        argv_owned.push("Content-Type: application/json".into());
+        argv_owned.push("--data-binary".into());
+        argv_owned.push("@-".into());
+    }
+    argv_owned.push(url);
+    let argv: Vec<&std::ffi::OsStr> = argv_owned.iter().map(|s| s.as_ref()).collect();
+
+    let mut flags = gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE;
+    if body.is_some() {
+        flags |= gio::SubprocessFlags::STDIN_PIPE;
+    }
+    let subprocess = match gio::Subprocess::newv(&argv, flags) {
+        Ok(p) => p,
+        Err(err) => {
+            on_done(Err(RequestError {
+                curl_exit: None,
+                detail: err.to_string(),
+            }));
+            return;
+        }
+    };
+    let sp = subprocess.clone();
+    subprocess.communicate_utf8_async(body, gio::Cancellable::NONE, move |result| {
+        match result {
+            Ok((stdout, _stderr)) if sp.is_successful() => {
+                on_done(Ok(stdout.as_deref().unwrap_or("").to_string()));
+            }
+            Ok((_, _)) => {
+                let code = sp.exit_status();
+                on_done(Err(RequestError {
+                    curl_exit: Some(code),
+                    detail: format!("curl exit {code}"),
+                }));
+            }
+            Err(err) => on_done(Err(RequestError {
+                curl_exit: None,
+                detail: err.to_string(),
+            })),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +305,73 @@ mod tests {
     fn formats_count() {
         assert_eq!(format_count(99, 100), "99");
         assert_eq!(format_count(100, 100), "100+");
+    }
+
+    use gtk4 as gtk_t;
+    use gtk_t::glib;
+    use std::cell::RefCell;
+    use std::io::{Read, Write};
+    use std::rc::Rc;
+
+    /// 1 リクエストだけ応答して閉じる HTTP スタブ。返り値はポート
+    fn spawn_stub(status_line: &'static str, body: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn run_request_against(port: u16) -> Result<String, RequestError> {
+        let _lock = crate::test_sync::lock();
+        let cfg = cfg(&format!(
+            "username = \"u\"\npassword = \"p\"\nbook = \"Inbox\"\nport = {port}\n"
+        ));
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().unwrap();
+        let ml = glib::MainLoop::new(None, false);
+        let result: Rc<RefCell<Option<Result<String, RequestError>>>> = Rc::new(RefCell::new(None));
+        let (ml_c, result_c) = (ml.clone(), result.clone());
+        request(&cfg, "GET", "/books", None, move |r| {
+            *result_c.borrow_mut() = Some(r);
+            ml_c.quit();
+        });
+        ml.run();
+        let got = result.borrow_mut().take();
+        got.expect("on_done が呼ばれていない")
+    }
+
+    #[test]
+    fn request_returns_body_on_success() {
+        let port = spawn_stub("200 OK", r#"[{"_id":"book:x","name":"Inbox"}]"#);
+        let got = run_request_against(port).unwrap();
+        assert!(got.contains("book:x"));
+    }
+
+    #[test]
+    fn request_reports_connection_refused() {
+        // bind して即 drop したポート = 確実に閉じている
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = run_request_against(port).unwrap_err();
+        assert_eq!(err.curl_exit, Some(7), "接続拒否は curl exit 7: {err:?}");
+    }
+
+    #[test]
+    fn request_reports_http_error() {
+        let port = spawn_stub("401 Unauthorized", "Invalid credentials");
+        let err = run_request_against(port).unwrap_err();
+        assert_eq!(err.curl_exit, Some(22), "-f の HTTP エラーは curl exit 22: {err:?}");
     }
 }
