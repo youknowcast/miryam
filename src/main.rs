@@ -1,4 +1,5 @@
 mod control;
+mod inkdrop;
 mod llm;
 mod phrases;
 mod scheduler;
