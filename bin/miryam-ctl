@@ -2,11 +2,13 @@
 # miryam を外部から操作する CLI (gdbus ラッパー)
 # usage: miryam-ctl say <text...>
 #        miryam-ctl timer <duration(s|m|h)> [message...]
+#        miryam-ctl memo <text...>
 set -eu
 
 usage() {
     echo "usage: miryam-ctl say <text...>" >&2
     echo "       miryam-ctl timer <duration(s|m|h)> [message...]" >&2
+    echo "       miryam-ctl memo <text...>" >&2
     exit 2
 }
 
@@ -14,7 +16,7 @@ usage() {
 action=$1
 shift
 case "$action" in
-    say | timer) ;;
+    say | timer | memo) ;;
     *) usage ;;
 esac
 text="$*"
