@@ -1,3 +1,4 @@
+mod chat;
 mod control;
 mod inkdrop;
 mod llm;
