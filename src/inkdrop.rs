@@ -21,6 +21,8 @@ pub struct InkdropConfig {
     pub book: String,
     #[serde(default = "default_threshold")]
     pub inbox_threshold: u32,
+    #[serde(default)]
+    pub chat_book: Option<String>,
 }
 
 impl InkdropConfig {
@@ -37,6 +39,9 @@ impl InkdropConfig {
         if self.book.is_empty() {
             bail!("[inkdrop] book が空です");
         }
+        if self.chat_book.as_deref() == Some("") {
+            bail!("[inkdrop] chat_book は指定するなら空にできません");
+        }
         if self.port == 0 {
             bail!("[inkdrop] port は 1 以上を指定してください");
         }
@@ -44,6 +49,11 @@ impl InkdropConfig {
             bail!("[inkdrop] inbox_threshold は 100 以下です (0 で見守り無効)");
         }
         Ok(())
+    }
+
+    /// 会話ログの保存先ノートブック名 (chat_book、未設定なら book)
+    pub fn chat_book_name(&self) -> &str {
+        self.chat_book.as_deref().unwrap_or(&self.book)
     }
 }
 
@@ -373,5 +383,24 @@ mod tests {
         let port = spawn_stub("401 Unauthorized", "Invalid credentials");
         let err = run_request_against(port).unwrap_err();
         assert_eq!(err.curl_exit, Some(22), "-f の HTTP エラーは curl exit 22: {err:?}");
+    }
+
+    #[test]
+    fn chat_book_falls_back_to_book() {
+        let c = cfg(MIN);
+        assert_eq!(c.chat_book_name(), "Inbox");
+    }
+
+    #[test]
+    fn chat_book_overrides_book() {
+        let c = cfg(&format!("{MIN}chat_book = \"ChatLog\"\n"));
+        assert!(c.validate().is_ok());
+        assert_eq!(c.chat_book_name(), "ChatLog");
+    }
+
+    #[test]
+    fn rejects_empty_chat_book() {
+        let c = cfg(&format!("{MIN}chat_book = \"\"\n"));
+        assert!(c.validate().is_err(), "指定するなら空文字は不可");
     }
 }
