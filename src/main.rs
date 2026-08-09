@@ -430,6 +430,11 @@ fn open_or_toggle_chat(ctx: &ChatCtx) {
         close_chat_session(ctx);
         return;
     }
+    // 定期発話の LLM リクエストが飛行中なら破棄する (キャンセル規則: speak/speak_event と同様)
+    let pending = ctx.timers.borrow_mut().llm_request.take();
+    if let Some(req) = pending {
+        req.cancel();
+    }
     ctx.timers.borrow_mut().chat_session = Some(chat::ChatSession::new(chrono::Local::now()));
     ctx.ui.open_chat();
     reset_chat_idle_timer(ctx);
