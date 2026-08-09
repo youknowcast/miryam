@@ -1,6 +1,6 @@
 use anyhow::bail;
-use gtk4 as gtk;
 use gtk::gio;
+use gtk4 as gtk;
 use serde::Deserialize;
 
 fn default_port() -> u16 {
@@ -181,23 +181,21 @@ pub fn request(
         }
     };
     let sp = subprocess.clone();
-    subprocess.communicate_utf8_async(body, gio::Cancellable::NONE, move |result| {
-        match result {
-            Ok((stdout, _stderr)) if sp.is_successful() => {
-                on_done(Ok(stdout.as_deref().unwrap_or("").to_string()));
-            }
-            Ok((_, _)) => {
-                let code = sp.exit_status();
-                on_done(Err(RequestError {
-                    curl_exit: Some(code),
-                    detail: format!("curl exit {code}"),
-                }));
-            }
-            Err(err) => on_done(Err(RequestError {
-                curl_exit: None,
-                detail: err.to_string(),
-            })),
+    subprocess.communicate_utf8_async(body, gio::Cancellable::NONE, move |result| match result {
+        Ok((stdout, _stderr)) if sp.is_successful() => {
+            on_done(Ok(stdout.as_deref().unwrap_or("").to_string()));
         }
+        Ok((_, _)) => {
+            let code = sp.exit_status();
+            on_done(Err(RequestError {
+                curl_exit: Some(code),
+                detail: format!("curl exit {code}"),
+            }));
+        }
+        Err(err) => on_done(Err(RequestError {
+            curl_exit: None,
+            detail: err.to_string(),
+        })),
     });
 }
 
@@ -294,7 +292,10 @@ mod tests {
     #[test]
     fn counts_notes() {
         assert_eq!(count_notes("[]"), Some(0));
-        assert_eq!(count_notes(r#"[{"_id":"note:1"},{"_id":"note:2"}]"#), Some(2));
+        assert_eq!(
+            count_notes(r#"[{"_id":"note:1"},{"_id":"note:2"}]"#),
+            Some(2)
+        );
         assert_eq!(count_notes(r#"{"error":true}"#), None);
         assert_eq!(count_notes("broken"), None);
     }
@@ -308,7 +309,10 @@ mod tests {
         assert!(!should_notify(9, 10, None, today));
         assert!(!should_notify(10, 0, None, today), "0 は無効");
         assert!(!should_notify(10, 10, Some(today), today), "同日再通知なし");
-        assert!(should_notify(10, 10, Some(yesterday), today), "翌日は再通知");
+        assert!(
+            should_notify(10, 10, Some(yesterday), today),
+            "翌日は再通知"
+        );
     }
 
     #[test]
@@ -317,8 +321,8 @@ mod tests {
         assert_eq!(format_count(100, 100), "100+");
     }
 
-    use gtk4 as gtk_t;
     use gtk_t::glib;
+    use gtk4 as gtk_t;
     use std::cell::RefCell;
     use std::io::{Read, Write};
     use std::rc::Rc;
@@ -382,7 +386,11 @@ mod tests {
     fn request_reports_http_error() {
         let port = spawn_stub("401 Unauthorized", "Invalid credentials");
         let err = run_request_against(port).unwrap_err();
-        assert_eq!(err.curl_exit, Some(22), "-f の HTTP エラーは curl exit 22: {err:?}");
+        assert_eq!(
+            err.curl_exit,
+            Some(22),
+            "-f の HTTP エラーは curl exit 22: {err:?}"
+        );
     }
 
     #[test]

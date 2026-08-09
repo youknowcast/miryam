@@ -7,8 +7,8 @@ mod scheduler;
 mod system;
 mod ui;
 
-use gtk4 as gtk;
 use gtk::{gio, glib, prelude::*};
+use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -63,24 +63,43 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     }
 
     register_actions(
-        app, &book, &ui, &timers, &muted, &quitting, &book_id_cache, &chat_book_id_cache,
+        app,
+        &book,
+        &ui,
+        &timers,
+        &muted,
+        &quitting,
+        &book_id_cache,
+        &chat_book_id_cache,
         started_at,
     );
 
     schedule_next_speech(
-        book.clone(), ui.clone(), timers.clone(),
-        muted.clone(), quitting.clone(), started_at,
+        book.clone(),
+        ui.clone(),
+        timers.clone(),
+        muted.clone(),
+        quitting.clone(),
+        started_at,
     );
     schedule_chime(
-        book.clone(), ui.clone(), timers.clone(),
-        muted.clone(), quitting.clone(), started_at,
+        book.clone(),
+        ui.clone(),
+        timers.clone(),
+        muted.clone(),
+        quitting.clone(),
+        started_at,
     );
 
     if book.inkdrop().is_some_and(|c| c.inbox_threshold > 0) {
         schedule_inbox_check(
-            book.clone(), ui.clone(), timers.clone(),
-            muted.clone(), quitting.clone(),
-            book_id_cache.clone(), inbox_last_notified.clone(),
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            book_id_cache.clone(),
+            inbox_last_notified.clone(),
             INBOX_CHECK_FIRST_DELAY_SECS,
         );
     }
@@ -97,7 +116,11 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     }
 
     let (book_c, ui_c, timers_c, muted_c, quitting_c) = (
-        book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+        book.clone(),
+        ui.clone(),
+        timers.clone(),
+        muted.clone(),
+        quitting.clone(),
     );
     ui.connect_character_clicked(move || {
         if quitting_c.get() || timers_c.borrow().chat_session.is_some() {
@@ -105,8 +128,12 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
         }
         speak(&book_c, &ui_c, &timers_c, started_at);
         schedule_next_speech(
-            book_c.clone(), ui_c.clone(), timers_c.clone(),
-            muted_c.clone(), quitting_c.clone(), started_at,
+            book_c.clone(),
+            ui_c.clone(),
+            timers_c.clone(),
+            muted_c.clone(),
+            quitting_c.clone(),
+            started_at,
         );
     });
 
@@ -237,9 +264,17 @@ fn capture_to_inkdrop(
     started_at: Instant,
     text: String,
 ) {
-    let cfg_book_name = book.inkdrop().expect("memo は inkdrop 有効時のみ").book.clone();
+    let cfg_book_name = book
+        .inkdrop()
+        .expect("memo は inkdrop 有効時のみ")
+        .book
+        .clone();
     let (book_r, ui_r, timers_r, muted_r, quitting_r) = (
-        book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+        book.clone(),
+        ui.clone(),
+        timers.clone(),
+        muted.clone(),
+        quitting.clone(),
     );
     let name_c = cfg_book_name.clone();
     resolve_book_id(book.clone(), cache, cfg_book_name, move |resolved| {
@@ -251,7 +286,12 @@ fn capture_to_inkdrop(
             Err(ResolveError::NotFound) => {
                 eprintln!("miryam: ノートブック \"{name_c}\" が見つかりません");
                 external_speak(
-                    &book_r, &ui_r, &timers_r, &muted_r, &quitting_r, started_at,
+                    &book_r,
+                    &ui_r,
+                    &timers_r,
+                    &muted_r,
+                    &quitting_r,
+                    started_at,
                     &format!("ノートブック \"{name_c}\" が見つかりません"),
                 );
                 return;
@@ -262,7 +302,12 @@ fn capture_to_inkdrop(
                     err.curl_exit, err.detail
                 );
                 external_speak(
-                    &book_r, &ui_r, &timers_r, &muted_r, &quitting_r, started_at,
+                    &book_r,
+                    &ui_r,
+                    &timers_r,
+                    &muted_r,
+                    &quitting_r,
+                    started_at,
                     "Inkdrop に届きませんでした",
                 );
                 return;
@@ -273,7 +318,11 @@ fn capture_to_inkdrop(
         let payload = inkdrop::note_payload(&book_id, &title, &body_text);
         let cfg = book_r.inkdrop().expect("memo は inkdrop 有効時のみ");
         let (book_c, ui_c, timers_c, muted_c, quitting_c) = (
-            book_r.clone(), ui_r.clone(), timers_r.clone(), muted_r.clone(), quitting_r.clone(),
+            book_r.clone(),
+            ui_r.clone(),
+            timers_r.clone(),
+            muted_r.clone(),
+            quitting_r.clone(),
         );
         inkdrop::request(cfg, "POST", "/notes", Some(payload), move |res| {
             if quitting_c.get() {
@@ -281,7 +330,12 @@ fn capture_to_inkdrop(
             }
             match res {
                 Ok(_) => external_speak(
-                    &book_c, &ui_c, &timers_c, &muted_c, &quitting_c, started_at,
+                    &book_c,
+                    &ui_c,
+                    &timers_c,
+                    &muted_c,
+                    &quitting_c,
+                    started_at,
                     "メモを預かりました",
                 ),
                 Err(err) => {
@@ -290,7 +344,12 @@ fn capture_to_inkdrop(
                         err.curl_exit, err.detail
                     );
                     external_speak(
-                        &book_c, &ui_c, &timers_c, &muted_c, &quitting_c, started_at,
+                        &book_c,
+                        &ui_c,
+                        &timers_c,
+                        &muted_c,
+                        &quitting_c,
+                        started_at,
                         "Inkdrop に届きませんでした",
                     );
                 }
@@ -328,20 +387,26 @@ fn schedule_inbox_check(
     delay_secs: u64,
 ) {
     glib::timeout_add_local_once(Duration::from_secs(delay_secs), move || {
-        let enabled = book
-            .inkdrop()
-            .is_some_and(|c| c.inbox_threshold > 0);
+        let enabled = book.inkdrop().is_some_and(|c| c.inbox_threshold > 0);
         if enabled && !quitting.get() && !muted.get() {
             run_inbox_check(
-                book.clone(), ui.clone(), timers.clone(),
-                muted.clone(), quitting.clone(),
-                cache.clone(), last_notified.clone(),
+                book.clone(),
+                ui.clone(),
+                timers.clone(),
+                muted.clone(),
+                quitting.clone(),
+                cache.clone(),
+                last_notified.clone(),
             );
         }
         schedule_inbox_check(
-            book.clone(), ui.clone(), timers.clone(),
-            muted.clone(), quitting.clone(),
-            cache.clone(), last_notified.clone(),
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            cache.clone(),
+            last_notified.clone(),
             INBOX_CHECK_INTERVAL_SECS,
         );
     });
@@ -357,9 +422,17 @@ fn run_inbox_check(
     last_notified: Rc<RefCell<Option<chrono::NaiveDate>>>,
 ) {
     let (book_r, ui_r, timers_r, muted_r, quitting_r) = (
-        book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+        book.clone(),
+        ui.clone(),
+        timers.clone(),
+        muted.clone(),
+        quitting.clone(),
     );
-    let name = book.inkdrop().expect("見守りは inkdrop 有効時のみ").book.clone();
+    let name = book
+        .inkdrop()
+        .expect("見守りは inkdrop 有効時のみ")
+        .book
+        .clone();
     resolve_book_id(book.clone(), cache, name, move |resolved| {
         let book_id = match resolved {
             Ok(id) => id,
@@ -400,7 +473,8 @@ fn run_inbox_check(
             if inkdrop::should_notify(count, threshold, *last_notified.borrow(), today) {
                 let n = inkdrop::format_count(count, inkdrop::NOTES_QUERY_LIMIT);
                 automatic_speak(
-                    &ui_r, &timers_r,
+                    &ui_r,
+                    &timers_r,
                     &format!("Inbox に {n} 件たまっています。そろそろ整理しませんか"),
                 );
                 *last_notified.borrow_mut() = Some(today);
@@ -459,7 +533,11 @@ fn reset_chat_idle_timer(ctx: &ChatCtx) {
 fn close_chat_session(ctx: &ChatCtx) -> bool {
     let (session, in_flight, idle) = {
         let mut t = ctx.timers.borrow_mut();
-        (t.chat_session.take(), t.chat_request.take(), t.chat_idle.take())
+        (
+            t.chat_session.take(),
+            t.chat_request.take(),
+            t.chat_idle.take(),
+        )
     };
     let Some(session) = session else { return false };
     if let Some(id) = idle {
@@ -492,7 +570,10 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
     if text.is_empty() {
         return;
     }
-    let cfg = ctx.book.chat().expect("チャット UI は [chat] 有効時のみ配線される");
+    let cfg = ctx
+        .book
+        .chat()
+        .expect("チャット UI は [chat] 有効時のみ配線される");
     // 再送信: 前のリクエストをキャンセル (前の pending はクロージャごと破棄)
     if let Some(req) = ctx.timers.borrow_mut().chat_request.take() {
         req.cancel();
@@ -501,7 +582,9 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
     let now = phrases::Snapshot::current(ctx.started_at);
     let prompt = {
         let timers = ctx.timers.borrow();
-        let Some(session) = timers.chat_session.as_ref() else { return };
+        let Some(session) = timers.chat_session.as_ref() else {
+            return;
+        };
         chat::build_chat_prompt(cfg, &session.turns, &text, &now)
     };
     show_text_persistent(&ctx.ui, &ctx.timers, "……");
@@ -552,8 +635,12 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                     eprintln!("miryam: ノートブック \"{name_c}\" が見つかりません");
                     if !ctx_c.quitting.get() {
                         external_speak(
-                            &ctx_c.book, &ctx_c.ui, &ctx_c.timers, &ctx_c.muted,
-                            &ctx_c.quitting, ctx_c.started_at,
+                            &ctx_c.book,
+                            &ctx_c.ui,
+                            &ctx_c.timers,
+                            &ctx_c.muted,
+                            &ctx_c.quitting,
+                            ctx_c.started_at,
                             &format!("ノートブック \"{name_c}\" が見つかりません"),
                         );
                     }
@@ -566,8 +653,12 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                     );
                     if !ctx_c.quitting.get() {
                         external_speak(
-                            &ctx_c.book, &ctx_c.ui, &ctx_c.timers, &ctx_c.muted,
-                            &ctx_c.quitting, ctx_c.started_at,
+                            &ctx_c.book,
+                            &ctx_c.ui,
+                            &ctx_c.timers,
+                            &ctx_c.muted,
+                            &ctx_c.quitting,
+                            ctx_c.started_at,
                             "会話ログを Inkdrop に残せませんでした",
                         );
                     }
@@ -585,8 +676,12 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                     );
                     if !ctx_d.quitting.get() {
                         external_speak(
-                            &ctx_d.book, &ctx_d.ui, &ctx_d.timers, &ctx_d.muted,
-                            &ctx_d.quitting, ctx_d.started_at,
+                            &ctx_d.book,
+                            &ctx_d.ui,
+                            &ctx_d.timers,
+                            &ctx_d.muted,
+                            &ctx_d.quitting,
+                            ctx_d.started_at,
                             "会話ログを Inkdrop に残せませんでした",
                         );
                     }
@@ -666,8 +761,12 @@ fn schedule_next_speech(
             scheduled_speak(&book, &ui, &timers_c, started_at);
         }
         schedule_next_speech(
-            book.clone(), ui.clone(), timers_c.clone(),
-            muted.clone(), quitting.clone(), started_at,
+            book.clone(),
+            ui.clone(),
+            timers_c.clone(),
+            muted.clone(),
+            quitting.clone(),
+            started_at,
         );
     });
     timers.borrow_mut().next_speech = Some(id);
@@ -690,8 +789,12 @@ fn schedule_chime(
             speak_event(&book, &ui, &timers, phrases::EventKind::Chime, started_at);
         }
         schedule_chime(
-            book.clone(), ui.clone(), timers.clone(),
-            muted.clone(), quitting.clone(), started_at,
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            started_at,
         );
     });
 }
@@ -720,7 +823,11 @@ fn register_actions(
     let speak_now = gio::SimpleAction::new("speak-now", None);
     {
         let (book, ui, timers, muted_r, quitting) = (
-            book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
         );
         speak_now.connect_activate(move |_, _| {
             if quitting.get() {
@@ -728,8 +835,12 @@ fn register_actions(
             }
             speak(&book, &ui, &timers, started_at);
             schedule_next_speech(
-                book.clone(), ui.clone(), timers.clone(),
-                muted_r.clone(), quitting.clone(), started_at,
+                book.clone(),
+                ui.clone(),
+                timers.clone(),
+                muted_r.clone(),
+                quitting.clone(),
+                started_at,
             );
         });
     }
@@ -834,9 +945,7 @@ fn register_actions(
                         if quitting.get() {
                             return;
                         }
-                        external_speak(
-                            &book, &ui, &timers, &muted_r, &quitting, started_at, &text,
-                        );
+                        external_speak(&book, &ui, &timers, &muted_r, &quitting, started_at, &text);
                         if let Some(app) = app_weak.upgrade() {
                             let n = gio::Notification::new("miryam");
                             n.set_body(Some(&text));
@@ -864,8 +973,12 @@ fn register_actions(
     let memo = gio::SimpleAction::new("memo", Some(glib::VariantTy::STRING));
     {
         let (book, ui, timers, muted_r, quitting, cache) = (
-            book.clone(), ui.clone(), timers.clone(),
-            muted.clone(), quitting.clone(), book_id_cache.clone(),
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            book_id_cache.clone(),
         );
         memo.connect_activate(move |_, param| {
             if quitting.get() || book.inkdrop().is_none() {
@@ -878,9 +991,14 @@ fn register_actions(
                 return;
             }
             capture_to_inkdrop(
-                book.clone(), ui.clone(), timers.clone(),
-                muted_r.clone(), quitting.clone(), cache.clone(),
-                started_at, text,
+                book.clone(),
+                ui.clone(),
+                timers.clone(),
+                muted_r.clone(),
+                quitting.clone(),
+                cache.clone(),
+                started_at,
+                text,
             );
         });
     }

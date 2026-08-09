@@ -2,8 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gtk4 as gtk;
 use gtk::{gio, glib, prelude::*};
+use gtk4 as gtk;
 use serde::Deserialize;
 
 use crate::phrases::Snapshot;
@@ -192,16 +192,21 @@ pub fn request_phrase(
     prompt: &str,
     on_done: impl FnOnce(Option<String>) + 'static,
 ) -> LlmRequest {
-    request_raw(&config.command, config.timeout_secs, prompt, move |raw| match raw {
-        Some(text) => match postprocess(&text) {
-            Some(phrase) => on_done(Some(phrase)),
-            None => {
-                warn_once("出力が空でした");
-                on_done(None)
-            }
+    request_raw(
+        &config.command,
+        config.timeout_secs,
+        prompt,
+        move |raw| match raw {
+            Some(text) => match postprocess(&text) {
+                Some(phrase) => on_done(Some(phrase)),
+                None => {
+                    warn_once("出力が空でした");
+                    on_done(None)
+                }
+            },
+            None => on_done(None),
         },
-        None => on_done(None),
-    })
+    )
 }
 
 fn weekday_name(w: chrono::Weekday) -> &'static str {
@@ -280,8 +285,12 @@ mod tests {
     fn build_prompt_uses_default_persona_and_context() {
         let cfg: LlmConfig = toml::from_str("").unwrap();
         let p = build_prompt(&cfg, &test_snapshot());
-        assert!(p.starts_with("あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。"));
-        assert!(p.ends_with("状況: 時間帯=morning, 曜日=mon, CPU=idle, メモリ=high, 連続稼働=2時間"));
+        assert!(
+            p.starts_with("あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。")
+        );
+        assert!(
+            p.ends_with("状況: 時間帯=morning, 曜日=mon, CPU=idle, メモリ=high, 連続稼働=2時間")
+        );
     }
 
     #[test]
@@ -338,10 +347,7 @@ mod tests {
 
     #[test]
     fn request_phrase_reports_spawn_failure() {
-        let got = run_request(
-            r#"command = ["/nonexistent-miryam-test-cmd"]"#,
-            "prompt",
-        );
+        let got = run_request(r#"command = ["/nonexistent-miryam-test-cmd"]"#, "prompt");
         assert!(got.is_none(), "spawn 失敗は None のはず");
     }
 
@@ -354,15 +360,17 @@ mod tests {
         );
         let elapsed = started.elapsed();
         assert!(got.is_none(), "タイムアウトは None のはず");
-        assert!(elapsed.as_secs() >= 1, "即時失敗ではなくタイムアウト経路を通るはず");
+        assert!(
+            elapsed.as_secs() >= 1,
+            "即時失敗ではなくタイムアウト経路を通るはず"
+        );
         assert!(elapsed.as_secs() < 10, "1 秒タイムアウトが効いていない");
     }
 
     #[test]
     fn cancelled_request_never_calls_on_done() {
         let _lock = crate::test_sync::lock();
-        let cfg: LlmConfig =
-            toml::from_str(r#"command = ["bash", "-c", "sleep 2"]"#).unwrap();
+        let cfg: LlmConfig = toml::from_str(r#"command = ["bash", "-c", "sleep 2"]"#).unwrap();
         let ctx = glib::MainContext::default();
         let _guard = ctx.acquire().unwrap();
         let ml = glib::MainLoop::new(None, false);
@@ -382,7 +390,10 @@ mod tests {
             ml_c.quit();
         });
         ml.run();
-        assert!(!called.get(), "cancel されたリクエストの on_done は呼ばれないはず");
+        assert!(
+            !called.get(),
+            "cancel されたリクエストの on_done は呼ばれないはず"
+        );
     }
 
     fn run_raw(command: &[&str], prompt: &str) -> Option<String> {
@@ -412,7 +423,10 @@ mod tests {
     #[test]
     fn request_raw_reports_failure_as_none() {
         assert!(run_raw(&["/nonexistent-miryam-test-cmd"], "p").is_none());
-        assert!(run_raw(&["bash", "-c", "exit 1"], "p").is_none(), "非ゼロ終了は None");
+        assert!(
+            run_raw(&["bash", "-c", "exit 1"], "p").is_none(),
+            "非ゼロ終了は None"
+        );
     }
 
     #[test]
@@ -436,6 +450,9 @@ mod tests {
             ml_c.quit();
         });
         ml.run();
-        assert!(!called.get(), "cancel 後の spawn 失敗 on_done は呼ばれないはず");
+        assert!(
+            !called.get(),
+            "cancel 後の spawn 失敗 on_done は呼ばれないはず"
+        );
     }
 }

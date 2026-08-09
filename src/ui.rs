@@ -1,6 +1,6 @@
 use anyhow::Context;
-use gtk4 as gtk;
 use gtk::{gdk, gdk_pixbuf, gio, glib, prelude::*};
+use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 const DEFAULT_CHARACTER_PNG: &[u8] = include_bytes!("../assets/character.png");
@@ -207,7 +207,9 @@ fn texture_from_bytes_scaled(bytes: &'static [u8]) -> anyhow::Result<gdk::Textur
     let loader = gdk_pixbuf::PixbufLoader::new();
     loader.write(bytes)?;
     loader.close()?;
-    let pixbuf = loader.pixbuf().context("デコード結果を取得できませんでした")?;
+    let pixbuf = loader
+        .pixbuf()
+        .context("デコード結果を取得できませんでした")?;
     let pixbuf = scale_to_fit(&pixbuf, CHARACTER_WIDTH, CHARACTER_HEIGHT);
     Ok(gdk::Texture::for_pixbuf(&pixbuf))
 }
@@ -229,11 +231,7 @@ fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_w: i32, max_h: i32) -> gdk_pixb
 
 /// クリックを受けるのはキャラ画像の矩形 (と表示中はチャット入力欄) のみ。
 /// 透明部分と吹き出しは下のアプリへ素通し
-fn setup_input_region(
-    window: &gtk::ApplicationWindow,
-    picture: &gtk::Picture,
-    entry: &gtk::Entry,
-) {
+fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture, entry: &gtk::Entry) {
     let window_weak = window.downgrade();
     let picture_weak = picture.downgrade();
     let entry_weak = entry.downgrade();
@@ -259,7 +257,9 @@ fn setup_input_region(
             ) else {
                 return;
             };
-            let Some(bounds) = picture.compute_bounds(&window) else { return };
+            let Some(bounds) = picture.compute_bounds(&window) else {
+                return;
+            };
             let rect = gtk::cairo::RectangleInt::new(
                 bounds.x() as i32,
                 bounds.y() as i32,
@@ -268,16 +268,16 @@ fn setup_input_region(
             );
             let region = gtk::cairo::Region::create_rectangle(&rect);
             // チャット中は入力欄もクリック・フォーカス可能にする
-            if gtk::prelude::WidgetExt::is_visible(&entry) {
-                if let Some(b) = entry.compute_bounds(&window) {
-                    let r = gtk::cairo::RectangleInt::new(
-                        b.x() as i32,
-                        b.y() as i32,
-                        b.width() as i32,
-                        b.height() as i32,
-                    );
-                    let _ = region.union_rectangle(&r);
-                }
+            if gtk::prelude::WidgetExt::is_visible(&entry)
+                && let Some(b) = entry.compute_bounds(&window)
+            {
+                let r = gtk::cairo::RectangleInt::new(
+                    b.x() as i32,
+                    b.y() as i32,
+                    b.width() as i32,
+                    b.height() as i32,
+                );
+                let _ = region.union_rectangle(&r);
             }
             surface.set_input_region(Some(&region));
         });

@@ -1,6 +1,5 @@
-use serde::Deserialize;
 use crate::phrases::Snapshot;
-use chrono::TimeZone;
+use serde::Deserialize;
 
 const DEFAULT_CHAT_PERSONA: &str = "あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。\nユーザーと雑談しています。日本語で、数文・120 文字程度までで自然に返答してください。絵文字・引用符・前置き・説明は不要です。";
 
@@ -159,6 +158,7 @@ mod tests {
     use super::*;
     use crate::phrases::Snapshot;
     use crate::system::{CpuLevel, MemLevel};
+    use chrono::TimeZone;
     use std::time::Duration;
 
     fn test_snapshot() -> Snapshot {
@@ -174,7 +174,10 @@ mod tests {
     }
 
     fn turn(role: Role, text: &str) -> Turn {
-        Turn { role, text: text.to_string() }
+        Turn {
+            role,
+            text: text.to_string(),
+        }
     }
 
     #[test]
@@ -206,9 +209,16 @@ mod tests {
     fn build_chat_prompt_without_history() {
         let cfg: ChatConfig = toml::from_str("").unwrap();
         let p = build_chat_prompt(&cfg, &[], "やあ", &test_snapshot());
-        assert!(p.starts_with("あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。"));
-        assert!(p.contains("状況: 時間帯=morning, 曜日=mon, CPU=idle, メモリ=high, 連続稼働=2時間"));
-        assert!(!p.contains("これまでの会話:"), "履歴なしではブロックを出さない");
+        assert!(
+            p.starts_with("あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。")
+        );
+        assert!(
+            p.contains("状況: 時間帯=morning, 曜日=mon, CPU=idle, メモリ=high, 連続稼働=2時間")
+        );
+        assert!(
+            !p.contains("これまでの会話:"),
+            "履歴なしではブロックを出さない"
+        );
         assert!(p.ends_with("ユーザー: やあ\nmiryam:"));
     }
 
@@ -231,8 +241,14 @@ mod tests {
             turns.push(turn(Role::Mascot, &format!("reply{i}")));
         }
         let p = build_chat_prompt(&cfg, &turns, "next", &test_snapshot());
-        assert!(!p.contains("ユーザー: user5\n"), "古い発言 (先頭 10 件) は落ちる");
-        assert!(p.contains("ユーザー: user6\n"), "直近 20 発言の先頭は user6");
+        assert!(
+            !p.contains("ユーザー: user5\n"),
+            "古い発言 (先頭 10 件) は落ちる"
+        );
+        assert!(
+            p.contains("ユーザー: user6\n"),
+            "直近 20 発言の先頭は user6"
+        );
         assert!(p.contains("miryam: reply15\n"));
     }
 
@@ -291,7 +307,9 @@ mod tests {
         let mut s = session_at(14, 30);
         s.push_exchange("こんにちは".to_string(), "やあ".to_string());
         s.push_exchange("二言目".to_string(), "返答".to_string());
-        let ended = chrono::Local.with_ymd_and_hms(2026, 8, 9, 14, 42, 0).unwrap();
+        let ended = chrono::Local
+            .with_ymd_and_hms(2026, 8, 9, 14, 42, 0)
+            .unwrap();
         let (title, body) = chat_note(&s, &ended);
         assert_eq!(title, "会話ログ 2026-08-09 14:30");
         assert_eq!(
