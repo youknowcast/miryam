@@ -44,7 +44,7 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
 
     let started_at = Instant::now();
     let book = Rc::new(phrases::PhraseBook::load()?);
-    let ui = Rc::new(ui::build(app, book.skin())?);
+    let ui = Rc::new(ui::build(app, book.skin(), book.chat().is_some())?);
     let timers = Rc::new(RefCell::new(Timers::default()));
     let muted = Rc::new(Cell::new(false));
     let quitting = Rc::new(Cell::new(false));
