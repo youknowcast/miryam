@@ -375,6 +375,15 @@ fn warn_inbox_once(detail: &str) {
     }
 }
 
+/// チャット返答生成の失敗 (CLI 自体の失敗は llm.rs 側で警告済みなので二重警告しない)
+fn warn_chat_once(detail: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("miryam: チャット返答の生成に失敗しました (以後この警告は抑制): {detail}");
+    }
+}
+
 /// Inbox 見守り: 固定間隔で件数を確認し、しきい値超過を 1 日 1 回だけ知らせる
 fn schedule_inbox_check(
     book: Rc<phrases::PhraseBook>,
@@ -574,6 +583,11 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
         .book
         .chat()
         .expect("チャット UI は [chat] 有効時のみ配線される");
+    // セッション不在なら以降の副作用 (idle タイマー起動など) を一切起こさない。
+    // 「chat_idle が Some ⇒ chat_session も Some」という不変条件をここで担保する
+    if ctx.timers.borrow().chat_session.is_none() {
+        return;
+    }
     // 再送信: 前のリクエストをキャンセル (前の pending はクロージャごと破棄)
     if let Some(req) = ctx.timers.borrow_mut().chat_request.take() {
         req.cancel();
@@ -582,9 +596,10 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
     let now = phrases::Snapshot::current(ctx.started_at);
     let prompt = {
         let timers = ctx.timers.borrow();
-        let Some(session) = timers.chat_session.as_ref() else {
-            return;
-        };
+        let session = timers
+            .chat_session
+            .as_ref()
+            .expect("直前にセッション存在を確認済み");
         chat::build_chat_prompt(cfg, &session.turns, &text, &now)
     };
     show_text_persistent(&ctx.ui, &ctx.timers, "……");
@@ -596,6 +611,7 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
             return;
         }
         reset_chat_idle_timer(&ctx_c); // 返答受信も「操作」扱い
+        let raw_was_some = raw.is_some();
         match raw.as_deref().and_then(chat::postprocess_chat) {
             Some(reply) => {
                 if let Some(session) = ctx_c.timers.borrow_mut().chat_session.as_mut() {
@@ -605,6 +621,11 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
                 show_text_for(&ctx_c.ui, &ctx_c.timers, &reply, secs);
             }
             None => {
+                // CLI 自体の失敗 (raw None) は llm.rs 側で警告済みなのでここでは二重警告しない。
+                // CLI は成功したが出力が空だった場合のみ、ここで警告する
+                if raw_was_some {
+                    warn_chat_once("出力が空でした");
+                }
                 // 失敗ターン: pending (user_text) はここで捨てられ、履歴に残らない
                 show_text(&ctx_c.ui, &ctx_c.timers, "うまく言葉が出てきません");
             }
@@ -830,7 +851,7 @@ fn register_actions(
             quitting.clone(),
         );
         speak_now.connect_activate(move |_, _| {
-            if quitting.get() {
+            if quitting.get() || timers.borrow().chat_session.is_some() {
                 return;
             }
             speak(&book, &ui, &timers, started_at);
