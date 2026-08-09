@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use crate::phrases::Snapshot;
+use chrono::TimeZone;
 
 const DEFAULT_CHAT_PERSONA: &str = "あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。\nユーザーと雑談しています。日本語で、数文・120 文字程度までで自然に返答してください。絵文字・引用符・前置き・説明は不要です。";
 
@@ -24,6 +25,58 @@ fn speaker_name(role: Role) -> &'static str {
         Role::User => "ユーザー",
         Role::Mascot => "miryam",
     }
+}
+
+/// 会話セッション。不変条件: turns は成立した往復のみ
+/// (User → Mascot の交互ペア。送信直後のユーザー発言はここに入れず、
+/// 返答が来た時に push_exchange で 2 発言まとめて積む — pending 方式)
+pub struct ChatSession {
+    pub turns: Vec<Turn>,
+    pub started_at: chrono::DateTime<chrono::Local>,
+}
+
+impl ChatSession {
+    pub fn new(started_at: chrono::DateTime<chrono::Local>) -> Self {
+        Self {
+            turns: Vec::new(),
+            started_at,
+        }
+    }
+
+    /// 成立した往復を積む (返答が来た時だけ呼ぶこと)
+    pub fn push_exchange(&mut self, user: String, mascot: String) {
+        self.turns.push(Turn {
+            role: Role::User,
+            text: user,
+        });
+        self.turns.push(Turn {
+            role: Role::Mascot,
+            text: mascot,
+        });
+    }
+}
+
+/// セッションを Inkdrop ノート (title, body) に整形する
+pub fn chat_note(
+    session: &ChatSession,
+    ended_at: &chrono::DateTime<chrono::Local>,
+) -> (String, String) {
+    let title = format!("会話ログ {}", session.started_at.format("%Y-%m-%d %H:%M"));
+    let mut blocks: Vec<String> = Vec::new();
+    for pair in session.turns.chunks(2) {
+        let mut block = String::new();
+        for t in pair {
+            block.push_str(&format!("**{}**: {}\n", speaker_name(t.role), t.text));
+        }
+        blocks.push(block);
+    }
+    let body = format!(
+        "{}\n---\n- 開始: {}\n- 終了: {}\nSource: miryam chat",
+        blocks.join("\n"),
+        session.started_at.format("%Y-%m-%d %H:%M"),
+        ended_at.format("%Y-%m-%d %H:%M"),
+    );
+    (title, body)
 }
 
 /// ペルソナ + 状況行 + 直近履歴 (最大 PROMPT_HISTORY_MAX 発言) + 新しい発言
@@ -216,5 +269,45 @@ mod tests {
         assert_eq!(bubble_secs(&"あ".repeat(100)), 16);
         assert_eq!(bubble_secs(&"あ".repeat(140)), 20);
         assert_eq!(bubble_secs(&"あ".repeat(300)), 20, "上限 20 秒");
+    }
+
+    fn session_at(h: u32, m: u32) -> ChatSession {
+        ChatSession::new(chrono::Local.with_ymd_and_hms(2026, 8, 9, h, m, 0).unwrap())
+    }
+
+    #[test]
+    fn push_exchange_appends_user_mascot_pair() {
+        let mut s = session_at(14, 30);
+        s.push_exchange("こんにちは".to_string(), "やあ".to_string());
+        assert_eq!(s.turns.len(), 2);
+        assert_eq!(s.turns[0].role, Role::User);
+        assert_eq!(s.turns[0].text, "こんにちは");
+        assert_eq!(s.turns[1].role, Role::Mascot);
+        assert_eq!(s.turns[1].text, "やあ");
+    }
+
+    #[test]
+    fn chat_note_formats_title_and_body() {
+        let mut s = session_at(14, 30);
+        s.push_exchange("こんにちは".to_string(), "やあ".to_string());
+        s.push_exchange("二言目".to_string(), "返答".to_string());
+        let ended = chrono::Local.with_ymd_and_hms(2026, 8, 9, 14, 42, 0).unwrap();
+        let (title, body) = chat_note(&s, &ended);
+        assert_eq!(title, "会話ログ 2026-08-09 14:30");
+        assert_eq!(
+            body,
+            "**ユーザー**: こんにちは\n**miryam**: やあ\n\n\
+             **ユーザー**: 二言目\n**miryam**: 返答\n\n\
+             ---\n- 開始: 2026-08-09 14:30\n- 終了: 2026-08-09 14:42\nSource: miryam chat"
+        );
+    }
+
+    #[test]
+    fn chat_note_keeps_multiline_reply() {
+        let mut s = session_at(9, 0);
+        s.push_exchange("q".to_string(), "一行目\n二行目".to_string());
+        let ended = chrono::Local.with_ymd_and_hms(2026, 8, 9, 9, 5, 0).unwrap();
+        let (_, body) = chat_note(&s, &ended);
+        assert!(body.starts_with("**ユーザー**: q\n**miryam**: 一行目\n二行目\n"));
     }
 }
