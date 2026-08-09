@@ -17,6 +17,8 @@ struct PhrasesFile {
     skin: Option<SkinConfig>,
     #[serde(default)]
     inkdrop: Option<crate::inkdrop::InkdropConfig>,
+    #[serde(default)]
+    chat: Option<crate::chat::ChatConfig>,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +171,7 @@ pub struct PhraseBook {
     llm: Option<crate::llm::LlmConfig>,
     skin: Option<SkinConfig>,
     inkdrop: Option<crate::inkdrop::InkdropConfig>,
+    chat: Option<crate::chat::ChatConfig>,
 }
 
 impl PhraseBook {
@@ -181,6 +184,7 @@ impl PhraseBook {
             llm,
             skin,
             inkdrop,
+            chat,
         } = file;
         if let Some(cfg) = &llm {
             cfg.validate().context("[llm] の設定が不正です")?;
@@ -190,6 +194,9 @@ impl PhraseBook {
         }
         if let Some(cfg) = &inkdrop {
             cfg.validate().context("[inkdrop] の設定が不正です")?;
+        }
+        if let Some(cfg) = &chat {
+            cfg.validate().context("[chat] の設定が不正です")?;
         }
         let groups = match (top_level, group.is_empty()) {
             (Some(_), false) => anyhow::bail!(
@@ -219,7 +226,7 @@ impl PhraseBook {
         if !groups.iter().any(|g| g.event.is_none()) {
             anyhow::bail!("event なしの通常台詞グループが 1 つ以上必要です");
         }
-        Ok(Self { groups, llm, skin, inkdrop })
+        Ok(Self { groups, llm, skin, inkdrop, chat })
     }
 
     pub fn llm(&self) -> Option<&crate::llm::LlmConfig> {
@@ -232,6 +239,10 @@ impl PhraseBook {
 
     pub fn inkdrop(&self) -> Option<&crate::inkdrop::InkdropConfig> {
         self.inkdrop.as_ref()
+    }
+
+    pub fn chat(&self) -> Option<&crate::chat::ChatConfig> {
+        self.chat.as_ref()
     }
 
     /// $XDG_CONFIG_HOME/miryam/phrases.toml があればそれを、無ければ埋め込みデフォルトを読む
@@ -870,6 +881,37 @@ mod tests {
     fn inkdrop_absent_is_none() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
         assert!(book.inkdrop().is_none());
+    }
+
+    #[test]
+    fn parses_chat_section() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [chat]
+            timeout_secs = 90
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.chat().unwrap().timeout_secs, 90);
+    }
+
+    #[test]
+    fn rejects_invalid_chat_config() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [chat]
+            command = []
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn chat_absent_is_none() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
+        assert!(book.chat().is_none());
     }
 
     #[test]
