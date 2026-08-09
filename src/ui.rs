@@ -5,9 +5,9 @@ use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
 const DEFAULT_CHARACTER_PNG: &[u8] = include_bytes!("../assets/character.png");
 const WINDOW_MARGIN: i32 = 24;
-const CHARACTER_WIDTH: i32 = 200;
-const CHARACTER_HEIGHT: i32 = 300;
-const CONTENT_WIDTH: i32 = 260;
+const CHARACTER_WIDTH: i32 = 600;
+const CHARACTER_HEIGHT: i32 = 900;
+const CONTENT_WIDTH: i32 = 640;
 
 const CSS: &str = "
 window { background: transparent; }
@@ -16,7 +16,7 @@ window { background: transparent; }
   color: #cdd6f4;
   border-radius: 12px;
   padding: 8px 12px;
-  font-size: 14px;
+  font-size: 16px;
 }
 ";
 
@@ -43,7 +43,7 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
     let bubble = gtk::Label::new(None);
     bubble.add_css_class("bubble");
     bubble.set_wrap(true);
-    bubble.set_max_width_chars(16);
+    bubble.set_max_width_chars(28);
     bubble.set_halign(gtk::Align::Center);
     bubble.set_opacity(0.0);
 
