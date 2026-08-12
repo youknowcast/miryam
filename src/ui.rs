@@ -103,6 +103,12 @@ impl MascotUi {
         self.bubble.set_opacity(0.0);
     }
 
+    /// ドラッグで動かした位置を既定 (右下、マージン WINDOW_MARGIN) に戻す
+    pub fn reset_position(&self) {
+        self.window.set_margin(Edge::Right, WINDOW_MARGIN);
+        self.window.set_margin(Edge::Bottom, WINDOW_MARGIN);
+    }
+
     pub fn connect_character_clicked(&self, f: impl Fn() + 'static) {
         let gesture = gtk::GestureClick::new();
         gesture.set_button(gdk::BUTTON_PRIMARY);
@@ -164,6 +170,7 @@ impl MascotUi {
             }
             menu.append_submenu(Some("リンク集"), &links_submenu());
             menu.append(Some("自動発話を停止"), Some("app.mute"));
+            menu.append(Some("位置をリセット"), Some("app.reset-position"));
             menu.append(Some("終了"), Some("app.quit-request"));
             popover.set_menu_model(Some(&menu));
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));

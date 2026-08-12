@@ -1123,6 +1123,14 @@ fn register_actions(
     }
     app.add_action(&add_link);
 
+    // ドラッグで動かした位置を既定 (右下) に戻す
+    let reset_position = gio::SimpleAction::new("reset-position", None);
+    {
+        let ui = ui.clone();
+        reset_position.connect_activate(move |_, _| ui.reset_position());
+    }
+    app.add_action(&reset_position);
+
     // リンク集: 指定 URL のリンクを削除 (メニュー「リンクを削除」から)
     let remove_link = gio::SimpleAction::new("remove-link", Some(glib::VariantTy::STRING));
     {
