@@ -140,7 +140,11 @@ mod tests {
     #[test]
     fn mem_level_boundary() {
         assert_eq!(mem_level(1000, 99), MemLevel::High, "9.9% は High");
-        assert_eq!(mem_level(1000, 100), MemLevel::Normal, "ちょうど 10% は Normal");
+        assert_eq!(
+            mem_level(1000, 100),
+            MemLevel::Normal,
+            "ちょうど 10% は Normal"
+        );
         assert_eq!(mem_level(1000, 500), MemLevel::Normal);
     }
 }

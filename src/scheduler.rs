@@ -35,6 +35,10 @@ mod tests {
         assert_eq!(duration_until_next_hour(59, 59), Duration::from_secs(1));
         assert_eq!(duration_until_next_hour(0, 0), Duration::from_secs(3600));
         assert_eq!(duration_until_next_hour(30, 0), Duration::from_secs(1800));
-        assert_eq!(duration_until_next_hour(59, 60), Duration::from_secs(1), "うるう秒でも 0 にならない");
+        assert_eq!(
+            duration_until_next_hour(59, 60),
+            Duration::from_secs(1),
+            "うるう秒でも 0 にならない"
+        );
     }
 }
