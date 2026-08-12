@@ -34,11 +34,7 @@ pub struct MascotUi {
     window: gtk::ApplicationWindow,
 }
 
-pub fn build(
-    app: &gtk::Application,
-    skin: Option<&str>,
-    chat_enabled: bool,
-) -> anyhow::Result<MascotUi> {
+pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<MascotUi> {
     anyhow::ensure!(
         gtk4_layer_shell::is_supported(),
         "gtk4-layer-shell がこの環境で利用できません (Wayland + layer-shell 対応コンポジタが必要です)"
@@ -85,7 +81,6 @@ pub fn build(
     window.set_keyboard_mode(KeyboardMode::None);
 
     setup_input_region(&window, &picture, &entry);
-    setup_menu(&window, chat_enabled);
 
     window.present();
 
@@ -145,6 +140,40 @@ impl MascotUi {
             }
         });
         self.entry.add_controller(key);
+    }
+
+    /// 右クリックメニューを配線する。メニューモデルは右クリックのたびに
+    /// 作り直す (links.toml のホットリロードのため)
+    pub fn connect_menu(
+        &self,
+        chat_enabled: bool,
+        links_submenu: impl Fn() -> gio::Menu + 'static,
+    ) {
+        let popover = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
+        popover.set_parent(&self.window);
+        popover.set_has_arrow(false);
+
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gdk::BUTTON_SECONDARY);
+        gesture.connect_pressed(move |_, _, x, y| {
+            let menu = gio::Menu::new();
+            menu.append(Some("今すぐ話す"), Some("app.speak-now"));
+            if chat_enabled {
+                menu.append(Some("話しかける"), Some("app.chat-toggle"));
+            }
+            menu.append_submenu(Some("リンク集"), &links_submenu());
+            menu.append(Some("自動発話を停止"), Some("app.mute"));
+            menu.append(Some("終了"), Some("app.quit-request"));
+            popover.set_menu_model(Some(&menu));
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        });
+        self.window.add_controller(gesture);
+    }
+
+    /// クリップボード取得 (リンク追加が使う)
+    pub fn clipboard(&self) -> gdk::Clipboard {
+        self.window.clipboard()
     }
 }
 
@@ -282,28 +311,6 @@ fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture, e
             surface.set_input_region(Some(&region));
         });
     });
-}
-
-fn setup_menu(window: &gtk::ApplicationWindow, chat_enabled: bool) {
-    let menu = gio::Menu::new();
-    menu.append(Some("今すぐ話す"), Some("app.speak-now"));
-    if chat_enabled {
-        menu.append(Some("話しかける"), Some("app.chat-toggle"));
-    }
-    menu.append(Some("自動発話を停止"), Some("app.mute"));
-    menu.append(Some("終了"), Some("app.quit-request"));
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_parent(window);
-    popover.set_has_arrow(false);
-
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gdk::BUTTON_SECONDARY);
-    let popover_ref = popover.clone();
-    gesture.connect_pressed(move |_, _, x, y| {
-        popover_ref.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover_ref.popup();
-    });
-    window.add_controller(gesture);
 }
 
 #[cfg(test)]
