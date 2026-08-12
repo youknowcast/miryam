@@ -43,6 +43,31 @@ pub fn load(path: &Path) -> anyhow::Result<Vec<Link>> {
     from_toml_str(&s).with_context(|| format!("{} が不正です", path.display()))
 }
 
+/// テキストが http/https の URL なら trim して返す。
+/// 判定はホスト部の存在と空白の不在のみ (厳密な URL 文法検証はしない)
+pub fn parse_http_url(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.contains(char::is_whitespace) {
+        return None;
+    }
+    host_of(t)?;
+    Some(t.to_string())
+}
+
+/// http/https URL からホスト名を取り出す (userinfo とポートは除く)
+pub fn host_of(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +138,39 @@ mod tests {
     fn load_missing_file_is_empty() {
         let path = std::path::Path::new("/nonexistent/miryam-test/links.toml");
         assert_eq!(load(path).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_http_url_accepts_http_and_https() {
+        assert_eq!(
+            parse_http_url("  https://github.com/a  "),
+            Some("https://github.com/a".to_string())
+        );
+        assert_eq!(
+            parse_http_url("http://localhost:8080/x?q=1"),
+            Some("http://localhost:8080/x?q=1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_http_url_rejects_non_urls() {
+        assert_eq!(parse_http_url("こんにちは"), None);
+        assert_eq!(parse_http_url("ftp://example.com"), None);
+        assert_eq!(parse_http_url("https://"), None);
+        assert_eq!(parse_http_url("https://exa mple.com"), None);
+        assert_eq!(parse_http_url(""), None);
+    }
+
+    #[test]
+    fn host_of_extracts_host() {
+        assert_eq!(
+            host_of("https://github.com/a/b"),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            host_of("http://user@example.com:8080/x"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(host_of("https://"), None);
     }
 }
