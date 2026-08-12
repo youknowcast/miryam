@@ -3,6 +3,7 @@ mod control;
 mod inkdrop;
 mod links;
 mod llm;
+mod news;
 mod phrases;
 mod scheduler;
 mod system;
