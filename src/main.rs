@@ -143,6 +143,8 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
 
 /// テキストを吹き出しに表示し、secs 秒後の自動消去タイマーを張り直す
 fn show_text_for(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text: &str, secs: u64) {
+    // 吹き出しの掛け替え時は表情も通常へ (辞書発話は show の直後に set_face で上書きする)
+    ui.set_face(None);
     ui.show_bubble(text);
     if let Some(id) = timers.borrow_mut().hide_bubble.take() {
         id.remove();
@@ -152,6 +154,7 @@ fn show_text_for(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text: &str
     let id = glib::timeout_add_local_once(Duration::from_secs(secs), move || {
         timers_c.borrow_mut().hide_bubble = None;
         ui_c.hide_bubble();
+        ui_c.set_face(None);
     });
     timers.borrow_mut().hide_bubble = Some(id);
 }
@@ -166,6 +169,7 @@ fn show_text_persistent(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, tex
     if let Some(id) = timers.borrow_mut().hide_bubble.take() {
         id.remove();
     }
+    ui.set_face(None);
     ui.show_bubble(text);
 }
 
@@ -181,9 +185,10 @@ fn speak(
         req.cancel();
     }
     let now = phrases::Snapshot::current(started_at);
-    let (text, _face) = book.pick(&now);
+    let (text, face) = book.pick(&now);
     let text = phrases::substitute_placeholders(text, &now);
     show_text(ui, timers, &text);
+    ui.set_face(face);
 }
 
 /// 外部由来テキストの発話 (postprocess 済み前提): LLM キャンセル + 表示 + 次回定期発話の張り直し
@@ -724,7 +729,7 @@ fn speak_event(
     started_at: Instant,
 ) -> bool {
     let now = phrases::Snapshot::current(started_at);
-    let Some((text, _face)) = book.pick_event(event, &now) else {
+    let Some((text, face)) = book.pick_event(event, &now) else {
         return false;
     };
     let text = phrases::substitute_placeholders(text, &now);
@@ -733,6 +738,7 @@ fn speak_event(
         req.cancel();
     }
     show_text(ui, timers, &text);
+    ui.set_face(face);
     true
 }
 
