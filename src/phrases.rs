@@ -1,3 +1,4 @@
+use crate::system;
 use anyhow::Context;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
@@ -19,6 +20,8 @@ struct GroupRaw {
     days: Option<Vec<String>>,
     dates: Option<Vec<String>>,
     uptime_hours: Option<u64>,
+    cpu: Option<Vec<String>>,
+    mem: Option<Vec<String>>,
     phrases: Vec<String>,
 }
 
@@ -27,6 +30,8 @@ struct Group {
     days: Option<Vec<chrono::Weekday>>,
     dates: Option<Vec<MonthDay>>,
     uptime_hours: Option<u64>,
+    cpu: Option<Vec<system::CpuLevel>>,
+    mem: Option<Vec<system::MemLevel>>,
     phrases: Vec<String>,
 }
 
@@ -52,9 +57,34 @@ impl GroupRaw {
                 .map(|v| v.iter().map(|s| MonthDay::parse(s)).collect::<anyhow::Result<Vec<_>>>())
                 .transpose()?,
             uptime_hours: self.uptime_hours,
+            cpu: self
+                .cpu
+                .map(|v| v.iter().map(|s| parse_cpu_level(s)).collect::<anyhow::Result<Vec<_>>>())
+                .transpose()?,
+            mem: self
+                .mem
+                .map(|v| v.iter().map(|s| parse_mem_level(s)).collect::<anyhow::Result<Vec<_>>>())
+                .transpose()?,
             phrases: self.phrases,
         })
     }
+}
+
+fn parse_cpu_level(s: &str) -> anyhow::Result<system::CpuLevel> {
+    Ok(match s {
+        "idle" => system::CpuLevel::Idle,
+        "normal" => system::CpuLevel::Normal,
+        "high" => system::CpuLevel::High,
+        other => anyhow::bail!("不明な cpu 条件です: {other} (idle/normal/high)"),
+    })
+}
+
+fn parse_mem_level(s: &str) -> anyhow::Result<system::MemLevel> {
+    Ok(match s {
+        "normal" => system::MemLevel::Normal,
+        "high" => system::MemLevel::High,
+        other => anyhow::bail!("不明な mem 条件です: {other} (normal/high)"),
+    })
 }
 
 /// 条件評価に使う現在状態。時刻取得と評価を分離しテスト可能にする
@@ -64,12 +94,15 @@ pub struct Snapshot {
     pub month: u32,
     pub day: u32,
     pub uptime: Duration,
+    pub cpu: system::CpuLevel,
+    pub mem: system::MemLevel,
 }
 
 impl Snapshot {
     /// 現在のローカル時刻と起動時刻から構築する
     pub fn current(started_at: Instant) -> Self {
         use chrono::{Datelike, Timelike};
+        let (cpu, mem) = system::read_levels();
         let now = chrono::Local::now();
         Self {
             hour: now.hour(),
@@ -77,6 +110,8 @@ impl Snapshot {
             month: now.month(),
             day: now.day(),
             uptime: started_at.elapsed(),
+            cpu,
+            mem,
         }
     }
 }
@@ -94,6 +129,8 @@ impl Group {
             && self
                 .uptime_hours
                 .is_none_or(|h| now.uptime >= Duration::from_secs(h.saturating_mul(3600)))
+            && self.cpu.as_ref().is_none_or(|ls| ls.contains(&now.cpu))
+            && self.mem.as_ref().is_none_or(|ls| ls.contains(&now.mem))
     }
 }
 
@@ -118,6 +155,8 @@ impl PhraseBook {
                     days: None,
                     dates: None,
                     uptime_hours: None,
+                    cpu: None,
+                    mem: None,
                     phrases,
                 }]
             }
@@ -258,6 +297,8 @@ mod tests {
             month,
             day,
             uptime: std::time::Duration::from_secs(uptime_h * 3600),
+            cpu: system::CpuLevel::Normal,
+            mem: system::MemLevel::Normal,
         }
     }
 
@@ -513,5 +554,62 @@ mod tests {
         for bad in ["1-1", "13-01", "12-32", "00-10", "12-00", "1225", "12-2x", "12/25", "12-+5", "+2-05"] {
             assert!(MonthDay::parse(bad).is_err(), "{bad} はエラーのはず");
         }
+    }
+
+    #[test]
+    fn parses_cpu_and_mem_conditions() {
+        let toml = r#"
+            [[group]]
+            cpu = ["idle", "high"]
+            mem = ["high"]
+            phrases = ["x"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(
+            book.groups[0].cpu,
+            Some(vec![system::CpuLevel::Idle, system::CpuLevel::High])
+        );
+        assert_eq!(book.groups[0].mem, Some(vec![system::MemLevel::High]));
+    }
+
+    #[test]
+    fn rejects_unknown_cpu_mem_values() {
+        let cpu_bad = r#"
+            [[group]]
+            cpu = ["busy"]
+            phrases = ["x"]
+        "#;
+        assert!(PhraseBook::from_toml_str(cpu_bad).is_err());
+        let mem_bad = r#"
+            [[group]]
+            mem = ["low"]
+            phrases = ["x"]
+        "#;
+        assert!(PhraseBook::from_toml_str(mem_bad).is_err());
+    }
+
+    #[test]
+    fn cpu_and_mem_conditions_match() {
+        let toml = r#"
+            [[group]]
+            cpu = ["high"]
+            mem = ["high"]
+            phrases = ["x"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let g = &book.groups[0];
+        let base = snap(12, chrono::Weekday::Mon, 6, 15, 0);
+        let both = Snapshot {
+            cpu: system::CpuLevel::High,
+            mem: system::MemLevel::High,
+            ..base
+        };
+        assert!(g.matches(&both));
+        let cpu_only = Snapshot {
+            cpu: system::CpuLevel::High,
+            ..snap(12, chrono::Weekday::Mon, 6, 15, 0)
+        };
+        assert!(!g.matches(&cpu_only), "mem 不一致なら AND で不成立");
+        assert!(!g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)));
     }
 }

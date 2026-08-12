@@ -53,11 +53,15 @@ cargo build --release
   phrases = ["メリークリスマス"]
 
   [[group]]
+  cpu = ["high"]           # CPU 負荷 (idle/normal/high)
+  phrases = ["ファンが頑張っていますね"]
+
+  [[group]]
   uptime_hours = 4             # 連続稼働 n 時間以上
   phrases = ["そろそろ休憩しませんか"]
   ```
 
-  条件の値: `time` は `morning` (5–10時) / `daytime` (11–16時) / `evening` (17–21時) / `night` (22–4時)、`days` は `mon`〜`sun`、`dates` は `MM-DD` (ゼロ埋め 2 桁)。同一グループ内の複数条件は AND、配列内は OR です。発話時にマッチした全グループの台詞から 1 つ選ばれ、どれもマッチしない場合は全台詞が候補になります。
+  条件の値: `time` は `morning` (5–10時) / `daytime` (11–16時) / `evening` (17–21時) / `night` (22–4時)、`days` は `mon`〜`sun`、`dates` は `MM-DD` (ゼロ埋め 2 桁)、`cpu` は `idle` / `normal` / `high` (load1÷コア数が 10% 未満で idle、80% 以上で high)、`mem` は `normal` / `high` (空きメモリが 10% 未満で high)。同一グループ内の複数条件は AND、配列内は OR です。発話時にマッチした全グループの台詞から 1 つ選ばれ、どれもマッチしない場合は全台詞が候補になります。cpu / mem は発話の瞬間のシステム状態で判定されます。
 
   旧形式 (トップレベルの `phrases = [...]` のみ) も引き続き読み込めます。新旧の混在はエラーになります。
 
