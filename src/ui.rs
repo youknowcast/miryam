@@ -81,6 +81,7 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
     window.set_keyboard_mode(KeyboardMode::None);
 
     setup_input_region(&window, &picture, &entry);
+    setup_drag(&window, &picture);
 
     window.present();
 
@@ -308,6 +309,76 @@ fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture, e
     });
 }
 
+/// クリックと区別してドラッグと確定する移動距離 (px)
+const DRAG_THRESHOLD_PX: f64 = 8.0;
+
+/// ドラッグ中のマージン計算: 開始時マージン − オフセットを [0, max] にクランプする。
+/// (右下アンカーのため、右/下へのドラッグ = 正のオフセット = マージン減)
+fn drag_margin(start: i32, offset: f64, max: Option<i32>) -> i32 {
+    let v = ((start as f64 - offset).round() as i32).max(0);
+    match max {
+        Some(m) => v.min(m.max(0)),
+        None => v,
+    }
+}
+
+/// モニタ内に収めるためのマージン上限 (モニタ情報が取れなければ None = 下限クランプのみ)
+fn margin_limits(window: &gtk::ApplicationWindow) -> (Option<i32>, Option<i32>) {
+    let Some(surface) = window.surface() else {
+        return (None, None);
+    };
+    let Some(display) = gdk::Display::default() else {
+        return (None, None);
+    };
+    let Some(monitor) = display.monitor_at_surface(&surface) else {
+        return (None, None);
+    };
+    let geo = monitor.geometry();
+    (
+        Some(geo.width() - window.width()),
+        Some(geo.height() - window.height()),
+    )
+}
+
+/// 左ドラッグでキャラを移動する (右下アンカーからのマージンを動的更新)。
+/// 閾値を超えたらシーケンスを Claim し、同じ picture 上のクリック発話
+/// ジェスチャを自動キャンセルさせる。閾値未満で離せば従来どおりクリック扱い。
+/// 位置は保存しない (再起動で既定位置に戻る)。
+///
+/// オフセットはウィジェット相対座標で報告されるため、窓が動くと座標系も
+/// 一緒にずれ、報告値は「ポインタ移動量 − 窓移動量」の残差になる。
+/// 開始時マージンからの絶対計算だと半速追従・ジッタになるので、
+/// 「現在マージン − 残差」の逐次適用で自己収束させる
+fn setup_drag(window: &gtk::ApplicationWindow, picture: &gtk::Picture) {
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(gdk::BUTTON_PRIMARY);
+    let window_weak = window.downgrade();
+    let dragging = std::rc::Rc::new(std::cell::Cell::new(false));
+    {
+        let dragging = dragging.clone();
+        drag.connect_drag_begin(move |_, _, _| dragging.set(false));
+    }
+    drag.connect_drag_update(move |gesture, dx, dy| {
+        let Some(window) = window_weak.upgrade() else {
+            return;
+        };
+        if !dragging.get() {
+            // Claim 前は窓を動かしていないため dx/dy は純粋なポインタ移動量
+            if dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX {
+                return;
+            }
+            dragging.set(true);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        }
+        let (max_r, max_b) = margin_limits(&window);
+        let r = drag_margin(window.margin(Edge::Right), dx, max_r);
+        let b = drag_margin(window.margin(Edge::Bottom), dy, max_b);
+        window.set_margin(Edge::Right, r);
+        window.set_margin(Edge::Bottom, b);
+    });
+    picture.add_controller(drag);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +390,25 @@ mod tests {
             p,
             std::path::PathBuf::from("/cfg/miryam/skins/asha/character.png")
         );
+    }
+
+    #[test]
+    fn drag_margin_moves_against_offset() {
+        // 右へ 10px ドラッグ → 右マージンは 10 減る
+        assert_eq!(drag_margin(24, 10.0, None), 14);
+        // 左へ 10px ドラッグ → 右マージンは 10 増える
+        assert_eq!(drag_margin(24, -10.0, None), 34);
+    }
+
+    #[test]
+    fn drag_margin_clamps_to_zero() {
+        assert_eq!(drag_margin(24, 100.0, None), 0);
+    }
+
+    #[test]
+    fn drag_margin_clamps_to_max() {
+        assert_eq!(drag_margin(24, -100.0, Some(80)), 80);
+        // 上限が負 (窓がモニタより大きい等) でも 0 に丸める
+        assert_eq!(drag_margin(24, -100.0, Some(-5)), 0);
     }
 }
