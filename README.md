@@ -34,14 +34,32 @@ cargo build --release
 
 ファイルを置くだけで差し替えられます (無ければ内蔵デフォルトを使用):
 
-- `~/.config/miryam/phrases.toml` — 台詞リスト。形式:
+- `~/.config/miryam/phrases.toml` — 台詞辞書。条件付きグループで定義します:
 
   ```toml
-  phrases = [
-    "おはようございます",
-    "少し休憩してもよいのでは",
-  ]
+  [[group]]                    # 条件なし = 常時候補
+  phrases = ["CPUは平静です"]
+
+  [[group]]
+  time = ["morning"]           # 時間帯
+  phrases = ["おはようございます"]
+
+  [[group]]
+  days = ["sat", "sun"]        # 曜日
+  phrases = ["休日もお疲れさまです"]
+
+  [[group]]
+  dates = ["12-24", "12-25"]   # 月-日
+  phrases = ["メリークリスマス"]
+
+  [[group]]
+  uptime_hours = 4             # 連続稼働 n 時間以上
+  phrases = ["そろそろ休憩しませんか"]
   ```
+
+  条件の値: `time` は `morning` (5–10時) / `daytime` (11–16時) / `evening` (17–21時) / `night` (22–4時)、`days` は `mon`〜`sun`、`dates` は `MM-DD` (ゼロ埋め 2 桁)。同一グループ内の複数条件は AND、配列内は OR です。発話時にマッチした全グループの台詞から 1 つ選ばれ、どれもマッチしない場合は全台詞が候補になります。
+
+  旧形式 (トップレベルの `phrases = [...]` のみ) も引き続き読み込めます。新旧の混在はエラーになります。
 
 - `~/.config/miryam/character.png` — キャラクター画像 (透過 PNG 推奨、200x200 目安)
 
