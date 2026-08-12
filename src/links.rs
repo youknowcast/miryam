@@ -102,6 +102,31 @@ pub fn append_link(path: &Path, link: &Link) -> anyhow::Result<()> {
         .with_context(|| format!("{} への書き込みに失敗しました", path.display()))
 }
 
+pub const ADD_FROM_CLIPBOARD_LABEL: &str = "クリップボードの URL を追加";
+
+/// 「リンク集」サブメニューを構築する。リンク 0 件時は追加項目のみ。
+/// セクション区切りが GTK 上では区切り線として描画される
+pub fn build_submenu(links: &[Link]) -> gtk4::gio::Menu {
+    use gtk4::glib::prelude::*;
+    let sub = gtk4::gio::Menu::new();
+    if !links.is_empty() {
+        let section = gtk4::gio::Menu::new();
+        for l in links {
+            let item = gtk4::gio::MenuItem::new(Some(&l.label), None);
+            item.set_action_and_target_value(Some("app.open-link"), Some(&l.url.to_variant()));
+            section.append_item(&item);
+        }
+        sub.append_section(None, &section);
+    }
+    let add = gtk4::gio::Menu::new();
+    add.append(
+        Some(ADD_FROM_CLIPBOARD_LABEL),
+        Some("app.add-link-from-clipboard"),
+    );
+    sub.append_section(None, &add);
+    sub
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +279,50 @@ mod tests {
         };
         append_link(&path, &link).unwrap();
         assert_eq!(load(&path).unwrap(), vec![link]);
+    }
+
+    #[test]
+    fn submenu_lists_links_and_add_item() {
+        use gtk4::prelude::*;
+        let links = vec![
+            Link {
+                label: "GitHub".into(),
+                url: "https://github.com".into(),
+            },
+            Link {
+                label: "カレンダー".into(),
+                url: "https://calendar.google.com".into(),
+            },
+        ];
+        let menu = build_submenu(&links);
+        // セクション 2 つ: リンク一覧 + 追加項目
+        assert_eq!(menu.n_items(), 2);
+        let section = menu.item_link(0, "section").unwrap();
+        assert_eq!(section.n_items(), 2);
+        let label = section
+            .item_attribute_value(0, "label", Some(gtk4::glib::VariantTy::STRING))
+            .unwrap();
+        assert_eq!(label.str(), Some("GitHub"));
+        let target = section
+            .item_attribute_value(0, "target", Some(gtk4::glib::VariantTy::STRING))
+            .unwrap();
+        assert_eq!(target.str(), Some("https://github.com"));
+        let action = section
+            .item_attribute_value(0, "action", Some(gtk4::glib::VariantTy::STRING))
+            .unwrap();
+        assert_eq!(action.str(), Some("app.open-link"));
+    }
+
+    #[test]
+    fn submenu_without_links_has_only_add_item() {
+        use gtk4::prelude::*;
+        let menu = build_submenu(&[]);
+        assert_eq!(menu.n_items(), 1);
+        let section = menu.item_link(0, "section").unwrap();
+        assert_eq!(section.n_items(), 1);
+        let label = section
+            .item_attribute_value(0, "label", Some(gtk4::glib::VariantTy::STRING))
+            .unwrap();
+        assert_eq!(label.str(), Some(ADD_FROM_CLIPBOARD_LABEL));
     }
 }
