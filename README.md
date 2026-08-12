@@ -113,7 +113,7 @@ url = "https://github.com/youknowcast"
 ```
 
 - 「クリップボードの URL を追加」で、コピー中の URL をワンクリック登録できます
-  (ラベルはホスト名。変更したいときは links.toml を直接編集してください)
+  (ラベルは「ホスト + パス」(例: github.com/owner/repo)。変更したいときは links.toml を直接編集してください)
 - クリップボードの読み取りには `wl-paste` (wl-clipboard) が必要です
   (layer-shell 窓はフォーカスを持たず Wayland の selection を受け取れないため)
 - links.toml が無い・リンク 0 件でもメニューは表示され、追加項目だけが並びます

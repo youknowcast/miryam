@@ -68,6 +68,41 @@ pub fn host_of(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
+/// メニュー表示用ラベルの上限文字数 (超過分は切り詰めて … を付ける)
+const LABEL_MAX_CHARS: usize = 40;
+
+/// URL から表示用ラベルを作る: ホスト (ポート含む) + パス。
+/// userinfo・クエリ・フラグメント・末尾スラッシュは落とす。
+/// 同一ホストのリンクが並んでも見分けられるようパスを残す (例: github.com/owner/repo)。
+/// URL として解釈できない場合はそのまま返す
+pub fn label_of(url: &str) -> String {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return url.to_string();
+    };
+    let mut parts = rest.splitn(2, '/');
+    let authority = parts.next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let path = parts
+        .next()
+        .map(|p| p.split(['?', '#']).next().unwrap_or(""))
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let label = if path.is_empty() {
+        host_port.to_string()
+    } else {
+        format!("{host_port}/{path}")
+    };
+    if label.chars().count() > LABEL_MAX_CHARS {
+        let head: String = label.chars().take(LABEL_MAX_CHARS).collect();
+        format!("{head}…")
+    } else {
+        label
+    }
+}
+
 #[derive(Serialize)]
 struct LinksFileOut<'a> {
     link: [&'a Link; 1],
@@ -231,6 +266,46 @@ mod tests {
             Some("example.com".to_string())
         );
         assert_eq!(host_of("https://"), None);
+    }
+
+    #[test]
+    fn label_of_keeps_host_and_path() {
+        assert_eq!(
+            label_of("https://github.com/youknowcast/miryam"),
+            "github.com/youknowcast/miryam"
+        );
+    }
+
+    #[test]
+    fn label_of_host_only_when_no_path() {
+        assert_eq!(label_of("https://github.com"), "github.com");
+        assert_eq!(label_of("https://github.com/"), "github.com");
+    }
+
+    #[test]
+    fn label_of_keeps_port_drops_userinfo_query_fragment() {
+        assert_eq!(
+            label_of("http://localhost:8080/admin?tab=1"),
+            "localhost:8080/admin"
+        );
+        assert_eq!(
+            label_of("https://user@example.com/a/b#sec"),
+            "example.com/a/b"
+        );
+    }
+
+    #[test]
+    fn label_of_truncates_long_labels() {
+        // ホスト 11 文字 + "/" + パス 40 文字 = 52 文字 → 40 文字 + …
+        let url = format!("https://example.com/{}", "a".repeat(40));
+        let label = label_of(&url);
+        assert_eq!(label.chars().count(), 41);
+        assert!(label.ends_with('…'));
+        assert!(label.starts_with("example.com/"));
+        // ちょうど 40 文字は切り詰めない
+        let url40 = format!("https://example.com/{}", "b".repeat(28));
+        assert_eq!(label_of(&url40).chars().count(), 40);
+        assert!(!label_of(&url40).ends_with('…'));
     }
 
     fn temp_links_path(test_name: &str) -> std::path::PathBuf {

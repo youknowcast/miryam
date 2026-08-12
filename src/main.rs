@@ -1159,13 +1159,13 @@ fn add_link_from_text(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text:
         show_text(ui, timers, "登録済みです");
         return;
     }
-    let host = links::host_of(&url).unwrap_or_else(|| url.clone());
+    let label = links::label_of(&url);
     let link = links::Link {
-        label: host.clone(),
+        label: label.clone(),
         url,
     };
     match links::append_link(&path, &link) {
-        Ok(()) => show_text(ui, timers, &format!("{host} を追加しました")),
+        Ok(()) => show_text(ui, timers, &format!("{label} を追加しました")),
         Err(e) => {
             eprintln!("miryam: {e:#}");
             show_text(ui, timers, "links.toml への書き込みに失敗しました");
