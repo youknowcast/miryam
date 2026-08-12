@@ -63,7 +63,7 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
     window.set_child(Some(&root));
 
     setup_input_region(&window, &picture);
-    setup_quit_menu(app, &window);
+    setup_menu(&window);
 
     window.present();
 
@@ -202,18 +202,11 @@ fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture) {
     });
 }
 
-fn setup_quit_menu(app: &gtk::Application, window: &gtk::ApplicationWindow) {
-    let action = gio::SimpleAction::new("quit", None);
-    let app_weak = app.downgrade();
-    action.connect_activate(move |_, _| {
-        if let Some(app) = app_weak.upgrade() {
-            app.quit();
-        }
-    });
-    app.add_action(&action);
-
+fn setup_menu(window: &gtk::ApplicationWindow) {
     let menu = gio::Menu::new();
-    menu.append(Some("終了"), Some("app.quit"));
+    menu.append(Some("今すぐ話す"), Some("app.speak-now"));
+    menu.append(Some("自動発話を停止"), Some("app.mute"));
+    menu.append(Some("終了"), Some("app.quit-request"));
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
     popover.set_parent(window);
     popover.set_has_arrow(false);

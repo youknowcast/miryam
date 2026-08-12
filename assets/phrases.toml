@@ -34,3 +34,21 @@ phrases = ["夜更かしですね"]
 [[group]]
 uptime_hours = 4
 phrases = ["そろそろ休憩しませんか"]
+
+[[group]]
+event = "boot"
+phrases = [
+  "こんにちは。今日もよろしくお願いします",
+  "起動しました。調子はどうですか",
+]
+
+[[group]]
+event = "quit"
+phrases = ["おつかれさまでした。またお会いしましょう"]
+
+[[group]]
+event = "chime"
+phrases = [
+  "{hour}時になりました",
+  "{hour}時です。区切りをつけるにはいい時間ですね",
+]

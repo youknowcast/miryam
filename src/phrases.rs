@@ -20,6 +20,7 @@ struct PhrasesFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GroupRaw {
+    event: Option<String>,
     time: Option<Vec<String>>,
     days: Option<Vec<String>>,
     dates: Option<Vec<String>>,
@@ -51,6 +52,7 @@ impl SkinConfig {
 }
 
 struct Group {
+    event: Option<EventKind>,
     time: Option<Vec<TimeBand>>,
     days: Option<Vec<chrono::Weekday>>,
     dates: Option<Vec<MonthDay>>,
@@ -69,6 +71,7 @@ impl GroupRaw {
             anyhow::bail!("uptime_hours は 1 以上を指定してください");
         }
         Ok(Group {
+            event: self.event.as_deref().map(parse_event).transpose()?,
             time: self
                 .time
                 .map(|v| v.iter().map(|s| TimeBand::parse(s)).collect::<anyhow::Result<Vec<_>>>())
@@ -190,6 +193,7 @@ impl PhraseBook {
                     anyhow::bail!("phrases.toml に台詞が 1 つもありません");
                 }
                 vec![Group {
+                    event: None,
                     time: None,
                     days: None,
                     dates: None,
@@ -205,6 +209,9 @@ impl PhraseBook {
                 .map(GroupRaw::validate)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         };
+        if !groups.iter().any(|g| g.event.is_none()) {
+            anyhow::bail!("event なしの通常台詞グループが 1 つ以上必要です");
+        }
         Ok(Self { groups, llm, skin })
     }
 
@@ -236,18 +243,54 @@ impl PhraseBook {
         let mut pool: Vec<&str> = self
             .groups
             .iter()
-            .filter(|g| g.matches(now))
+            .filter(|g| g.event.is_none() && g.matches(now))
             .flat_map(|g| g.phrases.iter().map(String::as_str))
             .collect();
         if pool.is_empty() {
             pool = self
                 .groups
                 .iter()
+                .filter(|g| g.event.is_none())
                 .flat_map(|g| g.phrases.iter().map(String::as_str))
                 .collect();
         }
         pool[rand::rng().random_range(0..pool.len())]
     }
+
+    pub fn pick_event(&self, event: EventKind, now: &Snapshot) -> Option<&str> {
+        use rand::RngExt;
+        let pool: Vec<&str> = self
+            .groups
+            .iter()
+            .filter(|g| g.event == Some(event) && g.matches(now))
+            .flat_map(|g| g.phrases.iter().map(String::as_str))
+            .collect();
+        if pool.is_empty() {
+            return None;
+        }
+        Some(pool[rand::rng().random_range(0..pool.len())])
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EventKind {
+    Boot,
+    Quit,
+    Chime,
+}
+
+fn parse_event(s: &str) -> anyhow::Result<EventKind> {
+    Ok(match s {
+        "boot" => EventKind::Boot,
+        "quit" => EventKind::Quit,
+        "chime" => EventKind::Chime,
+        other => anyhow::bail!("不明な event です: {other} (boot/quit/chime)"),
+    })
+}
+
+/// 辞書由来の台詞のプレースホルダを置換する ({hour} → 0-23 の時)
+pub fn substitute_placeholders(text: &str, now: &Snapshot) -> String {
+    text.replace("{hour}", &now.hour.to_string())
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -781,5 +824,135 @@ mod tests {
     fn skin_absent_is_none() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
         assert!(book.skin().is_none());
+    }
+
+    #[test]
+    fn parses_event_groups() {
+        let toml = r#"
+            [[group]]
+            phrases = ["normal"]
+
+            [[group]]
+            event = "boot"
+            phrases = ["hello"]
+
+            [[group]]
+            event = "quit"
+            phrases = ["bye"]
+
+            [[group]]
+            event = "chime"
+            phrases = ["bong"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.groups[0].event, None);
+        assert_eq!(book.groups[1].event, Some(EventKind::Boot));
+        assert_eq!(book.groups[2].event, Some(EventKind::Quit));
+        assert_eq!(book.groups[3].event, Some(EventKind::Chime));
+    }
+
+    #[test]
+    fn rejects_unknown_event_value() {
+        let toml = r#"
+            [[group]]
+            phrases = ["normal"]
+
+            [[group]]
+            event = "shutdown"
+            phrases = ["x"]
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_event_only_dictionary() {
+        let toml = r#"
+            [[group]]
+            event = "boot"
+            phrases = ["hello"]
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn pick_excludes_event_groups() {
+        let toml = r#"
+            [[group]]
+            phrases = ["normal"]
+
+            [[group]]
+            event = "boot"
+            phrases = ["hello"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let now = snap(12, chrono::Weekday::Mon, 6, 15, 0);
+        for _ in 0..50 {
+            assert_eq!(book.pick(&now), "normal");
+        }
+    }
+
+    #[test]
+    fn pick_fallback_excludes_event_groups() {
+        // 通常グループが morning 限定でも、夜のフォールバックは event グループに流れない
+        let toml = r#"
+            [[group]]
+            time = ["morning"]
+            phrases = ["morning-only"]
+
+            [[group]]
+            event = "boot"
+            phrases = ["hello"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
+        for _ in 0..50 {
+            assert_eq!(book.pick(&night), "morning-only");
+        }
+    }
+
+    #[test]
+    fn pick_event_filters_by_event_and_conditions() {
+        let toml = r#"
+            [[group]]
+            phrases = ["normal"]
+
+            [[group]]
+            event = "boot"
+            time = ["morning"]
+            phrases = ["morning-boot"]
+
+            [[group]]
+            event = "boot"
+            phrases = ["any-boot"]
+
+            [[group]]
+            event = "quit"
+            phrases = ["bye"]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
+        for _ in 0..50 {
+            assert_eq!(book.pick_event(EventKind::Boot, &night), Some("any-boot"));
+        }
+        let morning = snap(6, chrono::Weekday::Mon, 6, 15, 0);
+        let mut saw_morning = false;
+        for _ in 0..100 {
+            let got = book.pick_event(EventKind::Boot, &morning).unwrap();
+            assert!(["morning-boot", "any-boot"].contains(&got));
+            saw_morning |= got == "morning-boot";
+        }
+        assert!(saw_morning, "朝は morning-boot もプールに入るはず");
+        assert_eq!(book.pick_event(EventKind::Chime, &morning), None, "chime プールは空");
+    }
+
+    #[test]
+    fn substitutes_hour_placeholder() {
+        let now = snap(22, chrono::Weekday::Mon, 6, 15, 0);
+        assert_eq!(substitute_placeholders("{hour}時です", &now), "22時です");
+        assert_eq!(
+            substitute_placeholders("{hour}時。もう{hour}時", &now),
+            "22時。もう22時"
+        );
+        assert_eq!(substitute_placeholders("そのまま", &now), "そのまま");
     }
 }
