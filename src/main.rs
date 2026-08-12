@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 const QUIT_DELAY_SECS: u64 = 2;
 const INBOX_CHECK_FIRST_DELAY_SECS: u64 = 30;
 const INBOX_CHECK_INTERVAL_SECS: u64 = 6 * 3600;
+const NEWS_FIRST_DELAY_SECS: u64 = 30;
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder()
@@ -40,6 +41,7 @@ struct Timers {
     hide_bubble: Option<glib::SourceId>,
     llm_request: Option<llm::LlmRequest>,
     chat_request: Option<llm::LlmRequest>,
+    news_request: Option<llm::LlmRequest>,
     chat_idle: Option<glib::SourceId>,
     /// Some = チャットセッション中 (開始/終了は open_or_toggle_chat / close_chat_session のみが触る)
     chat_session: Option<chat::ChatSession>,
@@ -59,6 +61,7 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     let book_id_cache: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let inbox_last_notified: Rc<RefCell<Option<chrono::NaiveDate>>> = Rc::new(RefCell::new(None));
     let chat_book_id_cache: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let news_digest: Rc<RefCell<Option<news::Digest>>> = Rc::new(RefCell::new(None));
     // [chat] あり + [inkdrop] なし: 会話は可能だが履歴保存はされない (一度だけ知らせる)
     if book.chat().is_some() && book.inkdrop().is_none() {
         eprintln!("miryam: [inkdrop] が未設定のため会話ログは保存されません");
@@ -92,6 +95,18 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
         quitting.clone(),
         started_at,
     );
+
+    if book.news().is_some() {
+        schedule_news(
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            news_digest.clone(),
+            Duration::from_secs(NEWS_FIRST_DELAY_SECS),
+        );
+    }
 
     if book.inkdrop().is_some_and(|c| c.inbox_threshold > 0) {
         schedule_inbox_check(
@@ -498,6 +513,157 @@ fn run_inbox_check(
             }
         });
     });
+}
+
+/// ニュースサイクル: 固定間隔で feeds を取得し LLM でダイジェスト化して知らせる
+fn schedule_news(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    digest: Rc<RefCell<Option<news::Digest>>>,
+    delay: Duration,
+) {
+    glib::timeout_add_local_once(delay, move || {
+        if quitting.get() {
+            return;
+        }
+        run_news_cycle(
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            digest.clone(),
+        );
+        let interval = book
+            .news()
+            .expect("ニュースは [news] 有効時のみ")
+            .interval_mins;
+        schedule_news(
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            digest.clone(),
+            Duration::from_secs(interval * 60),
+        );
+    });
+}
+
+/// 1 サイクル: 全 feed 並行取得 → 整形連結 → LLM → 一言 + ダイジェスト保持。
+/// 途中でミュート/会話が始まっても取得と保持は続け、発話だけ落とす
+fn run_news_cycle(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    digest: Rc<RefCell<Option<news::Digest>>>,
+) {
+    let cfg = book.news().expect("ニュースは [news] 有効時のみ");
+    let urls = cfg.feeds.clone();
+    let max_bytes = (cfg.max_kb_per_feed as usize) * 1024;
+    let total = urls.len();
+    let results: Rc<RefCell<Vec<Option<(String, String)>>>> =
+        Rc::new(RefCell::new((0..total).map(|_| None).collect()));
+    let remaining = Rc::new(Cell::new(total));
+
+    for (i, url) in urls.into_iter().enumerate() {
+        let (book, ui, timers, muted, quitting, digest, results, remaining) = (
+            book.clone(),
+            ui.clone(),
+            timers.clone(),
+            muted.clone(),
+            quitting.clone(),
+            digest.clone(),
+            results.clone(),
+            remaining.clone(),
+        );
+        let url_c = url.clone();
+        news::fetch(&url, move |res| {
+            match res {
+                Ok(body) => {
+                    let text = news::strip_tags(&body);
+                    let text = news::truncate_bytes(&text, max_bytes).to_string();
+                    if !text.is_empty() {
+                        results.borrow_mut()[i] = Some((url_c, text));
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "miryam: ニュース取得に失敗しました ({url_c}): {}",
+                        err.detail
+                    );
+                }
+            }
+            remaining.set(remaining.get() - 1);
+            if remaining.get() == 0 {
+                summarize_news(book, ui, timers, muted, quitting, digest, results);
+            }
+        });
+    }
+}
+
+/// 取得結果を LLM に渡し、一言発話とダイジェスト更新を行う
+fn summarize_news(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    digest: Rc<RefCell<Option<news::Digest>>>,
+    results: Rc<RefCell<Vec<Option<(String, String)>>>>,
+) {
+    if quitting.get() {
+        return;
+    }
+    let sources: Vec<(String, String)> = results.borrow_mut().drain(..).flatten().collect();
+    if sources.is_empty() {
+        news_speak_failure(&ui, &timers, &muted, &quitting);
+        return;
+    }
+    let cfg = book.news().expect("ニュースは [news] 有効時のみ");
+    let llm_cfg = book.llm().expect("[news] には [llm] が必須 (validate 済み)");
+    let prompt = news::build_news_prompt(cfg, &sources);
+    if let Some(req) = timers.borrow_mut().news_request.take() {
+        req.cancel(); // 前サイクルの要約が生きていたら破棄 (遅い LLM の追い越し防止)
+    }
+    let timers_c = timers.clone();
+    let req = llm::request_text(llm_cfg, &prompt, move |raw| {
+        timers_c.borrow_mut().news_request = None;
+        match raw.as_deref().and_then(news::postprocess_news) {
+            Some((bubble, body)) => {
+                *digest.borrow_mut() = Some(news::Digest {
+                    body,
+                    made_at: chrono::Local::now(),
+                });
+                if !quitting.get() && !muted.get() && timers_c.borrow().chat_session.is_none() {
+                    automatic_speak(&ui, &timers_c, &bubble);
+                }
+            }
+            None => {
+                eprintln!("miryam: ニュース要約に失敗しました (LLM 失敗または空出力)");
+                news_speak_failure(&ui, &timers_c, &muted, &quitting);
+            }
+        }
+    });
+    timers.borrow_mut().news_request = Some(req);
+}
+
+/// 失敗一言 (ミュート/会話中/終了中は黙る)
+fn news_speak_failure(
+    ui: &Rc<ui::MascotUi>,
+    timers: &Rc<RefCell<Timers>>,
+    muted: &Rc<Cell<bool>>,
+    quitting: &Rc<Cell<bool>>,
+) {
+    if quitting.get() || muted.get() || timers.borrow().chat_session.is_some() {
+        return;
+    }
+    automatic_speak(ui, timers, "ニュースが取れませんでした");
 }
 
 /// チャット関連関数が共有する状態の束 (既存のタプル引き回しの肥大化を避ける)
