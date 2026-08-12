@@ -31,6 +31,7 @@ struct GroupRaw {
     uptime_hours: Option<u64>,
     cpu: Option<Vec<String>>,
     mem: Option<Vec<String>>,
+    face: Option<String>,
     phrases: Vec<String>,
 }
 
@@ -63,6 +64,7 @@ struct Group {
     uptime_hours: Option<u64>,
     cpu: Option<Vec<system::CpuLevel>>,
     mem: Option<Vec<system::MemLevel>>,
+    face: Option<String>,
     phrases: Vec<String>,
 }
 
@@ -73,6 +75,9 @@ impl GroupRaw {
         }
         if self.uptime_hours == Some(0) {
             anyhow::bail!("uptime_hours は 1 以上を指定してください");
+        }
+        if let Some(f) = &self.face {
+            validate_face(f)?;
         }
         Ok(Group {
             event: self.event.as_deref().map(parse_event).transpose()?,
@@ -117,9 +122,18 @@ impl GroupRaw {
                         .collect::<anyhow::Result<Vec<_>>>()
                 })
                 .transpose()?,
+            face: self.face,
             phrases: self.phrases,
         })
     }
+}
+
+/// face は小文字英字 1 語 (アセット仕様の state 名規約)
+fn validate_face(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_lowercase()) {
+        anyhow::bail!("face は小文字英字 1 語で指定してください: {s:?}");
+    }
+    Ok(())
 }
 
 fn parse_cpu_level(s: &str) -> anyhow::Result<system::CpuLevel> {
@@ -236,6 +250,7 @@ impl PhraseBook {
                     uptime_hours: None,
                     cpu: None,
                     mem: None,
+                    face: None,
                     phrases,
                 }]
             }
@@ -1114,5 +1129,40 @@ mod tests {
             "22時。もう22時"
         );
         assert_eq!(substitute_placeholders("そのまま", &now), "そのまま");
+    }
+
+    #[test]
+    fn face_key_is_parsed() {
+        let book = PhraseBook::from_toml_str(
+            r#"
+            [[group]]
+            phrases = ["通常"]
+
+            [[group]]
+            cpu = ["high"]
+            face = "troubled"
+            phrases = ["困り"]
+        "#,
+        )
+        .unwrap();
+        // pick 経由の検証は Task 2。ここではパースが通ることのみ確認する
+        drop(book);
+    }
+
+    #[test]
+    fn face_rejects_invalid_format() {
+        for bad in ["", "Troubled", "tro-ubled", "困り", "sleepy2"] {
+            let toml = format!(
+                r#"
+                [[group]]
+                face = {bad:?}
+                phrases = ["x"]
+            "#
+            );
+            assert!(
+                PhraseBook::from_toml_str(&toml).is_err(),
+                "{bad:?} はエラーのはず"
+            );
+        }
     }
 }
