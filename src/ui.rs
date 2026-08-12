@@ -32,6 +32,12 @@ pub struct MascotUi {
     picture: gtk::Picture,
     entry: gtk::Entry,
     window: gtk::ApplicationWindow,
+    /// [skin] 名。None なら表情差分は無効 (legacy 配置・埋め込みデフォルト)
+    skin: Option<String>,
+    /// 通常表情 (character.png)。set_face(None) で戻す先
+    default_texture: gdk::Texture,
+    /// 表情テクスチャの遅延ロードキャッシュ。None = ロード失敗済み (再試行しない)
+    face_cache: std::cell::RefCell<std::collections::HashMap<String, Option<gdk::Texture>>>,
 }
 
 pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<MascotUi> {
@@ -90,6 +96,9 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
         picture,
         entry,
         window,
+        skin: skin.map(str::to_string),
+        default_texture: texture,
+        face_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
     })
 }
 
@@ -101,6 +110,38 @@ impl MascotUi {
 
     pub fn hide_bubble(&self) {
         self.bubble.set_opacity(0.0);
+    }
+
+    /// 表情を切り替える。None = 通常 (character.png)。
+    /// 表情画像は初回使用時に読み込んでキャッシュし、失敗した表情は
+    /// 一度だけ警告して以後は通常にフォールバックする ([skin] 未設定も通常のまま)
+    pub fn set_face(&self, face: Option<&str>) {
+        let texture = face.and_then(|f| self.face_texture(f));
+        match texture {
+            Some(t) => self.picture.set_paintable(Some(&t)),
+            None => self.picture.set_paintable(Some(&self.default_texture)),
+        }
+    }
+
+    fn face_texture(&self, face: &str) -> Option<gdk::Texture> {
+        let skin = self.skin.as_deref()?;
+        self.face_cache
+            .borrow_mut()
+            .entry(face.to_string())
+            .or_insert_with(|| {
+                let path = skin_face_path(&glib::user_config_dir(), skin, face);
+                match texture_from_file_scaled(&path) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        eprintln!(
+                            "miryam: 表情 \"{face}\" を読み込めません。通常表情を使います ({}): {e:#}",
+                            path.display()
+                        );
+                        None
+                    }
+                }
+            })
+            .clone()
     }
 
     /// ドラッグで動かした位置を既定 (右下、マージン WINDOW_MARGIN) に戻す
@@ -199,6 +240,15 @@ fn skin_character_path(config_dir: &std::path::Path, name: &str) -> std::path::P
         .join("skins")
         .join(name)
         .join("character.png")
+}
+
+/// スキン名と表情名から character-<face>.png のパスを構築する
+fn skin_face_path(config_dir: &std::path::Path, name: &str, face: &str) -> std::path::PathBuf {
+    config_dir
+        .join("miryam")
+        .join("skins")
+        .join(name)
+        .join(format!("character-{face}.png"))
 }
 
 /// 解決順序: [skin] 指定 (欠落は起動エラー) → 旧 character.png → 埋め込み仮画像
@@ -396,6 +446,15 @@ mod tests {
         assert_eq!(
             p,
             std::path::PathBuf::from("/cfg/miryam/skins/asha/character.png")
+        );
+    }
+
+    #[test]
+    fn skin_face_path_layout() {
+        let p = skin_face_path(std::path::Path::new("/cfg"), "asha", "happy");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/cfg/miryam/skins/asha/character-happy.png")
         );
     }
 
