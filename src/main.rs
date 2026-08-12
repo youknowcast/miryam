@@ -181,7 +181,8 @@ fn speak(
         req.cancel();
     }
     let now = phrases::Snapshot::current(started_at);
-    let text = phrases::substitute_placeholders(book.pick(&now), &now);
+    let (text, _face) = book.pick(&now);
+    let text = phrases::substitute_placeholders(text, &now);
     show_text(ui, timers, &text);
 }
 
@@ -723,7 +724,7 @@ fn speak_event(
     started_at: Instant,
 ) -> bool {
     let now = phrases::Snapshot::current(started_at);
-    let Some(text) = book.pick_event(event, &now) else {
+    let Some((text, _face)) = book.pick_event(event, &now) else {
         return false;
     };
     let text = phrases::substitute_placeholders(text, &now);
