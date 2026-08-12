@@ -1123,6 +1123,30 @@ fn register_actions(
     }
     app.add_action(&add_link);
 
+    // リンク集: 指定 URL のリンクを削除 (メニュー「リンクを削除」から)
+    let remove_link = gio::SimpleAction::new("remove-link", Some(glib::VariantTy::STRING));
+    {
+        let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+        remove_link.connect_activate(move |_, param| {
+            if quitting.get() {
+                return;
+            }
+            let Some(url) = param.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            match links::remove_link(&links::links_path(), &url) {
+                Ok(Some(label)) => show_text(&ui, &timers, &format!("{label} を削除しました")),
+                // メニュー表示後に links.toml が変わった場合など: 黙って何もしない
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("miryam: {e:#}");
+                    show_text(&ui, &timers, "links.toml を更新できませんでした");
+                }
+            }
+        });
+    }
+    app.add_action(&remove_link);
+
     // リンク集サブメニュー: 右クリックのたびに links.toml を読み直す
     {
         let (ui_c, timers_c) = (ui.clone(), timers.clone());

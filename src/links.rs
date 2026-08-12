@@ -108,6 +108,31 @@ struct LinksFileOut<'a> {
     link: [&'a Link; 1],
 }
 
+#[derive(Serialize)]
+struct LinksFileAllOut<'a> {
+    link: &'a [Link],
+}
+
+/// url が一致するリンクを links.toml から削除して書き戻す。
+/// 削除したら Ok(Some(削除したラベル))、一致なしは何もせず Ok(None)。
+/// 注意: ファイル全体を再生成するため手書きコメント等は残らない
+pub fn remove_link(path: &Path, url: &str) -> anyhow::Result<Option<String>> {
+    let mut links = load(path)?;
+    let Some(pos) = links.iter().position(|l| l.url == url) else {
+        return Ok(None);
+    };
+    let removed = links.remove(pos);
+    let content = if links.is_empty() {
+        String::new()
+    } else {
+        toml::to_string(&LinksFileAllOut { link: &links })
+            .context("リンクの TOML 変換に失敗しました")?
+    };
+    std::fs::write(path, content)
+        .with_context(|| format!("{} への書き込みに失敗しました", path.display()))?;
+    Ok(Some(removed.label))
+}
+
 /// links.toml の末尾に [[link]] ブロックを追記する (無ければ作成)。
 /// 既存内容の整形・並び替えはしない
 pub fn append_link(path: &Path, link: &Link) -> anyhow::Result<()> {
@@ -138,6 +163,7 @@ pub fn append_link(path: &Path, link: &Link) -> anyhow::Result<()> {
 }
 
 pub const ADD_FROM_CLIPBOARD_LABEL: &str = "クリップボードの URL を追加";
+pub const REMOVE_SUBMENU_LABEL: &str = "リンクを削除";
 
 /// 「リンク集」サブメニューを構築する。リンク 0 件時は追加項目のみ。
 /// セクション区切りが GTK 上では区切り線として描画される
@@ -153,12 +179,22 @@ pub fn build_submenu(links: &[Link]) -> gtk4::gio::Menu {
         }
         sub.append_section(None, &section);
     }
-    let add = gtk4::gio::Menu::new();
-    add.append(
+    let tail = gtk4::gio::Menu::new();
+    tail.append(
         Some(ADD_FROM_CLIPBOARD_LABEL),
         Some("app.add-link-from-clipboard"),
     );
-    sub.append_section(None, &add);
+    // 削除は誤クリックしにくいようネストしたサブメニューに隔離する
+    if !links.is_empty() {
+        let del = gtk4::gio::Menu::new();
+        for l in links {
+            let item = gtk4::gio::MenuItem::new(Some(&l.label), None);
+            item.set_action_and_target_value(Some("app.remove-link"), Some(&l.url.to_variant()));
+            del.append_item(&item);
+        }
+        tail.append_submenu(Some(REMOVE_SUBMENU_LABEL), &del);
+    }
+    sub.append_section(None, &tail);
     sub
 }
 
@@ -386,6 +422,66 @@ mod tests {
             .item_attribute_value(0, "action", Some(gtk4::glib::VariantTy::STRING))
             .unwrap();
         assert_eq!(action.str(), Some("app.open-link"));
+        // 2 つ目のセクション: 追加項目 + 削除サブメニュー
+        let tail = menu.item_link(1, "section").unwrap();
+        assert_eq!(tail.n_items(), 2);
+        let del_label = tail
+            .item_attribute_value(1, "label", Some(gtk4::glib::VariantTy::STRING))
+            .unwrap();
+        assert_eq!(del_label.str(), Some(REMOVE_SUBMENU_LABEL));
+        let del = tail.item_link(1, "submenu").unwrap();
+        assert_eq!(del.n_items(), 2);
+        let del_action = del
+            .item_attribute_value(0, "action", Some(gtk4::glib::VariantTy::STRING))
+            .unwrap();
+        assert_eq!(del_action.str(), Some("app.remove-link"));
+        let del_target = del
+            .item_attribute_value(0, "target", Some(gtk4::glib::VariantTy::STRING))
+            .unwrap();
+        assert_eq!(del_target.str(), Some("https://github.com"));
+    }
+
+    #[test]
+    fn remove_link_deletes_matching_url() {
+        let path = temp_links_path("remove");
+        let first = Link {
+            label: "GitHub".into(),
+            url: "https://github.com".into(),
+        };
+        let second = Link {
+            label: "例".into(),
+            url: "https://example.com".into(),
+        };
+        append_link(&path, &first).unwrap();
+        append_link(&path, &second).unwrap();
+        let removed = remove_link(&path, "https://github.com").unwrap();
+        assert_eq!(removed, Some("GitHub".to_string()));
+        assert_eq!(load(&path).unwrap(), vec![second]);
+    }
+
+    #[test]
+    fn remove_link_no_match_leaves_file_unchanged() {
+        let path = temp_links_path("remove-nomatch");
+        let link = Link {
+            label: "GitHub".into(),
+            url: "https://github.com".into(),
+        };
+        append_link(&path, &link).unwrap();
+        let removed = remove_link(&path, "https://other.example").unwrap();
+        assert_eq!(removed, None);
+        assert_eq!(load(&path).unwrap(), vec![link]);
+    }
+
+    #[test]
+    fn remove_last_link_leaves_empty_file() {
+        let path = temp_links_path("remove-last");
+        let link = Link {
+            label: "GitHub".into(),
+            url: "https://github.com".into(),
+        };
+        append_link(&path, &link).unwrap();
+        remove_link(&path, "https://github.com").unwrap();
+        assert_eq!(load(&path).unwrap(), vec![]);
     }
 
     #[test]
