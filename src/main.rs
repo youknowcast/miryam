@@ -554,6 +554,9 @@ fn schedule_news(
     });
 }
 
+/// 取得結果 (feeds と同順、None = 失敗または空)。fetch コールバック間で共有する
+type NewsFetchResults = Rc<RefCell<Vec<Option<(String, String)>>>>;
+
 /// 1 サイクル: 全 feed 並行取得 → 整形連結 → LLM → 一言 + ダイジェスト保持。
 /// 途中でミュート/会話が始まっても取得と保持は続け、発話だけ落とす
 fn run_news_cycle(
@@ -568,8 +571,7 @@ fn run_news_cycle(
     let urls = cfg.feeds.clone();
     let max_bytes = (cfg.max_kb_per_feed as usize) * 1024;
     let total = urls.len();
-    let results: Rc<RefCell<Vec<Option<(String, String)>>>> =
-        Rc::new(RefCell::new((0..total).map(|_| None).collect()));
+    let results: NewsFetchResults = Rc::new(RefCell::new((0..total).map(|_| None).collect()));
     let remaining = Rc::new(Cell::new(total));
 
     for (i, url) in urls.into_iter().enumerate() {
@@ -616,7 +618,7 @@ fn summarize_news(
     muted: Rc<Cell<bool>>,
     quitting: Rc<Cell<bool>>,
     digest: Rc<RefCell<Option<news::Digest>>>,
-    results: Rc<RefCell<Vec<Option<(String, String)>>>>,
+    results: NewsFetchResults,
 ) {
     if quitting.get() {
         return;
@@ -627,7 +629,9 @@ fn summarize_news(
         return;
     }
     let cfg = book.news().expect("ニュースは [news] 有効時のみ");
-    let llm_cfg = book.llm().expect("[news] には [llm] が必須 (validate 済み)");
+    let llm_cfg = book
+        .llm()
+        .expect("[news] には [llm] が必須 (validate 済み)");
     let prompt = news::build_news_prompt(cfg, &sources);
     if let Some(req) = timers.borrow_mut().news_request.take() {
         req.cancel(); // 前サイクルの要約が生きていたら破棄 (遅い LLM の追い越し防止)
@@ -1356,16 +1360,18 @@ fn register_actions(
     // リンク集サブメニュー: 右クリックのたびに links.toml を読み直す
     {
         let (ui_c, timers_c) = (ui.clone(), timers.clone());
-        ui.connect_menu(book.chat().is_some(), book.news().is_some(), move || {
-            match links::load(&links::links_path()) {
+        ui.connect_menu(
+            book.chat().is_some(),
+            book.news().is_some(),
+            move || match links::load(&links::links_path()) {
                 Ok(list) => links::build_submenu(&list),
                 Err(e) => {
                     eprintln!("miryam: {e:#}");
                     show_text(&ui_c, &timers_c, "links.toml が不正です");
                     links::build_submenu(&[])
                 }
-            }
-        });
+            },
+        );
     }
 }
 

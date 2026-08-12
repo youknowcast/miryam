@@ -226,7 +226,11 @@ mod tests {
         assert!(parse("max_kb_per_feed = 0").validate().is_err());
         assert!(parse("max_kb_per_feed = 65").validate().is_err());
         assert!(parse("feeds = []").validate().is_err());
-        assert!(parse(r#"feeds = ["ftp://example.com/a"]"#).validate().is_err());
+        assert!(
+            parse(r#"feeds = ["ftp://example.com/a"]"#)
+                .validate()
+                .is_err()
+        );
         assert!(
             parse(r#"feeds = ["https://example.com/rss", "http://例.jp/x"]"#)
                 .validate()
@@ -267,7 +271,11 @@ mod tests {
     #[test]
     fn truncate_respects_char_boundary() {
         assert_eq!(truncate_bytes("abcdef", 4), "abcd");
-        assert_eq!(truncate_bytes("あいう", 4), "あ", "3 バイト文字の途中で切らない");
+        assert_eq!(
+            truncate_bytes("あいう", 4),
+            "あ",
+            "3 バイト文字の途中で切らない"
+        );
         assert_eq!(truncate_bytes("abc", 10), "abc");
     }
 
