@@ -76,6 +76,7 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
         &quitting,
         &book_id_cache,
         &chat_book_id_cache,
+        &news_digest,
         started_at,
     );
 
@@ -1004,6 +1005,7 @@ fn register_actions(
     quitting: &Rc<Cell<bool>>,
     book_id_cache: &Rc<RefCell<Option<String>>>,
     chat_book_id_cache: &Rc<RefCell<Option<String>>>,
+    news_digest: &Rc<RefCell<Option<news::Digest>>>,
     started_at: Instant,
 ) {
     let chat_ctx = ChatCtx {
@@ -1220,6 +1222,28 @@ fn register_actions(
         }
     }
 
+    // ニュース: メニュー「ニュースを見る」。メニュー項目は [news] 有効時しか出ないが、
+    // アクション自体は無条件登録でよい (外部から叩かれても「まだありません」で安全)
+    let news_show = gio::SimpleAction::new("news-show", None);
+    {
+        let (ui, timers, digest) = (ui.clone(), timers.clone(), news_digest.clone());
+        let app = app.clone();
+        let news_window: Rc<RefCell<Option<gtk::Window>>> = Rc::new(RefCell::new(None));
+        news_show.connect_activate(move |_, _| {
+            use chrono::Timelike;
+            match &*digest.borrow() {
+                Some(d) => ui::show_news_window(
+                    &app,
+                    &news_window,
+                    &format!("{}時のニュース", d.made_at.hour()),
+                    &d.body,
+                ),
+                None => show_text(&ui, &timers, "まだニュースがありません"),
+            }
+        });
+    }
+    app.add_action(&news_show);
+
     // リンク集: リンクを既定ブラウザで開く (gtk::show_uri は 4.10 deprecated のため gio 経由)
     let open_link = gio::SimpleAction::new("open-link", Some(glib::VariantTy::STRING));
     open_link.connect_activate(move |_, param| {
@@ -1332,7 +1356,7 @@ fn register_actions(
     // リンク集サブメニュー: 右クリックのたびに links.toml を読み直す
     {
         let (ui_c, timers_c) = (ui.clone(), timers.clone());
-        ui.connect_menu(book.chat().is_some(), move || {
+        ui.connect_menu(book.chat().is_some(), book.news().is_some(), move || {
             match links::load(&links::links_path()) {
                 Ok(list) => links::build_submenu(&list),
                 Err(e) => {

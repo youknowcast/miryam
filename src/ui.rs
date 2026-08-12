@@ -195,6 +195,7 @@ impl MascotUi {
     pub fn connect_menu(
         &self,
         chat_enabled: bool,
+        news_enabled: bool,
         links_submenu: impl Fn() -> gio::Menu + 'static,
     ) {
         let popover = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
@@ -209,6 +210,9 @@ impl MascotUi {
             if chat_enabled {
                 menu.append(Some("話しかける"), Some("app.chat-toggle"));
             }
+            if news_enabled {
+                menu.append(Some("ニュースを見る"), Some("app.news-show"));
+            }
             menu.append_submenu(Some("リンク集"), &links_submenu());
             menu.append(Some("自動発話を停止"), Some("app.mute"));
             menu.append(Some("位置をリセット"), Some("app.reset-position"));
@@ -219,6 +223,60 @@ impl MascotUi {
         });
         self.window.add_controller(gesture);
     }
+}
+
+/// ニュースダイジェスト用の通常ウィンドウ (layer shell ではないフロート窓)。
+/// slot で同時 1 枚を保証する: 開き直しは前の窓を閉じてから
+pub fn show_news_window(
+    app: &gtk::Application,
+    slot: &std::rc::Rc<std::cell::RefCell<Option<gtk::Window>>>,
+    title: &str,
+    body: &str,
+) {
+    if let Some(prev) = slot.borrow_mut().take() {
+        prev.close();
+    }
+    let label = gtk::Label::new(Some(body));
+    label.set_wrap(true);
+    label.set_selectable(true);
+    label.set_xalign(0.0);
+    label.set_valign(gtk::Align::Start);
+    label.set_margin_top(12);
+    label.set_margin_bottom(12);
+    label.set_margin_start(16);
+    label.set_margin_end(16);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scrolled.set_child(Some(&label));
+
+    let window = gtk::Window::new();
+    window.set_application(Some(app));
+    window.set_title(Some(title));
+    window.set_default_size(520, 640);
+    window.set_child(Some(&scrolled));
+
+    let key = gtk::EventControllerKey::new();
+    let win_c = window.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gdk::Key::Escape {
+            win_c.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key);
+
+    // 閉じられたら slot を空に (Esc・タイトルバー双方この経路を通る)
+    let slot_c = slot.clone();
+    window.connect_close_request(move |_| {
+        slot_c.borrow_mut().take();
+        glib::Propagation::Proceed
+    });
+
+    *slot.borrow_mut() = Some(window.clone());
+    window.present();
 }
 
 fn load_css() {
