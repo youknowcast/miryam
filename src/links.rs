@@ -68,6 +68,40 @@ pub fn host_of(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
+#[derive(Serialize)]
+struct LinksFileOut<'a> {
+    link: [&'a Link; 1],
+}
+
+/// links.toml の末尾に [[link]] ブロックを追記する (無ければ作成)。
+/// 既存内容の整形・並び替えはしない
+pub fn append_link(path: &Path, link: &Link) -> anyhow::Result<()> {
+    let block = toml::to_string(&LinksFileOut { link: [link] })
+        .context("リンクの TOML 変換に失敗しました")?;
+    let mut content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("{} の作成に失敗しました", dir.display()))?;
+            }
+            String::new()
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("{} の読み込みに失敗しました", path.display()));
+        }
+    };
+    if !content.is_empty() {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+    }
+    content.push_str(&block);
+    std::fs::write(path, content)
+        .with_context(|| format!("{} への書き込みに失敗しました", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +206,53 @@ mod tests {
             Some("example.com".to_string())
         );
         assert_eq!(host_of("https://"), None);
+    }
+
+    fn temp_links_path(test_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "miryam-links-test-{}-{}",
+            std::process::id(),
+            test_name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("links.toml")
+    }
+
+    #[test]
+    fn append_creates_file_and_dir() {
+        let path = temp_links_path("create");
+        let link = Link {
+            label: "GitHub".into(),
+            url: "https://github.com".into(),
+        };
+        append_link(&path, &link).unwrap();
+        assert_eq!(load(&path).unwrap(), vec![link]);
+    }
+
+    #[test]
+    fn append_preserves_existing_links() {
+        let path = temp_links_path("preserve");
+        let first = Link {
+            label: "GitHub".into(),
+            url: "https://github.com".into(),
+        };
+        let second = Link {
+            label: "例".into(),
+            url: "https://example.com".into(),
+        };
+        append_link(&path, &first).unwrap();
+        append_link(&path, &second).unwrap();
+        assert_eq!(load(&path).unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn append_escapes_special_characters() {
+        let path = temp_links_path("escape");
+        let link = Link {
+            label: "引用\"符".into(),
+            url: "https://example.com/a?q=\"x\"".into(),
+        };
+        append_link(&path, &link).unwrap();
+        assert_eq!(load(&path).unwrap(), vec![link]);
     }
 }
