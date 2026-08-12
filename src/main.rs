@@ -1045,6 +1045,97 @@ fn register_actions(
             });
         }
     }
+
+    // リンク集: リンクを既定ブラウザで開く (gtk::show_uri は 4.10 deprecated のため gio 経由)
+    let open_link = gio::SimpleAction::new("open-link", Some(glib::VariantTy::STRING));
+    open_link.connect_activate(move |_, param| {
+        let Some(url) = param.and_then(|v| v.get::<String>()) else {
+            return;
+        };
+        gio::AppInfo::launch_default_for_uri_async(
+            &url,
+            None::<&gio::AppLaunchContext>,
+            None::<&gio::Cancellable>,
+            move |res| {
+                if let Err(e) = res {
+                    eprintln!("miryam: URL を開けませんでした: {e}");
+                }
+            },
+        );
+    });
+    app.add_action(&open_link);
+
+    // リンク集: クリップボードの URL を links.toml に追記
+    let add_link = gio::SimpleAction::new("add-link-from-clipboard", None);
+    {
+        let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+        add_link.connect_activate(move |_, _| {
+            if quitting.get() {
+                return;
+            }
+            let (ui, timers) = (ui.clone(), timers.clone());
+            ui.clipboard().read_text_async(
+                None::<&gio::Cancellable>,
+                move |res: Result<Option<glib::GString>, glib::Error>| {
+                    let text = match &res {
+                        Ok(Some(t)) => t.to_string(),
+                        _ => String::new(),
+                    };
+                    add_link_from_text(&ui, &timers, &text);
+                },
+            );
+        });
+    }
+    app.add_action(&add_link);
+
+    // リンク集サブメニュー: 右クリックのたびに links.toml を読み直す
+    {
+        let (ui_c, timers_c) = (ui.clone(), timers.clone());
+        ui.connect_menu(book.chat().is_some(), move || {
+            match links::load(&links::links_path()) {
+                Ok(list) => links::build_submenu(&list),
+                Err(e) => {
+                    eprintln!("miryam: {e:#}");
+                    show_text(&ui_c, &timers_c, "links.toml が不正です");
+                    links::build_submenu(&[])
+                }
+            }
+        });
+    }
+}
+
+/// クリップボードのテキストを検証して links.toml に追記する。
+/// 結果は吹き出しで知らせる (成功 / URL でない / 登録済み / 失敗)
+fn add_link_from_text(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text: &str) {
+    let Some(url) = links::parse_http_url(text) else {
+        show_text(ui, timers, "クリップボードに URL がありません");
+        return;
+    };
+    let path = links::links_path();
+    let existing = match links::load(&path) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("miryam: {e:#}");
+            show_text(ui, timers, "links.toml が不正です");
+            return;
+        }
+    };
+    if existing.iter().any(|l| l.url == url) {
+        show_text(ui, timers, "登録済みです");
+        return;
+    }
+    let host = links::host_of(&url).unwrap_or_else(|| url.clone());
+    let link = links::Link {
+        label: host.clone(),
+        url,
+    };
+    match links::append_link(&path, &link) {
+        Ok(()) => show_text(ui, timers, &format!("{host} を追加しました")),
+        Err(e) => {
+            eprintln!("miryam: {e:#}");
+            show_text(ui, timers, "links.toml への書き込みに失敗しました");
+        }
+    }
 }
 
 #[cfg(test)]
