@@ -1,13 +1,13 @@
 use anyhow::Context;
-use gtk4 as gtk;
 use gtk::{gdk, gdk_pixbuf, gio, glib, prelude::*};
-use gtk4_layer_shell::{Edge, Layer, LayerShell};
+use gtk4 as gtk;
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 const DEFAULT_CHARACTER_PNG: &[u8] = include_bytes!("../assets/character.png");
 const WINDOW_MARGIN: i32 = 24;
-const CHARACTER_WIDTH: i32 = 200;
-const CHARACTER_HEIGHT: i32 = 300;
-const CONTENT_WIDTH: i32 = 260;
+const CHARACTER_WIDTH: i32 = 600;
+const CHARACTER_HEIGHT: i32 = 900;
+const CONTENT_WIDTH: i32 = 640;
 
 const CSS: &str = "
 window { background: transparent; }
@@ -16,16 +16,29 @@ window { background: transparent; }
   color: #cdd6f4;
   border-radius: 12px;
   padding: 8px 12px;
-  font-size: 14px;
+  font-size: 16px;
+}
+.chat-entry {
+  background: rgba(30, 30, 46, 0.92);
+  color: #cdd6f4;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 16px;
 }
 ";
 
 pub struct MascotUi {
     bubble: gtk::Label,
     picture: gtk::Picture,
+    entry: gtk::Entry,
+    window: gtk::ApplicationWindow,
 }
 
-pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<MascotUi> {
+pub fn build(
+    app: &gtk::Application,
+    skin: Option<&str>,
+    chat_enabled: bool,
+) -> anyhow::Result<MascotUi> {
     anyhow::ensure!(
         gtk4_layer_shell::is_supported(),
         "gtk4-layer-shell がこの環境で利用できません (Wayland + layer-shell 対応コンポジタが必要です)"
@@ -43,14 +56,22 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
     let bubble = gtk::Label::new(None);
     bubble.add_css_class("bubble");
     bubble.set_wrap(true);
-    bubble.set_max_width_chars(16);
+    bubble.set_max_width_chars(28);
     bubble.set_halign(gtk::Align::Center);
     bubble.set_opacity(0.0);
+
+    // チャット入力欄: 普段は非表示。表示制御は visible で行う
+    // (窓は下端アンカーなので、表示時は上に伸びるだけでキャラ位置は安定する)
+    let entry = gtk::Entry::new();
+    entry.add_css_class("chat-entry");
+    entry.set_placeholder_text(Some("話しかける…"));
+    entry.set_visible(false);
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.set_width_request(CONTENT_WIDTH);
     root.append(&bubble);
     root.append(&picture);
+    root.append(&entry);
 
     let window = gtk::ApplicationWindow::new(app);
     window.init_layer_shell();
@@ -61,13 +82,19 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
     window.set_margin(Edge::Bottom, WINDOW_MARGIN);
     window.set_namespace(Some("miryam"));
     window.set_child(Some(&root));
+    window.set_keyboard_mode(KeyboardMode::None);
 
-    setup_input_region(&window, &picture);
-    setup_menu(&window);
+    setup_input_region(&window, &picture, &entry);
+    setup_menu(&window, chat_enabled);
 
     window.present();
 
-    Ok(MascotUi { bubble, picture })
+    Ok(MascotUi {
+        bubble,
+        picture,
+        entry,
+        window,
+    })
 }
 
 impl MascotUi {
@@ -85,6 +112,39 @@ impl MascotUi {
         gesture.set_button(gdk::BUTTON_PRIMARY);
         gesture.connect_released(move |_, _, _, _| f());
         self.picture.add_controller(gesture);
+    }
+
+    pub fn open_chat(&self) {
+        self.entry.set_visible(true);
+        self.window.set_keyboard_mode(KeyboardMode::OnDemand);
+        self.entry.grab_focus();
+    }
+
+    pub fn close_chat(&self) {
+        self.entry.set_visible(false);
+        // 復帰漏れは他アプリへのキー入力を妨げる — クローズは必ずここを通ること
+        self.window.set_keyboard_mode(KeyboardMode::None);
+    }
+
+    pub fn connect_chat_submitted(&self, f: impl Fn(String) + 'static) {
+        self.entry.connect_activate(move |e| {
+            let text = e.text().to_string();
+            e.set_text("");
+            f(text);
+        });
+    }
+
+    pub fn connect_chat_escape(&self, f: impl Fn() + 'static) {
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                f();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        self.entry.add_controller(key);
     }
 }
 
@@ -147,7 +207,9 @@ fn texture_from_bytes_scaled(bytes: &'static [u8]) -> anyhow::Result<gdk::Textur
     let loader = gdk_pixbuf::PixbufLoader::new();
     loader.write(bytes)?;
     loader.close()?;
-    let pixbuf = loader.pixbuf().context("デコード結果を取得できませんでした")?;
+    let pixbuf = loader
+        .pixbuf()
+        .context("デコード結果を取得できませんでした")?;
     let pixbuf = scale_to_fit(&pixbuf, CHARACTER_WIDTH, CHARACTER_HEIGHT);
     Ok(gdk::Texture::for_pixbuf(&pixbuf))
 }
@@ -167,10 +229,12 @@ fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_w: i32, max_h: i32) -> gdk_pixb
         .unwrap_or_else(|| pixbuf.clone())
 }
 
-/// クリックを受けるのはキャラ画像の矩形のみ。透明部分と吹き出しは下のアプリへ素通し
-fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture) {
+/// クリックを受けるのはキャラ画像の矩形 (と表示中はチャット入力欄) のみ。
+/// 透明部分と吹き出しは下のアプリへ素通し
+fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture, entry: &gtk::Entry) {
     let window_weak = window.downgrade();
     let picture_weak = picture.downgrade();
+    let entry_weak = entry.downgrade();
     // map シグナルはコンポジタ都合の再マップ等で複数回発火しうる。connect_layout の
     // ハンドラを毎回追加登録すると同じ GdkSurface に購読が際限なく積み重なるため、
     // 初回のみ登録するようフラグで防ぐ。
@@ -184,12 +248,18 @@ fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture) {
         let Some(surface) = w.surface() else { return };
         let window_weak = window_weak.clone();
         let picture_weak = picture_weak.clone();
+        let entry_weak = entry_weak.clone();
         surface.connect_layout(move |surface, _width, _height| {
-            let (Some(window), Some(picture)) = (window_weak.upgrade(), picture_weak.upgrade())
-            else {
+            let (Some(window), Some(picture), Some(entry)) = (
+                window_weak.upgrade(),
+                picture_weak.upgrade(),
+                entry_weak.upgrade(),
+            ) else {
                 return;
             };
-            let Some(bounds) = picture.compute_bounds(&window) else { return };
+            let Some(bounds) = picture.compute_bounds(&window) else {
+                return;
+            };
             let rect = gtk::cairo::RectangleInt::new(
                 bounds.x() as i32,
                 bounds.y() as i32,
@@ -197,14 +267,29 @@ fn setup_input_region(window: &gtk::ApplicationWindow, picture: &gtk::Picture) {
                 bounds.height() as i32,
             );
             let region = gtk::cairo::Region::create_rectangle(&rect);
+            // チャット中は入力欄もクリック・フォーカス可能にする
+            if gtk::prelude::WidgetExt::is_visible(&entry)
+                && let Some(b) = entry.compute_bounds(&window)
+            {
+                let r = gtk::cairo::RectangleInt::new(
+                    b.x() as i32,
+                    b.y() as i32,
+                    b.width() as i32,
+                    b.height() as i32,
+                );
+                let _ = region.union_rectangle(&r);
+            }
             surface.set_input_region(Some(&region));
         });
     });
 }
 
-fn setup_menu(window: &gtk::ApplicationWindow) {
+fn setup_menu(window: &gtk::ApplicationWindow, chat_enabled: bool) {
     let menu = gio::Menu::new();
     menu.append(Some("今すぐ話す"), Some("app.speak-now"));
+    if chat_enabled {
+        menu.append(Some("話しかける"), Some("app.chat-toggle"));
+    }
     menu.append(Some("自動発話を停止"), Some("app.mute"));
     menu.append(Some("終了"), Some("app.quit-request"));
     let popover = gtk::PopoverMenu::from_model(Some(&menu));

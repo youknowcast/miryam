@@ -2,8 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gtk4 as gtk;
 use gtk::{gio, glib, prelude::*};
+use gtk4 as gtk;
 use serde::Deserialize;
 
 use crate::phrases::Snapshot;
@@ -51,17 +51,22 @@ impl LlmConfig {
     }
 }
 
-/// ペルソナ指示 (既定 or config.prompt) + 状況行からプロンプトを組み立てる
-pub fn build_prompt(config: &LlmConfig, now: &Snapshot) -> String {
-    let persona = config.prompt.as_deref().unwrap_or(DEFAULT_PERSONA);
+/// LLM プロンプト共通の状況行 (build_prompt / chat::build_chat_prompt で共用)
+pub(crate) fn situation_line(now: &Snapshot) -> String {
     format!(
-        "{persona}\n状況: 時間帯={}, 曜日={}, CPU={}, メモリ={}, 連続稼働={}時間",
+        "状況: 時間帯={}, 曜日={}, CPU={}, メモリ={}, 連続稼働={}時間",
         crate::phrases::time_band_name(now.hour),
         weekday_name(now.weekday),
         cpu_name(now.cpu),
         mem_name(now.mem),
         now.uptime.as_secs() / 3600,
     )
+}
+
+/// ペルソナ指示 (既定 or config.prompt) + 状況行からプロンプトを組み立てる
+pub fn build_prompt(config: &LlmConfig, now: &Snapshot) -> String {
+    let persona = config.prompt.as_deref().unwrap_or(DEFAULT_PERSONA);
+    format!("{persona}\n{}", situation_line(now))
 }
 
 /// CLI 出力から台詞を抽出する。trim → 最初の非空行 → 60 文字切り詰め。空なら None
@@ -94,18 +99,19 @@ fn warn_once(detail: &str) {
     }
 }
 
-/// CLI を非同期実行し、完了時に on_done をメインループ上で呼ぶ。
-/// 失敗 (spawn 失敗・非ゼロ終了・タイムアウト・空出力) は on_done(None)。
+/// CLI を非同期実行し、生の stdout を on_done に渡す (trim・切り詰めはしない)。
+/// 失敗 (spawn 失敗・非ゼロ終了・タイムアウト) は on_done(None)。
 /// 呼び出し元が cancel() した場合は on_done を呼ばない。
-pub fn request_phrase(
-    config: &LlmConfig,
+pub fn request_raw(
+    command: &[String],
+    timeout_secs: u64,
     prompt: &str,
     on_done: impl FnOnce(Option<String>) + 'static,
 ) -> LlmRequest {
     let cancellable = gio::Cancellable::new();
     let cancelled = Rc::new(Cell::new(false));
 
-    let mut argv: Vec<&std::ffi::OsStr> = config.command.iter().map(|s| s.as_ref()).collect();
+    let mut argv: Vec<&std::ffi::OsStr> = command.iter().map(|s| s.as_ref()).collect();
     argv.push(prompt.as_ref());
 
     let subprocess = match gio::Subprocess::newv(
@@ -137,7 +143,7 @@ pub fn request_phrase(
 
     // タイムアウト: cancel + kill。スロットは「発火時に自分で None にする」既存不変条件に従う
     let timeout_slot: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    let id = glib::timeout_add_local_once(std::time::Duration::from_secs(config.timeout_secs), {
+    let id = glib::timeout_add_local_once(std::time::Duration::from_secs(timeout_secs), {
         let slot = timeout_slot.clone();
         let cancellable = cancellable.clone();
         let subprocess = subprocess.clone();
@@ -158,16 +164,8 @@ pub fn request_phrase(
             return; // 呼び出し元キャンセル: 何もしない (on_done は drop される)
         }
         match result {
-            Ok((stdout, stderr)) if subprocess_c.is_successful() => {
-                let text = stdout.as_deref().unwrap_or("");
-                match postprocess(text) {
-                    Some(phrase) => on_done(Some(phrase)),
-                    None => {
-                        warn_once("出力が空でした");
-                        let _ = stderr;
-                        on_done(None);
-                    }
-                }
+            Ok((stdout, _stderr)) if subprocess_c.is_successful() => {
+                on_done(Some(stdout.as_deref().unwrap_or("").to_string()));
             }
             Ok((_, stderr)) => {
                 let head = stderr
@@ -186,6 +184,29 @@ pub fn request_phrase(
     });
 
     request
+}
+
+/// 自動発話用: request_raw + postprocess (最初の非空行 60 字)
+pub fn request_phrase(
+    config: &LlmConfig,
+    prompt: &str,
+    on_done: impl FnOnce(Option<String>) + 'static,
+) -> LlmRequest {
+    request_raw(
+        &config.command,
+        config.timeout_secs,
+        prompt,
+        move |raw| match raw {
+            Some(text) => match postprocess(&text) {
+                Some(phrase) => on_done(Some(phrase)),
+                None => {
+                    warn_once("出力が空でした");
+                    on_done(None)
+                }
+            },
+            None => on_done(None),
+        },
+    )
 }
 
 fn weekday_name(w: chrono::Weekday) -> &'static str {
@@ -264,8 +285,12 @@ mod tests {
     fn build_prompt_uses_default_persona_and_context() {
         let cfg: LlmConfig = toml::from_str("").unwrap();
         let p = build_prompt(&cfg, &test_snapshot());
-        assert!(p.starts_with("あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。"));
-        assert!(p.ends_with("状況: 時間帯=morning, 曜日=mon, CPU=idle, メモリ=high, 連続稼働=2時間"));
+        assert!(
+            p.starts_with("あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。")
+        );
+        assert!(
+            p.ends_with("状況: 時間帯=morning, 曜日=mon, CPU=idle, メモリ=high, 連続稼働=2時間")
+        );
     }
 
     #[test]
@@ -322,10 +347,7 @@ mod tests {
 
     #[test]
     fn request_phrase_reports_spawn_failure() {
-        let got = run_request(
-            r#"command = ["/nonexistent-miryam-test-cmd"]"#,
-            "prompt",
-        );
+        let got = run_request(r#"command = ["/nonexistent-miryam-test-cmd"]"#, "prompt");
         assert!(got.is_none(), "spawn 失敗は None のはず");
     }
 
@@ -338,15 +360,17 @@ mod tests {
         );
         let elapsed = started.elapsed();
         assert!(got.is_none(), "タイムアウトは None のはず");
-        assert!(elapsed.as_secs() >= 1, "即時失敗ではなくタイムアウト経路を通るはず");
+        assert!(
+            elapsed.as_secs() >= 1,
+            "即時失敗ではなくタイムアウト経路を通るはず"
+        );
         assert!(elapsed.as_secs() < 10, "1 秒タイムアウトが効いていない");
     }
 
     #[test]
     fn cancelled_request_never_calls_on_done() {
         let _lock = crate::test_sync::lock();
-        let cfg: LlmConfig =
-            toml::from_str(r#"command = ["bash", "-c", "sleep 2"]"#).unwrap();
+        let cfg: LlmConfig = toml::from_str(r#"command = ["bash", "-c", "sleep 2"]"#).unwrap();
         let ctx = glib::MainContext::default();
         let _guard = ctx.acquire().unwrap();
         let ml = glib::MainLoop::new(None, false);
@@ -366,7 +390,43 @@ mod tests {
             ml_c.quit();
         });
         ml.run();
-        assert!(!called.get(), "cancel されたリクエストの on_done は呼ばれないはず");
+        assert!(
+            !called.get(),
+            "cancel されたリクエストの on_done は呼ばれないはず"
+        );
+    }
+
+    fn run_raw(command: &[&str], prompt: &str) -> Option<String> {
+        let _lock = crate::test_sync::lock();
+        let command: Vec<String> = command.iter().map(|s| s.to_string()).collect();
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().unwrap();
+        let ml = glib::MainLoop::new(None, false);
+        let result: Rc<RefCell<Option<Option<String>>>> = Rc::new(RefCell::new(None));
+        let (ml_c, result_c) = (ml.clone(), result.clone());
+        let _req = request_raw(&command, 10, prompt, move |r| {
+            *result_c.borrow_mut() = Some(r);
+            ml_c.quit();
+        });
+        ml.run();
+        let got = result.borrow_mut().take();
+        got.expect("on_done が呼ばれていない")
+    }
+
+    #[test]
+    fn request_raw_returns_multiline_stdout_unmodified() {
+        // prompt は bash -c の $0 に入るだけで無害
+        let got = run_raw(&["bash", "-c", "printf '一行目\\n\\n二行目\\n'"], "unused").unwrap();
+        assert_eq!(got, "一行目\n\n二行目\n", "trim も切り詰めもされないはず");
+    }
+
+    #[test]
+    fn request_raw_reports_failure_as_none() {
+        assert!(run_raw(&["/nonexistent-miryam-test-cmd"], "p").is_none());
+        assert!(
+            run_raw(&["bash", "-c", "exit 1"], "p").is_none(),
+            "非ゼロ終了は None"
+        );
     }
 
     #[test]
@@ -390,6 +450,9 @@ mod tests {
             ml_c.quit();
         });
         ml.run();
-        assert!(!called.get(), "cancel 後の spawn 失敗 on_done は呼ばれないはず");
+        assert!(
+            !called.get(),
+            "cancel 後の spawn 失敗 on_done は呼ばれないはず"
+        );
     }
 }

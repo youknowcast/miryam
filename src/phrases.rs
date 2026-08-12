@@ -17,6 +17,8 @@ struct PhrasesFile {
     skin: Option<SkinConfig>,
     #[serde(default)]
     inkdrop: Option<crate::inkdrop::InkdropConfig>,
+    #[serde(default)]
+    chat: Option<crate::chat::ChatConfig>,
 }
 
 #[derive(Deserialize)]
@@ -76,24 +78,44 @@ impl GroupRaw {
             event: self.event.as_deref().map(parse_event).transpose()?,
             time: self
                 .time
-                .map(|v| v.iter().map(|s| TimeBand::parse(s)).collect::<anyhow::Result<Vec<_>>>())
+                .map(|v| {
+                    v.iter()
+                        .map(|s| TimeBand::parse(s))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })
                 .transpose()?,
             days: self
                 .days
-                .map(|v| v.iter().map(|s| parse_weekday(s)).collect::<anyhow::Result<Vec<_>>>())
+                .map(|v| {
+                    v.iter()
+                        .map(|s| parse_weekday(s))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })
                 .transpose()?,
             dates: self
                 .dates
-                .map(|v| v.iter().map(|s| MonthDay::parse(s)).collect::<anyhow::Result<Vec<_>>>())
+                .map(|v| {
+                    v.iter()
+                        .map(|s| MonthDay::parse(s))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })
                 .transpose()?,
             uptime_hours: self.uptime_hours,
             cpu: self
                 .cpu
-                .map(|v| v.iter().map(|s| parse_cpu_level(s)).collect::<anyhow::Result<Vec<_>>>())
+                .map(|v| {
+                    v.iter()
+                        .map(|s| parse_cpu_level(s))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })
                 .transpose()?,
             mem: self
                 .mem
-                .map(|v| v.iter().map(|s| parse_mem_level(s)).collect::<anyhow::Result<Vec<_>>>())
+                .map(|v| {
+                    v.iter()
+                        .map(|s| parse_mem_level(s))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })
                 .transpose()?,
             phrases: self.phrases,
         })
@@ -151,7 +173,10 @@ impl Group {
         self.time
             .as_ref()
             .is_none_or(|bands| bands.iter().any(|b| b.contains(now.hour)))
-            && self.days.as_ref().is_none_or(|ds| ds.contains(&now.weekday))
+            && self
+                .days
+                .as_ref()
+                .is_none_or(|ds| ds.contains(&now.weekday))
             && self
                 .dates
                 .as_ref()
@@ -169,18 +194,19 @@ pub struct PhraseBook {
     llm: Option<crate::llm::LlmConfig>,
     skin: Option<SkinConfig>,
     inkdrop: Option<crate::inkdrop::InkdropConfig>,
+    chat: Option<crate::chat::ChatConfig>,
 }
 
 impl PhraseBook {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
-        let file: PhrasesFile =
-            toml::from_str(s).context("phrases.toml のパースに失敗しました")?;
+        let file: PhrasesFile = toml::from_str(s).context("phrases.toml のパースに失敗しました")?;
         let PhrasesFile {
             phrases: top_level,
             group,
             llm,
             skin,
             inkdrop,
+            chat,
         } = file;
         if let Some(cfg) = &llm {
             cfg.validate().context("[llm] の設定が不正です")?;
@@ -191,10 +217,13 @@ impl PhraseBook {
         if let Some(cfg) = &inkdrop {
             cfg.validate().context("[inkdrop] の設定が不正です")?;
         }
+        if let Some(cfg) = &chat {
+            cfg.validate().context("[chat] の設定が不正です")?;
+        }
         let groups = match (top_level, group.is_empty()) {
-            (Some(_), false) => anyhow::bail!(
-                "旧形式 (トップレベル phrases) と新形式 ([[group]]) は併用できません"
-            ),
+            (Some(_), false) => {
+                anyhow::bail!("旧形式 (トップレベル phrases) と新形式 ([[group]]) は併用できません")
+            }
             (Some(phrases), true) => {
                 if phrases.is_empty() {
                     anyhow::bail!("phrases.toml に台詞が 1 つもありません");
@@ -219,7 +248,13 @@ impl PhraseBook {
         if !groups.iter().any(|g| g.event.is_none()) {
             anyhow::bail!("event なしの通常台詞グループが 1 つ以上必要です");
         }
-        Ok(Self { groups, llm, skin, inkdrop })
+        Ok(Self {
+            groups,
+            llm,
+            skin,
+            inkdrop,
+            chat,
+        })
     }
 
     pub fn llm(&self) -> Option<&crate::llm::LlmConfig> {
@@ -234,6 +269,10 @@ impl PhraseBook {
         self.inkdrop.as_ref()
     }
 
+    pub fn chat(&self) -> Option<&crate::chat::ChatConfig> {
+        self.chat.as_ref()
+    }
+
     /// $XDG_CONFIG_HOME/miryam/phrases.toml があればそれを、無ければ埋め込みデフォルトを読む
     pub fn load() -> anyhow::Result<Self> {
         let user_path = gtk4::glib::user_config_dir()
@@ -242,8 +281,7 @@ impl PhraseBook {
         if user_path.exists() {
             let s = std::fs::read_to_string(&user_path)
                 .with_context(|| format!("{} の読み込みに失敗しました", user_path.display()))?;
-            Self::from_toml_str(&s)
-                .with_context(|| format!("{} が不正です", user_path.display()))
+            Self::from_toml_str(&s).with_context(|| format!("{} が不正です", user_path.display()))
         } else {
             Self::from_toml_str(DEFAULT_PHRASES_TOML).context("埋め込みデフォルト台詞が不正です")
         }
@@ -319,9 +357,9 @@ impl TimeBand {
             "daytime" => Self::Daytime,
             "evening" => Self::Evening,
             "night" => Self::Night,
-            other => anyhow::bail!(
-                "不明な時間帯です: {other} (morning / daytime / evening / night)"
-            ),
+            other => {
+                anyhow::bail!("不明な時間帯です: {other} (morning / daytime / evening / night)")
+            }
         })
     }
 
@@ -330,7 +368,7 @@ impl TimeBand {
             Self::Morning => (5..11).contains(&hour),
             Self::Daytime => (11..17).contains(&hour),
             Self::Evening => (17..22).contains(&hour),
-            Self::Night => hour >= 22 || hour < 5,
+            Self::Night => !(5..22).contains(&hour),
         }
     }
 }
@@ -380,8 +418,12 @@ impl MonthDay {
         if !m.bytes().all(|b| b.is_ascii_digit()) || !d.bytes().all(|b| b.is_ascii_digit()) {
             anyhow::bail!("日付は MM-DD 形式 (ゼロ埋め 2 桁) で指定してください: {s}");
         }
-        let month: u32 = m.parse().with_context(|| format!("月が数値ではありません: {s}"))?;
-        let day: u32 = d.parse().with_context(|| format!("日が数値ではありません: {s}"))?;
+        let month: u32 = m
+            .parse()
+            .with_context(|| format!("月が数値ではありません: {s}"))?;
+        let day: u32 = d
+            .parse()
+            .with_context(|| format!("日が数値ではありません: {s}"))?;
         if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             anyhow::bail!("日付が範囲外です: {s} (月 01-12, 日 01-31)");
         }
@@ -443,9 +485,18 @@ mod tests {
         "#;
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let g = &book.groups[0];
-        assert!(g.matches(&snap(6, chrono::Weekday::Mon, 6, 15, 0)), "morning");
-        assert!(g.matches(&snap(23, chrono::Weekday::Mon, 6, 15, 0)), "night");
-        assert!(!g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)), "daytime は不一致");
+        assert!(
+            g.matches(&snap(6, chrono::Weekday::Mon, 6, 15, 0)),
+            "morning"
+        );
+        assert!(
+            g.matches(&snap(23, chrono::Weekday::Mon, 6, 15, 0)),
+            "night"
+        );
+        assert!(
+            !g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)),
+            "daytime は不一致"
+        );
     }
 
     #[test]
@@ -459,8 +510,14 @@ mod tests {
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let g = &book.groups[0];
         assert!(g.matches(&snap(6, chrono::Weekday::Mon, 6, 15, 0)));
-        assert!(!g.matches(&snap(6, chrono::Weekday::Tue, 6, 15, 0)), "曜日不一致");
-        assert!(!g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)), "時間帯不一致");
+        assert!(
+            !g.matches(&snap(6, chrono::Weekday::Tue, 6, 15, 0)),
+            "曜日不一致"
+        );
+        assert!(
+            !g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)),
+            "時間帯不一致"
+        );
     }
 
     #[test]
@@ -477,7 +534,10 @@ mod tests {
         let book = PhraseBook::from_toml_str(toml).unwrap();
         assert!(book.groups[0].matches(&snap(0, chrono::Weekday::Fri, 12, 25, 0)));
         assert!(!book.groups[0].matches(&snap(0, chrono::Weekday::Fri, 12, 26, 0)));
-        assert!(book.groups[1].matches(&snap(0, chrono::Weekday::Fri, 1, 1, 4)), "ちょうど 4h は一致");
+        assert!(
+            book.groups[1].matches(&snap(0, chrono::Weekday::Fri, 1, 1, 4)),
+            "ちょうど 4h は一致"
+        );
         assert!(!book.groups[1].matches(&snap(0, chrono::Weekday::Fri, 1, 1, 3)));
     }
 
@@ -507,7 +567,11 @@ mod tests {
         "#;
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
-        assert_eq!(book.pick(&night), "morning-only", "空プールは全台詞にフォールバック");
+        assert_eq!(
+            book.pick(&night),
+            "morning-only",
+            "空プールは全台詞にフォールバック"
+        );
     }
 
     #[test]
@@ -545,7 +609,10 @@ mod tests {
             Some(vec![TimeBand::Morning, TimeBand::Night])
         );
         assert_eq!(book.groups[1].days, Some(vec![chrono::Weekday::Mon]));
-        assert_eq!(book.groups[1].dates, Some(vec![MonthDay { month: 12, day: 25 }]));
+        assert_eq!(
+            book.groups[1].dates,
+            Some(vec![MonthDay { month: 12, day: 25 }])
+        );
         assert_eq!(book.groups[1].uptime_hours, Some(4));
     }
 
@@ -592,7 +659,10 @@ mod tests {
             day = ["mon"]
             phrases = ["x"]
         "#;
-        assert!(PhraseBook::from_toml_str(toml).is_err(), "day (typo) は拒否されるはず");
+        assert!(
+            PhraseBook::from_toml_str(toml).is_err(),
+            "day (typo) は拒否されるはず"
+        );
     }
 
     #[test]
@@ -614,7 +684,10 @@ mod tests {
                 phrases = ["x"]
             "#,
         ] {
-            assert!(PhraseBook::from_toml_str(toml).is_err(), "{toml} はエラーのはず");
+            assert!(
+                PhraseBook::from_toml_str(toml).is_err(),
+                "{toml} はエラーのはず"
+            );
         }
     }
 
@@ -662,9 +735,17 @@ mod tests {
 
     #[test]
     fn parses_month_day() {
-        assert_eq!(MonthDay::parse("12-25").unwrap(), MonthDay { month: 12, day: 25 });
-        assert_eq!(MonthDay::parse("02-29").unwrap(), MonthDay { month: 2, day: 29 });
-        for bad in ["1-1", "13-01", "12-32", "00-10", "12-00", "1225", "12-2x", "12/25", "12-+5", "+2-05"] {
+        assert_eq!(
+            MonthDay::parse("12-25").unwrap(),
+            MonthDay { month: 12, day: 25 }
+        );
+        assert_eq!(
+            MonthDay::parse("02-29").unwrap(),
+            MonthDay { month: 2, day: 29 }
+        );
+        for bad in [
+            "1-1", "13-01", "12-32", "00-10", "12-00", "1225", "12-2x", "12/25", "12-+5", "+2-05",
+        ] {
             assert!(MonthDay::parse(bad).is_err(), "{bad} はエラーのはず");
         }
     }
@@ -808,9 +889,7 @@ mod tests {
     #[test]
     fn rejects_skin_name_with_path_components() {
         for name in ["a/b", "../up", "..", "skins/other"] {
-            let toml = format!(
-                "[[group]]\nphrases = [\"x\"]\n\n[skin]\nname = \"{name}\"\n"
-            );
+            let toml = format!("[[group]]\nphrases = [\"x\"]\n\n[skin]\nname = \"{name}\"\n");
             assert!(
                 PhraseBook::from_toml_str(&toml).is_err(),
                 "{name} は拒否されるはず"
@@ -870,6 +949,37 @@ mod tests {
     fn inkdrop_absent_is_none() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
         assert!(book.inkdrop().is_none());
+    }
+
+    #[test]
+    fn parses_chat_section() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [chat]
+            timeout_secs = 90
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.chat().unwrap().timeout_secs, 90);
+    }
+
+    #[test]
+    fn rejects_invalid_chat_config() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [chat]
+            command = []
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn chat_absent_is_none() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
+        assert!(book.chat().is_none());
     }
 
     #[test]
@@ -988,7 +1098,11 @@ mod tests {
             saw_morning |= got == "morning-boot";
         }
         assert!(saw_morning, "朝は morning-boot もプールに入るはず");
-        assert_eq!(book.pick_event(EventKind::Chime, &morning), None, "chime プールは空");
+        assert_eq!(
+            book.pick_event(EventKind::Chime, &morning),
+            None,
+            "chime プールは空"
+        );
     }
 
     #[test]

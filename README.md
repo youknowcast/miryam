@@ -77,6 +77,29 @@ alias memo='miryam-ctl memo'                          # シェルからの入力
 - Inkdrop 側の準備: 設定で Local HTTP Server を有効化 (Preferences の保存が効かない場合は Inkdrop 終了後に `~/.config/inkdrop/config.json` の `*.core.server` に `{"enabled": true, "port": 19840, "bindAddress": "127.0.0.1", "auth": {"username": "...", "password": "..."}}` を直接書く) → Inkdrop 再起動
 - 認証情報が入るため `chmod 600 ~/.config/miryam/phrases.toml` を推奨します。phrases.toml を共有・公開する際は `[inkdrop]` を必ず除いてください
 
+## 会話 (claude 経由)
+
+右クリックメニューの「話しかける」で入力欄が開き、キャラクタと会話できます。
+`phrases.toml` に `[chat]` セクションがあるときだけ有効です。
+
+```toml
+[chat]
+# command = ["claude", "-p"]   # 既定値
+# timeout_secs = 60            # 返答待ちの上限
+# idle_close_secs = 600        # 無操作でセッション自動終了 (秒)
+# prompt = "..."               # 会話用ペルソナの上書き
+
+[inkdrop]
+# ... 既存設定 ...
+chat_book = "ChatLog"          # 会話ログの保存先 (省略時は book と同じ)
+```
+
+- Enter で送信、Esc・メニュー再選択・無操作 10 分でセッション終了
+- セッション終了時に会話全体が 1 ノートとして Inkdrop に保存されます
+  ([inkdrop] 未設定なら保存なし。保存失敗時のリトライはありません)
+- 会話中は定期発話・時報は割り込みません
+- アプリ終了時の保存はベストエフォートです (2 秒だけ完了を待ちます)
+
 ## カスタマイズ
 
 ファイルを置くだけで差し替えられます (無ければ内蔵デフォルトを使用):
@@ -155,9 +178,3 @@ exec-once = /path/to/miryam/target/release/miryam
 - 吹き出しは表示専用でクリック不可
 - キャラ画像は 1 枚固定 (表情差分・アニメーションなし)
 - 台詞は固定文からのランダム選択のみ
-
-## 次に実装予定の機能
-
-1. 会話辞書 (時間帯・曜日などの条件付き台詞)
-2. システム状態への反応 (CPU 負荷、バッテリーなど)
-3. LLM 連携による会話 (`src/phrases.rs` の境界に非同期実装を追加)
