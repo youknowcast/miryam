@@ -6,7 +6,7 @@ Omarchy / Hyprland / Wayland 上で動作する伺か風デスクトップマス
 ## 必要パッケージ (Arch Linux / Omarchy)
 
 ```bash
-sudo pacman -S --needed gtk4 gtk4-layer-shell
+sudo pacman -S --needed gtk4 gtk4-layer-shell wl-clipboard
 ```
 
 Rust ツールチェーンは mise または rustup で導入してください (edition 2024 対応版)。
@@ -99,6 +99,26 @@ chat_book = "ChatLog"          # 会話ログの保存先 (省略時は book と
   ([inkdrop] 未設定なら保存なし。保存失敗時のリトライはありません)
 - 会話中は定期発話・時報は割り込みません
 - アプリ終了時の保存はベストエフォートです (2 秒だけ完了を待ちます)
+
+## リンク集
+
+右クリックメニューの「リンク集」から、よく使う URL を既定ブラウザで開けます。
+設定ファイルは `~/.config/miryam/links.toml` で、右クリックのたびに読み直されます
+(編集後の再起動は不要)。
+
+```toml
+[[link]]
+label = "GitHub"
+url = "https://github.com/youknowcast"
+```
+
+- 「クリップボードの URL を追加」で、コピー中の URL をワンクリック登録できます
+  (ラベルは「ホスト + パス」(例: github.com/owner/repo)。変更したいときは links.toml を直接編集してください)
+- 「リンクを削除」サブメニューから個別に削除できます (確認なしで即削除、吹き出しで通知)
+- クリップボードの読み取りには `wl-paste` (wl-clipboard) が必要です
+  (layer-shell 窓はフォーカスを持たず Wayland の selection を受け取れないため)
+- links.toml が無い・リンク 0 件でもメニューは表示され、追加項目だけが並びます
+- 不正な links.toml は吹き出しで知らせ、リンクは表示されません (起動は妨げません)
 
 ## カスタマイズ
 

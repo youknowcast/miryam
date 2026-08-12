@@ -1,6 +1,7 @@
 mod chat;
 mod control;
 mod inkdrop;
+mod links;
 mod llm;
 mod phrases;
 mod scheduler;
@@ -50,7 +51,7 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
 
     let started_at = Instant::now();
     let book = Rc::new(phrases::PhraseBook::load()?);
-    let ui = Rc::new(ui::build(app, book.skin(), book.chat().is_some())?);
+    let ui = Rc::new(ui::build(app, book.skin())?);
     let timers = Rc::new(RefCell::new(Timers::default()));
     let muted = Rc::new(Cell::new(false));
     let quitting = Rc::new(Cell::new(false));
@@ -1042,6 +1043,156 @@ fn register_actions(
             ui.connect_chat_escape(move || {
                 close_chat_session(&ctx);
             });
+        }
+    }
+
+    // リンク集: リンクを既定ブラウザで開く (gtk::show_uri は 4.10 deprecated のため gio 経由)
+    let open_link = gio::SimpleAction::new("open-link", Some(glib::VariantTy::STRING));
+    open_link.connect_activate(move |_, param| {
+        let Some(url) = param.and_then(|v| v.get::<String>()) else {
+            return;
+        };
+        gio::AppInfo::launch_default_for_uri_async(
+            &url,
+            None::<&gio::AppLaunchContext>,
+            None::<&gio::Cancellable>,
+            move |res| {
+                if let Err(e) = res {
+                    eprintln!("miryam: URL を開けませんでした: {e}");
+                }
+            },
+        );
+    });
+    app.add_action(&open_link);
+
+    // リンク集: クリップボードの URL を links.toml に追記。
+    // layer-shell 窓はキーボードフォーカスを持たず Wayland の selection オファーを
+    // 受け取れないため、GDK のクリップボードは常に空に見える。フォーカス不要の
+    // data-control プロトコルを使う wl-paste に読み取りを委譲する
+    let add_link = gio::SimpleAction::new("add-link-from-clipboard", None);
+    {
+        let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+        add_link.connect_activate(move |_, _| {
+            if quitting.get() {
+                return;
+            }
+            let argv: [&std::ffi::OsStr; 2] = ["wl-paste".as_ref(), "--no-newline".as_ref()];
+            let subprocess = match gio::Subprocess::newv(
+                &argv,
+                gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "miryam: wl-paste を起動できませんでした (wl-clipboard は必須です): {e}"
+                    );
+                    show_text(&ui, &timers, "クリップボードを読み取れませんでした");
+                    return;
+                }
+            };
+            let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+            let subprocess_c = subprocess.clone();
+            // wl-paste はローカルで即応するためタイムアウトは張らない (llm.rs とは異なり
+            // ハング時も次のクリックが新プロセスを起こすだけで実害がない)
+            subprocess.communicate_utf8_async(None, None::<&gio::Cancellable>, move |result| {
+                if quitting.get() {
+                    return;
+                }
+                let text = match &result {
+                    Ok((stdout, _stderr)) if subprocess_c.is_successful() => {
+                        stdout.as_deref().unwrap_or("").to_string()
+                    }
+                    // 非ゼロ終了は通常「クリップボードが空」: 「URL なし」扱いにするが、
+                    // 他の失敗理由と区別できるよう stderr は残す
+                    Ok((_, stderr)) => {
+                        let head = stderr
+                            .as_deref()
+                            .and_then(|s| s.lines().next())
+                            .unwrap_or("");
+                        eprintln!("miryam: wl-paste が非ゼロ終了しました: {head}");
+                        String::new()
+                    }
+                    Err(e) => {
+                        eprintln!("miryam: クリップボードの読み取りに失敗しました: {e}");
+                        String::new()
+                    }
+                };
+                add_link_from_text(&ui, &timers, &text);
+            });
+        });
+    }
+    app.add_action(&add_link);
+
+    // リンク集: 指定 URL のリンクを削除 (メニュー「リンクを削除」から)
+    let remove_link = gio::SimpleAction::new("remove-link", Some(glib::VariantTy::STRING));
+    {
+        let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+        remove_link.connect_activate(move |_, param| {
+            if quitting.get() {
+                return;
+            }
+            let Some(url) = param.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            match links::remove_link(&links::links_path(), &url) {
+                Ok(Some(label)) => show_text(&ui, &timers, &format!("{label} を削除しました")),
+                // メニュー表示後に links.toml が変わった場合など: 黙って何もしない
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("miryam: {e:#}");
+                    show_text(&ui, &timers, "links.toml を更新できませんでした");
+                }
+            }
+        });
+    }
+    app.add_action(&remove_link);
+
+    // リンク集サブメニュー: 右クリックのたびに links.toml を読み直す
+    {
+        let (ui_c, timers_c) = (ui.clone(), timers.clone());
+        ui.connect_menu(book.chat().is_some(), move || {
+            match links::load(&links::links_path()) {
+                Ok(list) => links::build_submenu(&list),
+                Err(e) => {
+                    eprintln!("miryam: {e:#}");
+                    show_text(&ui_c, &timers_c, "links.toml が不正です");
+                    links::build_submenu(&[])
+                }
+            }
+        });
+    }
+}
+
+/// クリップボードのテキストを検証して links.toml に追記する。
+/// 結果は吹き出しで知らせる (成功 / URL でない / 登録済み / 失敗)
+fn add_link_from_text(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text: &str) {
+    let Some(url) = links::parse_http_url(text) else {
+        show_text(ui, timers, "クリップボードに URL がありません");
+        return;
+    };
+    let path = links::links_path();
+    let existing = match links::load(&path) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("miryam: {e:#}");
+            show_text(ui, timers, "links.toml が不正です");
+            return;
+        }
+    };
+    if existing.iter().any(|l| l.url == url) {
+        show_text(ui, timers, "登録済みです");
+        return;
+    }
+    let label = links::label_of(&url);
+    let link = links::Link {
+        label: label.clone(),
+        url,
+    };
+    match links::append_link(&path, &link) {
+        Ok(()) => show_text(ui, timers, &format!("{label} を追加しました")),
+        Err(e) => {
+            eprintln!("miryam: {e:#}");
+            show_text(ui, timers, "links.toml への書き込みに失敗しました");
         }
     }
 }

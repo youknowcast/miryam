@@ -76,7 +76,16 @@ mod tests {
     #[test]
     fn rejects_bad_specs() {
         for bad in [
-            "", "  ", "25x", "m", "0m", "-5m", "25h", "86401s", "２５m", "1.5h",
+            "",
+            "  ",
+            "25x",
+            "m",
+            "0m",
+            "-5m",
+            "25h",
+            "86401s",
+            "２５m",
+            "1.5h",
             "18446744073709551615h",
         ] {
             assert!(parse_timer_spec(bad).is_err(), "{bad:?} はエラーのはず");
