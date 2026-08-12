@@ -170,11 +170,6 @@ impl MascotUi {
         });
         self.window.add_controller(gesture);
     }
-
-    /// クリップボード取得 (リンク追加が使う)
-    pub fn clipboard(&self) -> gdk::Clipboard {
-        self.window.clipboard()
-    }
 }
 
 fn load_css() {

@@ -1065,7 +1065,10 @@ fn register_actions(
     });
     app.add_action(&open_link);
 
-    // リンク集: クリップボードの URL を links.toml に追記
+    // リンク集: クリップボードの URL を links.toml に追記。
+    // layer-shell 窓はキーボードフォーカスを持たず Wayland の selection オファーを
+    // 受け取れないため、GDK のクリップボードは常に空に見える。フォーカス不要の
+    // data-control プロトコルを使う wl-paste に読み取りを委譲する
     let add_link = gio::SimpleAction::new("add-link-from-clipboard", None);
     {
         let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
@@ -1073,20 +1076,39 @@ fn register_actions(
             if quitting.get() {
                 return;
             }
+            let argv: [&std::ffi::OsStr; 2] = ["wl-paste".as_ref(), "--no-newline".as_ref()];
+            let subprocess = match gio::Subprocess::newv(
+                &argv,
+                gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "miryam: wl-paste を起動できませんでした (wl-clipboard は必須です): {e}"
+                    );
+                    show_text(&ui, &timers, "クリップボードを読み取れませんでした");
+                    return;
+                }
+            };
             let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
-            ui.clipboard().read_text_async(
-                None::<&gio::Cancellable>,
-                move |res: Result<Option<glib::GString>, glib::Error>| {
-                    if quitting.get() {
-                        return;
+            let subprocess_c = subprocess.clone();
+            subprocess.communicate_utf8_async(None, None::<&gio::Cancellable>, move |result| {
+                if quitting.get() {
+                    return;
+                }
+                let text = match &result {
+                    Ok((stdout, _stderr)) if subprocess_c.is_successful() => {
+                        stdout.as_deref().unwrap_or("").to_string()
                     }
-                    let text = match &res {
-                        Ok(Some(t)) => t.to_string(),
-                        _ => String::new(),
-                    };
-                    add_link_from_text(&ui, &timers, &text);
-                },
-            );
+                    // クリップボードが空のとき wl-paste は非ゼロ終了する: 「URL なし」扱い
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        eprintln!("miryam: クリップボードの読み取りに失敗しました: {e}");
+                        String::new()
+                    }
+                };
+                add_link_from_text(&ui, &timers, &text);
+            });
         });
     }
     app.add_action(&add_link);
