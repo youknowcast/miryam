@@ -31,6 +31,7 @@ struct GroupRaw {
     uptime_hours: Option<u64>,
     cpu: Option<Vec<String>>,
     mem: Option<Vec<String>>,
+    face: Option<String>,
     phrases: Vec<String>,
 }
 
@@ -63,6 +64,7 @@ struct Group {
     uptime_hours: Option<u64>,
     cpu: Option<Vec<system::CpuLevel>>,
     mem: Option<Vec<system::MemLevel>>,
+    face: Option<String>,
     phrases: Vec<String>,
 }
 
@@ -73,6 +75,9 @@ impl GroupRaw {
         }
         if self.uptime_hours == Some(0) {
             anyhow::bail!("uptime_hours は 1 以上を指定してください");
+        }
+        if let Some(f) = &self.face {
+            validate_face(f)?;
         }
         Ok(Group {
             event: self.event.as_deref().map(parse_event).transpose()?,
@@ -117,9 +122,18 @@ impl GroupRaw {
                         .collect::<anyhow::Result<Vec<_>>>()
                 })
                 .transpose()?,
+            face: self.face,
             phrases: self.phrases,
         })
     }
+}
+
+/// face は小文字英字 1 語 (アセット仕様の state 名規約)
+fn validate_face(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_lowercase()) {
+        anyhow::bail!("face は小文字英字 1 語で指定してください: {s:?}");
+    }
+    Ok(())
 }
 
 fn parse_cpu_level(s: &str) -> anyhow::Result<system::CpuLevel> {
@@ -236,6 +250,7 @@ impl PhraseBook {
                     uptime_hours: None,
                     cpu: None,
                     mem: None,
+                    face: None,
                     phrases,
                 }]
             }
@@ -287,32 +302,44 @@ impl PhraseBook {
         }
     }
 
-    pub fn pick(&self, now: &Snapshot) -> &str {
+    pub fn pick(&self, now: &Snapshot) -> (&str, Option<&str>) {
         use rand::RngExt;
-        let mut pool: Vec<&str> = self
+        let mut pool: Vec<(&str, Option<&str>)> = self
             .groups
             .iter()
             .filter(|g| g.event.is_none() && g.matches(now))
-            .flat_map(|g| g.phrases.iter().map(String::as_str))
+            .flat_map(|g| {
+                g.phrases
+                    .iter()
+                    .map(move |p| (p.as_str(), g.face.as_deref()))
+            })
             .collect();
         if pool.is_empty() {
             pool = self
                 .groups
                 .iter()
                 .filter(|g| g.event.is_none())
-                .flat_map(|g| g.phrases.iter().map(String::as_str))
+                .flat_map(|g| {
+                    g.phrases
+                        .iter()
+                        .map(move |p| (p.as_str(), g.face.as_deref()))
+                })
                 .collect();
         }
         pool[rand::rng().random_range(0..pool.len())]
     }
 
-    pub fn pick_event(&self, event: EventKind, now: &Snapshot) -> Option<&str> {
+    pub fn pick_event(&self, event: EventKind, now: &Snapshot) -> Option<(&str, Option<&str>)> {
         use rand::RngExt;
-        let pool: Vec<&str> = self
+        let pool: Vec<(&str, Option<&str>)> = self
             .groups
             .iter()
             .filter(|g| g.event == Some(event) && g.matches(now))
-            .flat_map(|g| g.phrases.iter().map(String::as_str))
+            .flat_map(|g| {
+                g.phrases
+                    .iter()
+                    .map(move |p| (p.as_str(), g.face.as_deref()))
+            })
             .collect();
         if pool.is_empty() {
             return None;
@@ -462,7 +489,7 @@ mod tests {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x", "y", "z"]"#).unwrap();
         let now = snap(12, chrono::Weekday::Mon, 6, 15, 0);
         for _ in 0..50 {
-            assert!(["x", "y", "z"].contains(&book.pick(&now)));
+            assert!(["x", "y", "z"].contains(&book.pick(&now).0));
         }
     }
 
@@ -554,7 +581,7 @@ mod tests {
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
         for _ in 0..50 {
-            assert_eq!(book.pick(&night), "always", "夜は always のみのはず");
+            assert_eq!(book.pick(&night).0, "always", "夜は always のみのはず");
         }
     }
 
@@ -568,7 +595,7 @@ mod tests {
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
         assert_eq!(
-            book.pick(&night),
+            book.pick(&night).0,
             "morning-only",
             "空プールは全台詞にフォールバック"
         );
@@ -1043,7 +1070,7 @@ mod tests {
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let now = snap(12, chrono::Weekday::Mon, 6, 15, 0);
         for _ in 0..50 {
-            assert_eq!(book.pick(&now), "normal");
+            assert_eq!(book.pick(&now).0, "normal");
         }
     }
 
@@ -1062,7 +1089,7 @@ mod tests {
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
         for _ in 0..50 {
-            assert_eq!(book.pick(&night), "morning-only");
+            assert_eq!(book.pick(&night).0, "morning-only");
         }
     }
 
@@ -1088,12 +1115,15 @@ mod tests {
         let book = PhraseBook::from_toml_str(toml).unwrap();
         let night = snap(23, chrono::Weekday::Mon, 6, 15, 0);
         for _ in 0..50 {
-            assert_eq!(book.pick_event(EventKind::Boot, &night), Some("any-boot"));
+            assert_eq!(
+                book.pick_event(EventKind::Boot, &night).map(|(t, _)| t),
+                Some("any-boot")
+            );
         }
         let morning = snap(6, chrono::Weekday::Mon, 6, 15, 0);
         let mut saw_morning = false;
         for _ in 0..100 {
-            let got = book.pick_event(EventKind::Boot, &morning).unwrap();
+            let (got, _face) = book.pick_event(EventKind::Boot, &morning).unwrap();
             assert!(["morning-boot", "any-boot"].contains(&got));
             saw_morning |= got == "morning-boot";
         }
@@ -1106,6 +1136,53 @@ mod tests {
     }
 
     #[test]
+    fn pick_propagates_group_face() {
+        let book = PhraseBook::from_toml_str(
+            r#"
+            [[group]]
+            cpu = ["high"]
+            face = "troubled"
+            phrases = ["困り"]
+
+            [[group]]
+            phrases = ["通常"]
+        "#,
+        )
+        .unwrap();
+        let mut now = snap(12, chrono::Weekday::Mon, 6, 15, 0);
+        now.cpu = crate::system::CpuLevel::High;
+        // cpu=high のグループに当たるまで引く (プールは条件一致グループのみなので 1 回で決まる)
+        let (text, face) = book.pick(&now);
+        if text == "困り" {
+            assert_eq!(face, Some("troubled"));
+        } else {
+            assert_eq!(text, "通常");
+            assert_eq!(face, None);
+        }
+    }
+
+    #[test]
+    fn pick_event_propagates_face() {
+        let book = PhraseBook::from_toml_str(
+            r#"
+            [[group]]
+            phrases = ["通常"]
+
+            [[group]]
+            event = "boot"
+            face = "happy"
+            phrases = ["おはよう"]
+        "#,
+        )
+        .unwrap();
+        let (text, face) = book
+            .pick_event(EventKind::Boot, &snap(12, chrono::Weekday::Mon, 6, 15, 0))
+            .unwrap();
+        assert_eq!(text, "おはよう");
+        assert_eq!(face, Some("happy"));
+    }
+
+    #[test]
     fn substitutes_hour_placeholder() {
         let now = snap(22, chrono::Weekday::Mon, 6, 15, 0);
         assert_eq!(substitute_placeholders("{hour}時です", &now), "22時です");
@@ -1114,5 +1191,40 @@ mod tests {
             "22時。もう22時"
         );
         assert_eq!(substitute_placeholders("そのまま", &now), "そのまま");
+    }
+
+    #[test]
+    fn face_key_is_parsed() {
+        let book = PhraseBook::from_toml_str(
+            r#"
+            [[group]]
+            phrases = ["通常"]
+
+            [[group]]
+            cpu = ["high"]
+            face = "troubled"
+            phrases = ["困り"]
+        "#,
+        )
+        .unwrap();
+        // pick 経由の検証は Task 2。ここではパースが通ることのみ確認する
+        drop(book);
+    }
+
+    #[test]
+    fn face_rejects_invalid_format() {
+        for bad in ["", "Troubled", "tro-ubled", "困り", "sleepy2"] {
+            let toml = format!(
+                r#"
+                [[group]]
+                face = {bad:?}
+                phrases = ["x"]
+            "#
+            );
+            assert!(
+                PhraseBook::from_toml_str(&toml).is_err(),
+                "{bad:?} はエラーのはず"
+            );
+        }
     }
 }
