@@ -167,6 +167,15 @@ url = "https://github.com/youknowcast"
 
   `[skin]` を指定しない場合は、従来の `~/.config/miryam/character.png` (後方互換)、それも無ければ内蔵の仮画像が使われます。指定したスキンの画像が読めない場合は起動エラーになります。
 
+- リポジトリには標準スキン「アーシャ」を同梱しています (`assets/skins/asha/`、立ち絵 + 表情/ポーズ差分 15 種、ChatGPT による生成画像)。使うには設定ディレクトリへコピーして `[skin]` で選択します:
+
+  ```bash
+  mkdir -p ~/.config/miryam/skins
+  cp -r assets/skins/asha ~/.config/miryam/skins/
+  ```
+
+  同梱辞書の `face` 名はこのスキンの表情差分に合わせてあります。
+
 配置したファイルが不正な場合 (TOML の構文エラー、画像のデコード失敗など) はフォールバックせず起動エラーになります。自動起動で反映されない場合は `cargo run` を手動実行してエラーメッセージを確認してください。
 
 ### 表情差分
