@@ -48,6 +48,35 @@ miryam-ctl timer 90s                            # メッセージ省略時は「
 - duration は `<正整数><s|m|h>`、最大 24h。タイマーの一覧・キャンセルはありません (アプリ終了で消えます)
 - glib のタイマーはサスペンド中に進まないため、ラップトップを閉じていた時間だけ満了が遅れます
 
+## Inkdrop 連携 (任意)
+
+`phrases.toml` に `[inkdrop]` セクションを書くと、Inkdrop の Local HTTP Server 経由で 2 つの機能が有効になります (既定は無効):
+
+```toml
+[inkdrop]
+username = "..."          # Local Server の Basic 認証
+password = "..."
+book = "Inbox"            # capture 先・見守り対象のノートブック名
+# port = 19840            # 省略可
+# inbox_threshold = 10    # 省略可。0 で見守り無効 (最大 100)
+```
+
+```bash
+miryam-ctl memo "あとで調べる: GraphQL の件数制限"   # → Inbox に即ノート作成、キャラが確認
+alias memo='miryam-ctl memo'                          # シェルからの入力に便利
+```
+
+- **Quick Capture**: `miryam-ctl memo` で 1 行 (複数行も可) を Inbox にノート化します。タイトルは先頭行 60 文字、本文に `Source: miryam-ctl` と日付が付きます。失敗時はキャラが知らせ、詳細は stderr に出ます
+- **Inbox 見守り**: 起動 30 秒後と 6 時間ごとに Inbox の件数を確認し、しきい値以上なら 1 日 1 回だけ「Inbox に N 件たまっています」と知らせます (ミュート中は黙ります)
+- glib のタイマーはサスペンド中に進まないため、見守りタイマーもラップトップを閉じていた時間だけ次回確認が遅れます (say/timer と同じ注意)
+- note 本文の上限は 1 MiB です。超過した場合は保存失敗としてキャラが「Inkdrop に届きませんでした」と知らせます
+- walker 等のランチャーから 1 行入力をそのまま渡すこともできます (例: `walker --dmenu` 系が無い環境では `rofi` などでも可):
+  ```bash
+  miryam-ctl memo "$(rofi -dmenu -p memo)"   # rofi で 1 行入力してそのまま Inbox にキャプチャ
+  ```
+- Inkdrop 側の準備: 設定で Local HTTP Server を有効化 (Preferences の保存が効かない場合は Inkdrop 終了後に `~/.config/inkdrop/config.json` の `*.core.server` に `{"enabled": true, "port": 19840, "bindAddress": "127.0.0.1", "auth": {"username": "...", "password": "..."}}` を直接書く) → Inkdrop 再起動
+- 認証情報が入るため `chmod 600 ~/.config/miryam/phrases.toml` を推奨します。phrases.toml を共有・公開する際は `[inkdrop]` を必ず除いてください
+
 ## カスタマイズ
 
 ファイルを置くだけで差し替えられます (無ければ内蔵デフォルトを使用):

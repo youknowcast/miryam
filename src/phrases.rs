@@ -15,6 +15,8 @@ struct PhrasesFile {
     llm: Option<crate::llm::LlmConfig>,
     #[serde(default)]
     skin: Option<SkinConfig>,
+    #[serde(default)]
+    inkdrop: Option<crate::inkdrop::InkdropConfig>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +168,7 @@ pub struct PhraseBook {
     groups: Vec<Group>,
     llm: Option<crate::llm::LlmConfig>,
     skin: Option<SkinConfig>,
+    inkdrop: Option<crate::inkdrop::InkdropConfig>,
 }
 
 impl PhraseBook {
@@ -177,12 +180,16 @@ impl PhraseBook {
             group,
             llm,
             skin,
+            inkdrop,
         } = file;
         if let Some(cfg) = &llm {
             cfg.validate().context("[llm] の設定が不正です")?;
         }
         if let Some(cfg) = &skin {
             cfg.validate().context("[skin] の設定が不正です")?;
+        }
+        if let Some(cfg) = &inkdrop {
+            cfg.validate().context("[inkdrop] の設定が不正です")?;
         }
         let groups = match (top_level, group.is_empty()) {
             (Some(_), false) => anyhow::bail!(
@@ -212,7 +219,7 @@ impl PhraseBook {
         if !groups.iter().any(|g| g.event.is_none()) {
             anyhow::bail!("event なしの通常台詞グループが 1 つ以上必要です");
         }
-        Ok(Self { groups, llm, skin })
+        Ok(Self { groups, llm, skin, inkdrop })
     }
 
     pub fn llm(&self) -> Option<&crate::llm::LlmConfig> {
@@ -221,6 +228,10 @@ impl PhraseBook {
 
     pub fn skin(&self) -> Option<&str> {
         self.skin.as_ref().map(|s| s.name.as_str())
+    }
+
+    pub fn inkdrop(&self) -> Option<&crate::inkdrop::InkdropConfig> {
+        self.inkdrop.as_ref()
     }
 
     /// $XDG_CONFIG_HOME/miryam/phrases.toml があればそれを、無ければ埋め込みデフォルトを読む
@@ -824,6 +835,41 @@ mod tests {
     fn skin_absent_is_none() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
         assert!(book.skin().is_none());
+    }
+
+    #[test]
+    fn parses_inkdrop_section() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [inkdrop]
+            username = "u"
+            password = "p"
+            book = "Inbox"
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.inkdrop().unwrap().book, "Inbox");
+    }
+
+    #[test]
+    fn rejects_invalid_inkdrop_config() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [inkdrop]
+            username = ""
+            password = "p"
+            book = "Inbox"
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn inkdrop_absent_is_none() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
+        assert!(book.inkdrop().is_none());
     }
 
     #[test]

@@ -296,12 +296,8 @@ mod tests {
         assert!(postprocess("  \n \n").is_none());
     }
 
-    use std::sync::Mutex;
-
-    static MAIN_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
-
     fn run_request(config_toml: &str, prompt: &str) -> Option<String> {
-        let _lock = MAIN_CONTEXT_LOCK.lock().unwrap();
+        let _lock = crate::test_sync::lock();
         let cfg: LlmConfig = toml::from_str(config_toml).unwrap();
         let ctx = glib::MainContext::default();
         let _guard = ctx.acquire().unwrap();
@@ -348,7 +344,7 @@ mod tests {
 
     #[test]
     fn cancelled_request_never_calls_on_done() {
-        let _lock = MAIN_CONTEXT_LOCK.lock().unwrap();
+        let _lock = crate::test_sync::lock();
         let cfg: LlmConfig =
             toml::from_str(r#"command = ["bash", "-c", "sleep 2"]"#).unwrap();
         let ctx = glib::MainContext::default();
@@ -375,7 +371,7 @@ mod tests {
 
     #[test]
     fn cancelled_spawn_failure_never_calls_on_done() {
-        let _lock = MAIN_CONTEXT_LOCK.lock().unwrap();
+        let _lock = crate::test_sync::lock();
         let cfg: LlmConfig =
             toml::from_str(r#"command = ["/nonexistent-miryam-test-cmd"]"#).unwrap();
         let ctx = glib::MainContext::default();

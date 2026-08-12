@@ -1,4 +1,5 @@
 mod control;
+mod inkdrop;
 mod llm;
 mod phrases;
 mod scheduler;
@@ -12,6 +13,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const QUIT_DELAY_SECS: u64 = 2;
+const INBOX_CHECK_FIRST_DELAY_SECS: u64 = 30;
+const INBOX_CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder()
@@ -44,8 +47,12 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     let timers = Rc::new(RefCell::new(Timers::default()));
     let muted = Rc::new(Cell::new(false));
     let quitting = Rc::new(Cell::new(false));
+    let book_id_cache: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let inbox_last_notified: Rc<RefCell<Option<chrono::NaiveDate>>> = Rc::new(RefCell::new(None));
 
-    register_actions(app, &book, &ui, &timers, &muted, &quitting, started_at);
+    register_actions(
+        app, &book, &ui, &timers, &muted, &quitting, &book_id_cache, started_at,
+    );
 
     schedule_next_speech(
         book.clone(), ui.clone(), timers.clone(),
@@ -55,6 +62,15 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
         book.clone(), ui.clone(), timers.clone(),
         muted.clone(), quitting.clone(), started_at,
     );
+
+    if book.inkdrop().is_some_and(|c| c.inbox_threshold > 0) {
+        schedule_inbox_check(
+            book.clone(), ui.clone(), timers.clone(),
+            muted.clone(), quitting.clone(),
+            book_id_cache.clone(), inbox_last_notified.clone(),
+            INBOX_CHECK_FIRST_DELAY_SECS,
+        );
+    }
 
     // 起動挨拶 (1 秒後)
     {
@@ -142,6 +158,234 @@ fn external_speak(
         quitting.clone(),
         started_at,
     );
+}
+
+/// resolve_book_id の失敗理由
+enum ResolveError {
+    /// /books は取れたが名前一致なし
+    NotFound,
+    /// /books のリクエスト自体が失敗
+    Request(inkdrop::RequestError),
+}
+
+/// book 名を ID に解決して cont を呼ぶ (キャッシュあり)。呼び出し側がエラー種別に応じて発話/ログを判断する
+fn resolve_book_id(
+    book: Rc<phrases::PhraseBook>,
+    quitting: Rc<Cell<bool>>,
+    cache: Rc<RefCell<Option<String>>>,
+    cont: impl FnOnce(Result<String, ResolveError>) + 'static,
+) {
+    let cached = cache.borrow().clone();
+    if let Some(id) = cached {
+        cont(Ok(id));
+        return;
+    }
+    let Some(cfg) = book.inkdrop() else {
+        cont(Err(ResolveError::NotFound));
+        return;
+    };
+    let name = cfg.book.clone();
+    inkdrop::request(cfg, "GET", "/books", None, move |res| {
+        if quitting.get() {
+            return;
+        }
+        match res {
+            Ok(json) => match inkdrop::find_book_id(&json, &name) {
+                Some((id, dup)) => {
+                    if dup {
+                        eprintln!(
+                            "miryam: 同名ノートブック \"{name}\" が複数あります。最初の一致を使います"
+                        );
+                    }
+                    *cache.borrow_mut() = Some(id.clone());
+                    cont(Ok(id));
+                }
+                None => cont(Err(ResolveError::NotFound)),
+            },
+            Err(err) => cont(Err(ResolveError::Request(err))),
+        }
+    });
+}
+
+/// memo: book 解決 → POST /notes → 確認発話 (エラーは毎回 stderr)
+fn capture_to_inkdrop(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    cache: Rc<RefCell<Option<String>>>,
+    started_at: Instant,
+    text: String,
+) {
+    let (book_r, ui_r, timers_r, muted_r, quitting_r) = (
+        book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+    );
+    resolve_book_id(book.clone(), quitting.clone(), cache, move |resolved| {
+        if quitting_r.get() {
+            return;
+        }
+        let book_id = match resolved {
+            Ok(id) => id,
+            Err(ResolveError::NotFound) => {
+                let name = book_r.inkdrop().map(|c| c.book.clone()).unwrap_or_default();
+                eprintln!("miryam: ノートブック \"{name}\" が見つかりません");
+                external_speak(
+                    &book_r, &ui_r, &timers_r, &muted_r, &quitting_r, started_at,
+                    &format!("ノートブック \"{name}\" が見つかりません"),
+                );
+                return;
+            }
+            Err(ResolveError::Request(err)) => {
+                eprintln!(
+                    "miryam: Inkdrop への接続に失敗しました (curl exit {:?}): {}",
+                    err.curl_exit, err.detail
+                );
+                external_speak(
+                    &book_r, &ui_r, &timers_r, &muted_r, &quitting_r, started_at,
+                    "Inkdrop に届きませんでした",
+                );
+                return;
+            }
+        };
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let (title, body_text) = inkdrop::capture_note(&text, &date);
+        let payload = inkdrop::note_payload(&book_id, &title, &body_text);
+        let cfg = book_r.inkdrop().expect("memo は inkdrop 有効時のみ");
+        let (book_c, ui_c, timers_c, muted_c, quitting_c) = (
+            book_r.clone(), ui_r.clone(), timers_r.clone(), muted_r.clone(), quitting_r.clone(),
+        );
+        inkdrop::request(cfg, "POST", "/notes", Some(payload), move |res| {
+            if quitting_c.get() {
+                return;
+            }
+            match res {
+                Ok(_) => external_speak(
+                    &book_c, &ui_c, &timers_c, &muted_c, &quitting_c, started_at,
+                    "メモを預かりました",
+                ),
+                Err(err) => {
+                    eprintln!(
+                        "miryam: Inkdrop への保存に失敗しました (curl exit {:?}): {}",
+                        err.curl_exit, err.detail
+                    );
+                    external_speak(
+                        &book_c, &ui_c, &timers_c, &muted_c, &quitting_c, started_at,
+                        "Inkdrop に届きませんでした",
+                    );
+                }
+            }
+        });
+    });
+}
+
+/// 自動発話 (見守り用): LLM キャンセル + 表示のみ。定期発話は張り直さない
+fn automatic_speak(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text: &str) {
+    let pending = timers.borrow_mut().llm_request.take();
+    if let Some(req) = pending {
+        req.cancel();
+    }
+    show_text(ui, timers, text);
+}
+
+fn warn_inbox_once(detail: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("miryam: Inbox 見守りに失敗しました (以後この警告は抑制): {detail}");
+    }
+}
+
+/// Inbox 見守り: 固定間隔で件数を確認し、しきい値超過を 1 日 1 回だけ知らせる
+fn schedule_inbox_check(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    cache: Rc<RefCell<Option<String>>>,
+    last_notified: Rc<RefCell<Option<chrono::NaiveDate>>>,
+    delay_secs: u64,
+) {
+    glib::timeout_add_local_once(Duration::from_secs(delay_secs), move || {
+        let enabled = book
+            .inkdrop()
+            .is_some_and(|c| c.inbox_threshold > 0);
+        if enabled && !quitting.get() && !muted.get() {
+            run_inbox_check(
+                book.clone(), ui.clone(), timers.clone(),
+                muted.clone(), quitting.clone(),
+                cache.clone(), last_notified.clone(),
+            );
+        }
+        schedule_inbox_check(
+            book.clone(), ui.clone(), timers.clone(),
+            muted.clone(), quitting.clone(),
+            cache.clone(), last_notified.clone(),
+            INBOX_CHECK_INTERVAL_SECS,
+        );
+    });
+}
+
+fn run_inbox_check(
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    cache: Rc<RefCell<Option<String>>>,
+    last_notified: Rc<RefCell<Option<chrono::NaiveDate>>>,
+) {
+    let (book_r, ui_r, timers_r, muted_r, quitting_r) = (
+        book.clone(), ui.clone(), timers.clone(), muted.clone(), quitting.clone(),
+    );
+    resolve_book_id(book.clone(), quitting.clone(), cache, move |resolved| {
+        let book_id = match resolved {
+            Ok(id) => id,
+            Err(ResolveError::NotFound) => {
+                warn_inbox_once("ノートブック解決に失敗 (名前不一致)");
+                return;
+            }
+            Err(ResolveError::Request(err)) => {
+                warn_inbox_once(&format!("curl exit {:?}: {}", err.curl_exit, err.detail));
+                return;
+            }
+        };
+        let cfg = book_r.inkdrop().expect("見守りは inkdrop 有効時のみ");
+        let path = format!(
+            "/notes?keyword=bookId:{}&limit={}",
+            inkdrop::strip_book_prefix(&book_id),
+            inkdrop::NOTES_QUERY_LIMIT
+        );
+        let threshold = cfg.inbox_threshold;
+        inkdrop::request(cfg, "GET", &path, None, move |res| {
+            if quitting_r.get() || muted_r.get() {
+                return; // 発行後にミュート/終了された場合は発話もマーカーもなし
+            }
+            let count = match res {
+                Ok(json) => match inkdrop::count_notes(&json) {
+                    Some(n) => n,
+                    None => {
+                        warn_inbox_once("応答の解析に失敗");
+                        return;
+                    }
+                },
+                Err(err) => {
+                    warn_inbox_once(&err.detail);
+                    return;
+                }
+            };
+            let today = chrono::Local::now().date_naive();
+            if inkdrop::should_notify(count, threshold, *last_notified.borrow(), today) {
+                let n = inkdrop::format_count(count, inkdrop::NOTES_QUERY_LIMIT);
+                automatic_speak(
+                    &ui_r, &timers_r,
+                    &format!("Inbox に {n} 件たまっています。そろそろ整理しませんか"),
+                );
+                *last_notified.borrow_mut() = Some(today);
+            }
+        });
+    });
 }
 
 /// イベント台詞を選んで表示する。プールが空なら何もせず false
@@ -250,6 +494,7 @@ fn register_actions(
     timers: &Rc<RefCell<Timers>>,
     muted: &Rc<Cell<bool>>,
     quitting: &Rc<Cell<bool>>,
+    book_id_cache: &Rc<RefCell<Option<String>>>,
     started_at: Instant,
 ) {
     let speak_now = gio::SimpleAction::new("speak-now", None);
@@ -389,4 +634,44 @@ fn register_actions(
         });
     }
     app.add_action(&timer_action);
+
+    // Inkdrop キャプチャ: miryam-ctl memo <text>
+    let memo = gio::SimpleAction::new("memo", Some(glib::VariantTy::STRING));
+    {
+        let (book, ui, timers, muted_r, quitting, cache) = (
+            book.clone(), ui.clone(), timers.clone(),
+            muted.clone(), quitting.clone(), book_id_cache.clone(),
+        );
+        memo.connect_activate(move |_, param| {
+            if quitting.get() || book.inkdrop().is_none() {
+                return;
+            }
+            let Some(text) = param.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            capture_to_inkdrop(
+                book.clone(), ui.clone(), timers.clone(),
+                muted_r.clone(), quitting.clone(), cache.clone(),
+                started_at, text,
+            );
+        });
+    }
+    app.add_action(&memo);
+}
+
+#[cfg(test)]
+pub(crate) mod test_sync {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// glib デフォルトメインコンテキストを使う統合テストの直列化ロック。
+    /// acquire() は他スレッド保持時に Err を返すため、これ無しでは並列テストが flaky になる
+    pub static MAIN_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
+
+    pub fn lock() -> MutexGuard<'static, ()> {
+        // 1 本の panic が以降のテストを poison で巻き込まないようにする
+        MAIN_CONTEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
