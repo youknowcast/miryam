@@ -9,14 +9,17 @@ phrases = ["CPUは平静です"]
 
 [[group]]
 cpu = ["high"]
+face = "troubled"
 phrases = ["ファンが頑張っていますね"]
 
 [[group]]
 mem = ["high"]
+face = "troubled"
 phrases = ["メモリが残りわずかです"]
 
 [[group]]
 time = ["morning"]
+face = "happy"
 phrases = ["おはようございます"]
 
 [[group]]
@@ -29,14 +32,17 @@ phrases = ["少し休憩してもよいのでは"]
 
 [[group]]
 time = ["night"]
+face = "sleepy"
 phrases = ["夜更かしですね"]
 
 [[group]]
 uptime_hours = 4
+face = "sleepy"
 phrases = ["そろそろ休憩しませんか"]
 
 [[group]]
 event = "boot"
+face = "happy"
 phrases = [
   "こんにちは。今日もよろしくお願いします",
   "起動しました。調子はどうですか",
