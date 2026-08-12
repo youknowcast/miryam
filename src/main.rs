@@ -1073,10 +1073,13 @@ fn register_actions(
             if quitting.get() {
                 return;
             }
-            let (ui, timers) = (ui.clone(), timers.clone());
+            let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
             ui.clipboard().read_text_async(
                 None::<&gio::Cancellable>,
                 move |res: Result<Option<glib::GString>, glib::Error>| {
+                    if quitting.get() {
+                        return;
+                    }
                     let text = match &res {
                         Ok(Some(t)) => t.to_string(),
                         _ => String::new(),
