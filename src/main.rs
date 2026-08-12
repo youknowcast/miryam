@@ -1,6 +1,7 @@
 mod chat;
 mod control;
 mod inkdrop;
+mod links;
 mod llm;
 mod phrases;
 mod scheduler;
