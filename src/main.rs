@@ -1092,6 +1092,8 @@ fn register_actions(
             };
             let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
             let subprocess_c = subprocess.clone();
+            // wl-paste はローカルで即応するためタイムアウトは張らない (llm.rs とは異なり
+            // ハング時も次のクリックが新プロセスを起こすだけで実害がない)
             subprocess.communicate_utf8_async(None, None::<&gio::Cancellable>, move |result| {
                 if quitting.get() {
                     return;
@@ -1100,8 +1102,16 @@ fn register_actions(
                     Ok((stdout, _stderr)) if subprocess_c.is_successful() => {
                         stdout.as_deref().unwrap_or("").to_string()
                     }
-                    // クリップボードが空のとき wl-paste は非ゼロ終了する: 「URL なし」扱い
-                    Ok(_) => String::new(),
+                    // 非ゼロ終了は通常「クリップボードが空」: 「URL なし」扱いにするが、
+                    // 他の失敗理由と区別できるよう stderr は残す
+                    Ok((_, stderr)) => {
+                        let head = stderr
+                            .as_deref()
+                            .and_then(|s| s.lines().next())
+                            .unwrap_or("");
+                        eprintln!("miryam: wl-paste が非ゼロ終了しました: {head}");
+                        String::new()
+                    }
                     Err(e) => {
                         eprintln!("miryam: クリップボードの読み取りに失敗しました: {e}");
                         String::new()

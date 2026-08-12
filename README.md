@@ -6,7 +6,7 @@ Omarchy / Hyprland / Wayland 上で動作する伺か風デスクトップマス
 ## 必要パッケージ (Arch Linux / Omarchy)
 
 ```bash
-sudo pacman -S --needed gtk4 gtk4-layer-shell
+sudo pacman -S --needed gtk4 gtk4-layer-shell wl-clipboard
 ```
 
 Rust ツールチェーンは mise または rustup で導入してください (edition 2024 対応版)。
