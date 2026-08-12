@@ -11,6 +11,8 @@ struct PhrasesFile {
     phrases: Option<Vec<String>>,
     #[serde(default)]
     group: Vec<GroupRaw>,
+    #[serde(default)]
+    llm: Option<crate::llm::LlmConfig>,
 }
 
 #[derive(Deserialize)]
@@ -136,13 +138,22 @@ impl Group {
 
 pub struct PhraseBook {
     groups: Vec<Group>,
+    llm: Option<crate::llm::LlmConfig>,
 }
 
 impl PhraseBook {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
         let file: PhrasesFile =
             toml::from_str(s).context("phrases.toml のパースに失敗しました")?;
-        let groups = match (file.phrases, file.group.is_empty()) {
+        let PhrasesFile {
+            phrases: top_level,
+            group,
+            llm,
+        } = file;
+        if let Some(cfg) = &llm {
+            cfg.validate().context("[llm] の設定が不正です")?;
+        }
+        let groups = match (top_level, group.is_empty()) {
             (Some(_), false) => anyhow::bail!(
                 "旧形式 (トップレベル phrases) と新形式 ([[group]]) は併用できません"
             ),
@@ -161,13 +172,16 @@ impl PhraseBook {
                 }]
             }
             (None, true) => anyhow::bail!("phrases.toml に台詞が 1 つもありません"),
-            (None, false) => file
-                .group
+            (None, false) => group
                 .into_iter()
                 .map(GroupRaw::validate)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         };
-        Ok(Self { groups })
+        Ok(Self { groups, llm })
+    }
+
+    pub fn llm(&self) -> Option<&crate::llm::LlmConfig> {
+        self.llm.as_ref()
     }
 
     /// $XDG_CONFIG_HOME/miryam/phrases.toml があればそれを、無ければ埋め込みデフォルトを読む
@@ -232,6 +246,19 @@ impl TimeBand {
             Self::Evening => (17..22).contains(&hour),
             Self::Night => hour >= 22 || hour < 5,
         }
+    }
+}
+
+/// 時間帯名 (LLM プロンプト用)。しきい値は TimeBand と同一
+pub(crate) fn time_band_name(hour: u32) -> &'static str {
+    if TimeBand::Morning.contains(hour) {
+        "morning"
+    } else if TimeBand::Daytime.contains(hour) {
+        "daytime"
+    } else if TimeBand::Evening.contains(hour) {
+        "evening"
+    } else {
+        "night"
     }
 }
 
@@ -611,5 +638,56 @@ mod tests {
         };
         assert!(!g.matches(&cpu_only), "mem 不一致なら AND で不成立");
         assert!(!g.matches(&snap(12, chrono::Weekday::Mon, 6, 15, 0)));
+    }
+
+    #[test]
+    fn time_band_name_matches_bands() {
+        assert_eq!(time_band_name(6), "morning");
+        assert_eq!(time_band_name(12), "daytime");
+        assert_eq!(time_band_name(18), "evening");
+        assert_eq!(time_band_name(23), "night");
+        assert_eq!(time_band_name(3), "night");
+    }
+
+    #[test]
+    fn parses_llm_section() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [llm]
+            probability = 0.5
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.llm().unwrap().probability, 0.5);
+    }
+
+    #[test]
+    fn llm_section_works_with_legacy_format() {
+        let toml = r#"
+            phrases = ["x"]
+
+            [llm]
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert!(book.llm().is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_llm_config() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [llm]
+            probability = 2.0
+        "#;
+        assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn llm_absent_is_none() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
+        assert!(book.llm().is_none());
     }
 }
