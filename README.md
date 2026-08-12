@@ -158,6 +158,14 @@ url = "https://github.com/youknowcast"
 
   旧形式 (トップレベルの `phrases = [...]` のみ) も引き続き読み込めます。新旧の混在はエラーになります。
 
+- 定期発話の間隔は `[speech]` セクションで調整できます (未指定は 30〜90 秒のランダム):
+
+  ```toml
+  [speech]
+  interval_min_secs = 15   # 下限 (5 以上)
+  interval_max_secs = 45   # 上限 (下限以上)
+  ```
+
 - キャラクター画像は「スキン」として差し替えられます。`~/.config/miryam/skins/<名前>/character.png` に透過 PNG (400x600 推奨) を置き、`phrases.toml` で選択します:
 
   ```toml
