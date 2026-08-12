@@ -1,11 +1,12 @@
 use anyhow::Context;
 use gtk4 as gtk;
-use gtk::{gdk, gio, glib, prelude::*};
+use gtk::{gdk, gdk_pixbuf, gio, glib, prelude::*};
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
 const DEFAULT_CHARACTER_PNG: &[u8] = include_bytes!("../assets/character.png");
 const WINDOW_MARGIN: i32 = 24;
-const CHARACTER_SIZE: i32 = 200;
+const CHARACTER_WIDTH: i32 = 200;
+const CHARACTER_HEIGHT: i32 = 300;
 const CONTENT_WIDTH: i32 = 260;
 
 const CSS: &str = "
@@ -24,7 +25,7 @@ pub struct MascotUi {
     picture: gtk::Picture,
 }
 
-pub fn build(app: &gtk::Application) -> anyhow::Result<MascotUi> {
+pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<MascotUi> {
     anyhow::ensure!(
         gtk4_layer_shell::is_supported(),
         "gtk4-layer-shell がこの環境で利用できません (Wayland + layer-shell 対応コンポジタが必要です)"
@@ -32,9 +33,9 @@ pub fn build(app: &gtk::Application) -> anyhow::Result<MascotUi> {
 
     load_css();
 
-    let texture = load_character_texture()?;
+    let texture = load_character_texture(skin)?;
     let picture = gtk::Picture::for_paintable(&texture);
-    picture.set_size_request(CHARACTER_SIZE, CHARACTER_SIZE);
+    picture.set_size_request(CHARACTER_WIDTH, CHARACTER_HEIGHT);
     picture.set_halign(gtk::Align::Center);
 
     // 吹き出しは opacity で表示制御する (レイアウトを常に確保して
@@ -99,16 +100,71 @@ fn load_css() {
     }
 }
 
-/// $XDG_CONFIG_HOME/miryam/character.png があればそれを、無ければ埋め込み仮画像を使う
-fn load_character_texture() -> anyhow::Result<gdk::Texture> {
-    let user_path = glib::user_config_dir().join("miryam").join("character.png");
-    if user_path.exists() {
-        gdk::Texture::from_filename(&user_path)
-            .with_context(|| format!("{} の読み込みに失敗しました", user_path.display()))
-    } else {
-        gdk::Texture::from_bytes(&glib::Bytes::from_static(DEFAULT_CHARACTER_PNG))
-            .context("埋め込みキャラクター画像のデコードに失敗しました")
+/// スキン名から character.png のパスを構築する
+fn skin_character_path(config_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    config_dir
+        .join("miryam")
+        .join("skins")
+        .join(name)
+        .join("character.png")
+}
+
+/// 解決順序: [skin] 指定 (欠落は起動エラー) → 旧 character.png → 埋め込み仮画像
+///
+/// いずれの経路も表示上限 (CHARACTER_WIDTH x CHARACTER_HEIGHT) に収まるよう
+/// アスペクト比を保って縮小デコードする (窓サイズが画像の元ピクセルサイズに
+/// 膨張するのを防ぐため)。
+fn load_character_texture(skin: Option<&str>) -> anyhow::Result<gdk::Texture> {
+    let config_dir = glib::user_config_dir();
+    if let Some(name) = skin {
+        let path = skin_character_path(&config_dir, name);
+        return texture_from_file_scaled(&path).with_context(|| {
+            format!(
+                "スキン \"{name}\" の画像を読み込めません: {}",
+                path.display()
+            )
+        });
     }
+    let legacy = config_dir.join("miryam").join("character.png");
+    if legacy.exists() {
+        return texture_from_file_scaled(&legacy)
+            .with_context(|| format!("{} の読み込みに失敗しました", legacy.display()));
+    }
+    texture_from_bytes_scaled(DEFAULT_CHARACTER_PNG)
+        .context("埋め込みキャラクター画像のデコードに失敗しました")
+}
+
+/// ファイルパスの画像を表示上限に収まるよう縮小デコードしてテクスチャ化する。
+/// 上限より小さい画像を拡大することはない (scale_to_fit を参照)。
+fn texture_from_file_scaled(path: &std::path::Path) -> anyhow::Result<gdk::Texture> {
+    let pixbuf = gdk_pixbuf::Pixbuf::from_file(path)?;
+    let pixbuf = scale_to_fit(&pixbuf, CHARACTER_WIDTH, CHARACTER_HEIGHT);
+    Ok(gdk::Texture::for_pixbuf(&pixbuf))
+}
+
+/// 埋め込みバイト列を表示上限に収まるよう縮小デコードしてテクスチャ化する
+fn texture_from_bytes_scaled(bytes: &'static [u8]) -> anyhow::Result<gdk::Texture> {
+    let loader = gdk_pixbuf::PixbufLoader::new();
+    loader.write(bytes)?;
+    loader.close()?;
+    let pixbuf = loader.pixbuf().context("デコード結果を取得できませんでした")?;
+    let pixbuf = scale_to_fit(&pixbuf, CHARACTER_WIDTH, CHARACTER_HEIGHT);
+    Ok(gdk::Texture::for_pixbuf(&pixbuf))
+}
+
+/// アスペクト比を保ったまま (max_w, max_h) の枠に収まるよう縮小する。
+/// 既に枠内に収まっている場合はそのまま返す (拡大はしない)。
+fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_w: i32, max_h: i32) -> gdk_pixbuf::Pixbuf {
+    let (w, h) = (pixbuf.width(), pixbuf.height());
+    if w <= max_w && h <= max_h {
+        return pixbuf.clone();
+    }
+    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+    let dest_w = ((w as f64 * scale).round() as i32).max(1);
+    let dest_h = ((h as f64 * scale).round() as i32).max(1);
+    pixbuf
+        .scale_simple(dest_w, dest_h, gdk_pixbuf::InterpType::Bilinear)
+        .unwrap_or_else(|| pixbuf.clone())
 }
 
 /// クリックを受けるのはキャラ画像の矩形のみ。透明部分と吹き出しは下のアプリへ素通し
@@ -170,4 +226,18 @@ fn setup_quit_menu(app: &gtk::Application, window: &gtk::ApplicationWindow) {
         popover_ref.popup();
     });
     window.add_controller(gesture);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skin_path_layout() {
+        let p = skin_character_path(std::path::Path::new("/cfg"), "asha");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/cfg/miryam/skins/asha/character.png")
+        );
+    }
 }

@@ -37,7 +37,7 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
 
     let started_at = Instant::now();
     let book = Rc::new(phrases::PhraseBook::load()?);
-    let ui = Rc::new(ui::build(app)?);
+    let ui = Rc::new(ui::build(app, book.skin())?);
     let timers = Rc::new(RefCell::new(Timers::default()));
 
     schedule_next_speech(book.clone(), ui.clone(), timers.clone(), started_at);
