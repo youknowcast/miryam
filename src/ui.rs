@@ -191,10 +191,11 @@ impl MascotUi {
     }
 
     /// 右クリックメニューを配線する。メニューモデルは右クリックのたびに
-    /// 作り直す (links.toml のホットリロードのため)
+    /// 作り直す (links.toml のホットリロードのため)。
+    /// chat_modes が空ならチャット項目は出さない
     pub fn connect_menu(
         &self,
-        chat_enabled: bool,
+        chat_modes: Vec<String>,
         news_enabled: bool,
         links_submenu: impl Fn() -> gio::Menu + 'static,
     ) {
@@ -207,8 +208,17 @@ impl MascotUi {
         gesture.connect_pressed(move |_, _, x, y| {
             let menu = gio::Menu::new();
             menu.append(Some("今すぐ話す"), Some("app.speak-now"));
-            if chat_enabled {
-                menu.append(Some("話しかける"), Some("app.chat-toggle"));
+            if !chat_modes.is_empty() {
+                let sub = gio::Menu::new();
+                for name in &chat_modes {
+                    let item = gio::MenuItem::new(Some(name), None);
+                    item.set_action_and_target_value(
+                        Some("app.chat-mode"),
+                        Some(&name.to_variant()),
+                    );
+                    sub.append_item(&item);
+                }
+                menu.append_submenu(Some("話しかける"), &sub);
             }
             if news_enabled {
                 menu.append(Some("ニュースを見る"), Some("app.news-show"));
@@ -277,6 +287,185 @@ pub fn show_news_window(
 
     *slot.borrow_mut() = Some(window.clone());
     window.present();
+}
+
+/// Entry と選択肢ボタン共通の送信コールバックの型 (clippy::type_complexity 回避)
+type SubmitCallback = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>>;
+
+/// 議論系チャットモード用の会話ウィンドウ (ニュース窓と同系のフロート窓)。
+/// 同時 1 枚の保証とセッション管理は main.rs 側の責務
+pub struct ChatWindow {
+    window: gtk::Window,
+    history: gtk::Box,
+    scrolled: gtk::ScrolledWindow,
+    choices: gtk::Box,
+    entry: gtk::Entry,
+    /// 考え中の「miryam: ……」行。finish_reply で置換して None に戻す
+    pending: std::rc::Rc<std::cell::RefCell<Option<gtk::Label>>>,
+    /// Entry と選択肢ボタン共通の送信コールバック
+    on_submit: SubmitCallback,
+}
+
+pub fn build_chat_window(app: &gtk::Application, title: &str) -> ChatWindow {
+    let history = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    history.set_margin_top(12);
+    history.set_margin_bottom(12);
+    history.set_margin_start(16);
+    history.set_margin_end(16);
+    history.set_valign(gtk::Align::Start);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scrolled.set_child(Some(&history));
+    scrolled.set_vexpand(true);
+
+    let choices = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    choices.set_margin_start(16);
+    choices.set_margin_end(16);
+    choices.set_visible(false);
+
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("話しかける…"));
+    entry.set_margin_top(8);
+    entry.set_margin_bottom(12);
+    entry.set_margin_start(16);
+    entry.set_margin_end(16);
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    root.append(&scrolled);
+    root.append(&choices);
+    root.append(&entry);
+
+    let window = gtk::Window::new();
+    window.set_application(Some(app));
+    window.set_title(Some(title));
+    window.set_default_size(520, 640);
+    window.set_child(Some(&root));
+
+    let key = gtk::EventControllerKey::new();
+    let win_c = window.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gdk::Key::Escape {
+            win_c.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key);
+
+    let on_submit: SubmitCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
+    {
+        let on_submit = on_submit.clone();
+        entry.connect_activate(move |e| {
+            let text = e.text().to_string();
+            e.set_text("");
+            let cb = on_submit.borrow().clone();
+            if let Some(cb) = cb {
+                cb(text);
+            }
+        });
+    }
+
+    window.present();
+    entry.grab_focus();
+
+    ChatWindow {
+        window,
+        history,
+        scrolled,
+        choices,
+        entry,
+        pending: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        on_submit,
+    }
+}
+
+impl ChatWindow {
+    fn append_line(&self, text: &str) -> gtk::Label {
+        let label = gtk::Label::new(Some(text));
+        label.set_wrap(true);
+        label.set_selectable(true);
+        label.set_xalign(0.0);
+        self.history.append(&label);
+        self.scroll_to_bottom();
+        label
+    }
+
+    /// レイアウト確定後に最下部へ (append 直後は upper が古いので idle で)
+    fn scroll_to_bottom(&self) {
+        let adj = self.scrolled.vadjustment();
+        glib::idle_add_local_once(move || adj.set_value(adj.upper() - adj.page_size()));
+    }
+
+    pub fn push_user(&self, text: &str) {
+        self.append_line(&format!("あなた: {text}"));
+    }
+
+    pub fn begin_reply(&self) {
+        let label = self.append_line("miryam: ……");
+        *self.pending.borrow_mut() = Some(label);
+    }
+
+    pub fn finish_reply(&self, text: Option<&str>) {
+        let Some(label) = self.pending.borrow_mut().take() else {
+            return;
+        };
+        match text {
+            Some(t) => label.set_text(&format!("miryam: {t}")),
+            None => label.set_text("(応答が得られませんでした)"),
+        }
+        self.scroll_to_bottom();
+    }
+
+    pub fn set_choices(&self, choices: &[String]) {
+        while let Some(child) = self.choices.first_child() {
+            self.choices.remove(&child);
+        }
+        self.choices.set_visible(!choices.is_empty());
+        for choice in choices {
+            let button = gtk::Button::with_label(choice);
+            let on_submit = self.on_submit.clone();
+            let text = choice.clone();
+            button.connect_clicked(move |_| {
+                let cb = on_submit.borrow().clone();
+                if let Some(cb) = cb {
+                    cb(text.clone());
+                }
+            });
+            self.choices.append(&button);
+        }
+    }
+
+    pub fn set_busy(&self, busy: bool) {
+        self.entry.set_sensitive(!busy);
+        self.choices.set_sensitive(!busy);
+    }
+
+    pub fn connect_submitted(&self, f: impl Fn(String) + 'static) {
+        *self.on_submit.borrow_mut() = Some(std::rc::Rc::new(f));
+    }
+
+    pub fn connect_closed(&self, f: impl Fn() + 'static) {
+        self.window.connect_close_request(move |_| {
+            f();
+            glib::Propagation::Proceed
+        });
+    }
+
+    pub fn close(&self) {
+        self.window.close();
+    }
+
+    /// close イベントの同一性ガード用に内部ウィンドウへの弱参照を返す
+    pub fn downgrade(&self) -> glib::WeakRef<gtk::Window> {
+        self.window.downgrade()
+    }
+
+    /// この ChatWindow が指定のウィンドウを保持しているか (GObject ポインタ比較)
+    pub fn is_window(&self, window: &gtk::Window) -> bool {
+        &self.window == window
+    }
 }
 
 fn load_css() {
