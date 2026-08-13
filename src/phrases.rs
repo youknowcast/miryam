@@ -23,6 +23,8 @@ struct PhrasesFile {
     news: Option<crate::news::NewsConfig>,
     #[serde(default)]
     speech: Option<SpeechConfig>,
+    #[serde(default)]
+    reader: Option<crate::reader::config::ReaderConfig>,
 }
 
 /// 定期発話の間隔設定。未指定は scheduler の既定 (30〜90 秒)
@@ -245,6 +247,7 @@ pub struct PhraseBook {
     chat: Option<crate::chat::ChatConfig>,
     news: Option<crate::news::NewsConfig>,
     speech: Option<SpeechConfig>,
+    reader: Option<crate::reader::config::ReaderConfig>,
 }
 
 impl PhraseBook {
@@ -259,6 +262,7 @@ impl PhraseBook {
             chat,
             news,
             speech,
+            reader,
         } = file;
         if let Some(cfg) = &llm {
             cfg.validate().context("[llm] の設定が不正です")?;
@@ -280,6 +284,9 @@ impl PhraseBook {
         }
         if let Some(cfg) = &speech {
             cfg.validate().context("[speech] の設定が不正です")?;
+        }
+        if let Some(cfg) = &reader {
+            cfg.validate().context("[reader] の設定が不正です")?;
         }
         let groups = match (top_level, group.is_empty()) {
             (Some(_), false) => {
@@ -318,6 +325,7 @@ impl PhraseBook {
             chat,
             news,
             speech,
+            reader,
         })
     }
 
@@ -339,6 +347,10 @@ impl PhraseBook {
 
     pub fn news(&self) -> Option<&crate::news::NewsConfig> {
         self.news.as_ref()
+    }
+
+    pub fn reader(&self) -> Option<&crate::reader::config::ReaderConfig> {
+        self.reader.as_ref()
     }
 
     /// 定期発話間隔の (下限, 上限) 秒。[speech] 未指定は既定の 30〜90 秒
@@ -1161,6 +1173,34 @@ mod tests {
     fn news_absent_is_none() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["a"]"#).unwrap();
         assert!(book.news().is_none());
+    }
+
+    #[test]
+    fn reader_section_is_parsed_and_validated() {
+        let book = PhraseBook::from_toml_str(
+            r#"
+[[group]]
+phrases = ["やあ"]
+
+[reader]
+dir = "~/Documents/library"
+"#,
+        )
+        .expect("読み込めること");
+        assert_eq!(book.reader().expect("[reader] がある").recursive, false);
+
+        let Err(err) = PhraseBook::from_toml_str(
+            r#"
+[[group]]
+phrases = ["やあ"]
+
+[reader]
+dir = ""
+"#,
+        ) else {
+            panic!("dir が空の [reader] が通ってしまった");
+        };
+        assert!(err.to_string().contains("[reader]"));
     }
 
     #[test]

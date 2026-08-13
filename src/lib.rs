@@ -8,6 +8,7 @@ pub mod links;
 pub mod llm;
 pub mod news;
 pub mod phrases;
+pub mod reader;
 pub mod scheduler;
 pub mod system;
 pub mod ui;
