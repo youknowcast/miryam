@@ -279,6 +279,13 @@ exec-once = /path/to/miryam/target/release/miryam
 (Omarchy では `~/.config/hypr/windows.conf` などユーザー設定に追記):
 
 ```conf
+windowrule = float 1, match:class ^(dev\.youknow\.miryam)$
+windowrule = center 1, match:class ^(dev\.youknow\.miryam)$
+```
+
+古い Hyprland (0.55 未満) では旧構文を使う:
+
+```conf
 windowrulev2 = float, class:^(dev\.youknow\.miryam)$
 windowrulev2 = center, class:^(dev\.youknow\.miryam)$
 ```
