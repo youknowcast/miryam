@@ -911,7 +911,11 @@ fn open_window_chat(ctx: &ChatCtx, mode: chat::ChatMode) {
     if let Some(req) = pending {
         req.cancel();
     }
-    let win = ui::build_chat_window(&ctx.app, &format!("{} — miryam", mode.name));
+    let win = ui::build_chat_window(
+        &ctx.app,
+        &format!("{} — miryam", mode.name),
+        &ctx.ui.character_texture(),
+    );
     {
         let ctx_c = ctx.clone();
         win.connect_submitted(move |text| send_window_message(&ctx_c, text));
@@ -1397,6 +1401,7 @@ fn register_actions(
                     &news_window,
                     &format!("{}時のニュース", d.made_at.hour()),
                     &d.body,
+                    &ui.character_texture(),
                 ),
                 None => show_text(&ui, &timers, "まだニュースがありません"),
             }
