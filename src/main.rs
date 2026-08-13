@@ -1410,6 +1410,7 @@ fn register_actions(
         let slot = library_slot.clone();
         let ui_for_library = ui.clone();
         let app_for_library = app.clone();
+        let timers_for_library = timers.clone();
         let running: Rc<RefCell<std::collections::HashSet<std::path::PathBuf>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         library_show.connect_activate(move |_, _| {
@@ -1417,12 +1418,17 @@ fn register_actions(
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("miryam: 本棚を読めません: {e:#}");
-                    ui_for_library.show_bubble("本棚のフォルダが見つかりません");
+                    show_text(
+                        &ui_for_library,
+                        &timers_for_library,
+                        "本棚のフォルダが見つかりません",
+                    );
                     return;
                 }
             };
             let running = running.clone();
             let ui_for_open = ui_for_library.clone();
+            let timers_for_open = timers_for_library.clone();
             ui::show_library_window(
                 &app_for_library,
                 &slot,
@@ -1430,7 +1436,7 @@ fn register_actions(
                 &ui_for_library.backdrop_texture(),
                 move |path| {
                     if !running.borrow_mut().insert(path.to_path_buf()) {
-                        ui_for_open.show_bubble("それはもう開いています");
+                        show_text(&ui_for_open, &timers_for_open, "それはもう開いています");
                         return;
                     }
                     let exe = std::env::current_exe().unwrap_or_else(|_| "miryam".into());
@@ -1447,7 +1453,11 @@ fn register_actions(
                         Err(e) => {
                             eprintln!("miryam: reader を起動できません: {e}");
                             running.borrow_mut().remove(path);
-                            ui_for_open.show_bubble("リーダーを起動できませんでした");
+                            show_text(
+                                &ui_for_open,
+                                &timers_for_open,
+                                "リーダーを起動できませんでした",
+                            );
                         }
                     }
                 },
