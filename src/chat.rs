@@ -42,6 +42,8 @@ fn speaker_name(role: Role) -> &'static str {
 pub struct ChatSession {
     pub turns: Vec<Turn>,
     pub started_at: chrono::DateTime<chrono::Local>,
+    /// Some = 会話ウィンドウモード。None = 雑談 (吹き出し)
+    pub mode: Option<ChatMode>,
 }
 
 impl ChatSession {
@@ -49,6 +51,16 @@ impl ChatSession {
         Self {
             turns: Vec::new(),
             started_at,
+            mode: None,
+        }
+    }
+
+    /// 会話ウィンドウモードのセッションを開始する
+    pub fn with_mode(started_at: chrono::DateTime<chrono::Local>, mode: ChatMode) -> Self {
+        Self {
+            turns: Vec::new(),
+            started_at,
+            mode: Some(mode),
         }
     }
 
@@ -70,7 +82,11 @@ pub fn chat_note(
     session: &ChatSession,
     ended_at: &chrono::DateTime<chrono::Local>,
 ) -> (String, String) {
-    let title = format!("会話ログ {}", session.started_at.format("%Y-%m-%d %H:%M"));
+    let stamp = session.started_at.format("%Y-%m-%d %H:%M");
+    let title = match &session.mode {
+        Some(m) => format!("会話ログ ({}) {stamp}", m.name),
+        None => format!("会話ログ {stamp}"),
+    };
     let mut blocks: Vec<String> = Vec::new();
     for pair in session.turns.chunks(2) {
         let mut block = String::new();
@@ -466,6 +482,25 @@ mod tests {
         let ended = chrono::Local.with_ymd_and_hms(2026, 8, 9, 9, 5, 0).unwrap();
         let (_, body) = chat_note(&s, &ended);
         assert!(body.starts_with("**ユーザー**: q\n**miryam**: 一行目\n二行目\n"));
+    }
+
+    #[test]
+    fn with_mode_session_notes_mode_name_in_title() {
+        let mode = ChatMode {
+            name: "設計議論".to_string(),
+            prompt: "p".to_string(),
+            window: true,
+        };
+        let mut s = ChatSession::with_mode(
+            chrono::Local.with_ymd_and_hms(2026, 8, 9, 14, 30, 0).unwrap(),
+            mode,
+        );
+        s.push_exchange("q".to_string(), "a".to_string());
+        let ended = chrono::Local
+            .with_ymd_and_hms(2026, 8, 9, 14, 42, 0)
+            .unwrap();
+        let (title, _) = chat_note(&s, &ended);
+        assert_eq!(title, "会話ログ (設計議論) 2026-08-09 14:30");
     }
 
     #[test]
