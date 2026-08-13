@@ -456,6 +456,16 @@ impl ChatWindow {
     pub fn close(&self) {
         self.window.close();
     }
+
+    /// close イベントの同一性ガード用に内部ウィンドウへの弱参照を返す
+    pub fn downgrade(&self) -> glib::WeakRef<gtk::Window> {
+        self.window.downgrade()
+    }
+
+    /// この ChatWindow が指定のウィンドウを保持しているか (GObject ポインタ比較)
+    pub fn is_window(&self, window: &gtk::Window) -> bool {
+        &self.window == window
+    }
 }
 
 fn load_css() {

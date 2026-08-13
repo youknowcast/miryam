@@ -918,8 +918,22 @@ fn open_window_chat(ctx: &ChatCtx, mode: chat::ChatMode) {
     }
     {
         let ctx_c = ctx.clone();
+        // 同一性ガード: close-request が遅延発火する GTK 実装でも、古い窓の close が
+        // モード切替後の新セッションを壊さないようにする (現行 GTK は同期発火で、
+        // その場合 close_chat_session 側の take 済み早期 return と併せて二重に安全)
+        let weak = win.downgrade();
         win.connect_closed(move || {
-            close_chat_session(&ctx_c);
+            let Some(closing) = weak.upgrade() else {
+                return;
+            };
+            let is_current = ctx_c
+                .chat_window
+                .borrow()
+                .as_ref()
+                .is_some_and(|w| w.is_window(&closing));
+            if is_current {
+                close_chat_session(&ctx_c);
+            }
         });
     }
     ctx.timers.borrow_mut().chat_session =
