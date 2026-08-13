@@ -21,6 +21,38 @@ struct PhrasesFile {
     chat: Option<crate::chat::ChatConfig>,
     #[serde(default)]
     news: Option<crate::news::NewsConfig>,
+    #[serde(default)]
+    speech: Option<SpeechConfig>,
+}
+
+/// 定期発話の間隔設定。未指定は scheduler の既定 (30〜90 秒)
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeechConfig {
+    #[serde(default = "default_speech_min")]
+    interval_min_secs: u64,
+    #[serde(default = "default_speech_max")]
+    interval_max_secs: u64,
+}
+
+fn default_speech_min() -> u64 {
+    crate::scheduler::SPEECH_INTERVAL_MIN_SECS
+}
+
+fn default_speech_max() -> u64 {
+    crate::scheduler::SPEECH_INTERVAL_MAX_SECS
+}
+
+impl SpeechConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.interval_min_secs < 5 {
+            anyhow::bail!("[speech] interval_min_secs は 5 以上を指定してください");
+        }
+        if self.interval_max_secs < self.interval_min_secs {
+            anyhow::bail!("[speech] interval_max_secs は interval_min_secs 以上を指定してください");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -212,6 +244,7 @@ pub struct PhraseBook {
     inkdrop: Option<crate::inkdrop::InkdropConfig>,
     chat: Option<crate::chat::ChatConfig>,
     news: Option<crate::news::NewsConfig>,
+    speech: Option<SpeechConfig>,
 }
 
 impl PhraseBook {
@@ -225,6 +258,7 @@ impl PhraseBook {
             inkdrop,
             chat,
             news,
+            speech,
         } = file;
         if let Some(cfg) = &llm {
             cfg.validate().context("[llm] の設定が不正です")?;
@@ -243,6 +277,9 @@ impl PhraseBook {
             if llm.is_none() {
                 anyhow::bail!("[news] には [llm] セクションが必要です");
             }
+        }
+        if let Some(cfg) = &speech {
+            cfg.validate().context("[speech] の設定が不正です")?;
         }
         let groups = match (top_level, group.is_empty()) {
             (Some(_), false) => {
@@ -280,6 +317,7 @@ impl PhraseBook {
             inkdrop,
             chat,
             news,
+            speech,
         })
     }
 
@@ -301,6 +339,17 @@ impl PhraseBook {
 
     pub fn news(&self) -> Option<&crate::news::NewsConfig> {
         self.news.as_ref()
+    }
+
+    /// 定期発話間隔の (下限, 上限) 秒。[speech] 未指定は既定の 30〜90 秒
+    pub fn speech_interval(&self) -> (u64, u64) {
+        self.speech
+            .as_ref()
+            .map(|s| (s.interval_min_secs, s.interval_max_secs))
+            .unwrap_or((
+                crate::scheduler::SPEECH_INTERVAL_MIN_SECS,
+                crate::scheduler::SPEECH_INTERVAL_MAX_SECS,
+            ))
     }
 
     /// $XDG_CONFIG_HOME/miryam/phrases.toml があればそれを、無ければ埋め込みデフォルトを読む
@@ -1016,6 +1065,47 @@ mod tests {
             command = []
         "#;
         assert!(PhraseBook::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn speech_interval_defaults_when_absent() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
+        assert_eq!(
+            book.speech_interval(),
+            (
+                crate::scheduler::SPEECH_INTERVAL_MIN_SECS,
+                crate::scheduler::SPEECH_INTERVAL_MAX_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn parses_speech_section() {
+        let toml = r#"
+            [[group]]
+            phrases = ["x"]
+
+            [speech]
+            interval_min_secs = 15
+            interval_max_secs = 45
+        "#;
+        let book = PhraseBook::from_toml_str(toml).unwrap();
+        assert_eq!(book.speech_interval(), (15, 45));
+    }
+
+    #[test]
+    fn rejects_invalid_speech_config() {
+        for body in [
+            "interval_min_secs = 3",                          // 下限未満
+            "interval_min_secs = 60\ninterval_max_secs = 30", // min > max
+            "unknown_key = 1",                                // 未知キー
+        ] {
+            let toml = format!("[[group]]\nphrases = [\"x\"]\n\n[speech]\n{body}\n");
+            assert!(
+                PhraseBook::from_toml_str(&toml).is_err(),
+                "{body:?} はエラーのはず"
+            );
+        }
     }
 
     #[test]

@@ -943,7 +943,7 @@ fn scheduled_speak(
     timers.borrow_mut().llm_request = Some(req);
 }
 
-/// 30〜90 秒後の次回発話をスケジュールする。既存の予約はキャンセルする
+/// [speech] の間隔設定 (既定 30〜90 秒) に従って次回発話をスケジュールする。既存の予約はキャンセルする
 fn schedule_next_speech(
     book: Rc<phrases::PhraseBook>,
     ui: Rc<ui::MascotUi>,
@@ -956,20 +956,24 @@ fn schedule_next_speech(
         id.remove();
     }
     let timers_c = timers.clone();
-    let id = glib::timeout_add_local_once(scheduler::next_speech_interval(), move || {
-        timers_c.borrow_mut().next_speech = None;
-        if !quitting.get() && !muted.get() && timers_c.borrow().chat_session.is_none() {
-            scheduled_speak(&book, &ui, &timers_c, started_at);
-        }
-        schedule_next_speech(
-            book.clone(),
-            ui.clone(),
-            timers_c.clone(),
-            muted.clone(),
-            quitting.clone(),
-            started_at,
-        );
-    });
+    let (min_secs, max_secs) = book.speech_interval();
+    let id = glib::timeout_add_local_once(
+        scheduler::next_speech_interval(min_secs, max_secs),
+        move || {
+            timers_c.borrow_mut().next_speech = None;
+            if !quitting.get() && !muted.get() && timers_c.borrow().chat_session.is_none() {
+                scheduled_speak(&book, &ui, &timers_c, started_at);
+            }
+            schedule_next_speech(
+                book.clone(),
+                ui.clone(),
+                timers_c.clone(),
+                muted.clone(),
+                quitting.clone(),
+                started_at,
+            );
+        },
+    );
     timers.borrow_mut().next_speech = Some(id);
 }
 
