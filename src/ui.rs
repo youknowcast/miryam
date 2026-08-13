@@ -230,6 +230,7 @@ impl MascotUi {
         &self,
         chat_modes: Vec<String>,
         news_enabled: bool,
+        library_enabled: bool,
         links_submenu: impl Fn() -> gio::Menu + 'static,
     ) {
         let popover = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
@@ -255,6 +256,9 @@ impl MascotUi {
             }
             if news_enabled {
                 menu.append(Some("ニュースを見る"), Some("app.news-show"));
+            }
+            if library_enabled {
+                menu.append(Some("本棚"), Some("app.library-show"));
             }
             menu.append_submenu(Some("リンク集"), &links_submenu());
             menu.append(Some("自動発話を停止"), Some("app.mute"));
@@ -343,6 +347,79 @@ pub fn show_news_window(
 
     *slot.borrow_mut() = Some(window.clone());
     window.present();
+}
+
+/// 本棚ウィンドウ (layer shell ではないフロート窓)。行を選ぶと on_open が呼ばれる。
+/// slot で同時 1 枚を保証する: 開き直しは前の窓を閉じてから (show_news_window と同じ)
+pub fn show_library_window(
+    app: &gtk::Application,
+    slot: &std::rc::Rc<std::cell::RefCell<Option<gtk::Window>>>,
+    entries: Vec<crate::reader::library::LibraryEntry>,
+    backdrop: &gdk::Texture,
+    on_open: impl Fn(&std::path::Path) + 'static,
+) {
+    if let Some(prev) = slot.borrow_mut().take() {
+        prev.close();
+    }
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    if entries.is_empty() {
+        let empty = gtk::Label::new(Some("PDF がありません"));
+        empty.set_margin_top(16);
+        empty.set_margin_bottom(16);
+        list.append(&empty);
+    }
+    let on_open = std::rc::Rc::new(on_open);
+    for e in entries {
+        let button = gtk::Button::with_label(&crate::reader::library::format_entry(&e));
+        button.set_has_frame(false);
+        let path = e.path.clone();
+        let on_open = on_open.clone();
+        button.connect_clicked(move |_| on_open(&path));
+        list.append(&button);
+    }
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_child(Some(&list));
+
+    let window = gtk::Window::new();
+    window.set_application(Some(app));
+    window.set_title(Some("本棚"));
+    window.set_default_size(520, 480);
+    window.set_child(Some(&with_backdrop(backdrop, &scrolled)));
+
+    let key = gtk::EventControllerKey::new();
+    let window_for_key = window.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gdk::Key::Escape {
+            window_for_key.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key);
+
+    // 閉じられたら slot を空に (Esc・タイトルバー双方この経路を通る)
+    let slot_for_close = slot.clone();
+    window.connect_close_request(move |_| {
+        slot_for_close.borrow_mut().take();
+        glib::Propagation::Proceed
+    });
+
+    *slot.borrow_mut() = Some(window.clone());
+    window.present();
+}
+
+/// miryam-reader は自分と同じディレクトリにあるものを使う。
+/// 親ディレクトリが取れなければ PATH 解決に任せて名前だけ返す
+pub fn reader_exe_path(current_exe: &std::path::Path) -> std::path::PathBuf {
+    match current_exe.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("miryam-reader"),
+        _ => std::path::PathBuf::from("miryam-reader"),
+    }
 }
 
 /// Entry と選択肢ボタン共通の送信コールバックの型 (clippy::type_complexity 回避)
@@ -792,5 +869,21 @@ mod tests {
         assert_eq!(drag_margin(24, -100.0, Some(80)), 80);
         // 上限が負 (窓がモニタより大きい等) でも 0 に丸める
         assert_eq!(drag_margin(24, -100.0, Some(-5)), 0);
+    }
+
+    #[test]
+    fn reader_exe_sits_next_to_the_mascot() {
+        assert_eq!(
+            reader_exe_path(std::path::Path::new("/opt/miryam/bin/miryam")),
+            std::path::PathBuf::from("/opt/miryam/bin/miryam-reader")
+        );
+    }
+
+    #[test]
+    fn reader_exe_falls_back_to_bare_name() {
+        assert_eq!(
+            reader_exe_path(std::path::Path::new("miryam")),
+            std::path::PathBuf::from("miryam-reader")
+        );
     }
 }
