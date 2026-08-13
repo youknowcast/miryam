@@ -63,19 +63,33 @@ impl ReaderState {
         self.warn_bar = Some(bar);
     }
 
-    /// 保存に失敗していたら警告バーに出す。
-    /// **state を借りたまま呼ばないこと** (中で `borrow_mut` する)
+    /// 直近の保存が失敗したままかどうか
+    pub fn save_failed(&self) -> bool {
+        self.save_error.is_some()
+    }
+
+    /// 直近の保存の結果を警告バーに反映する。成功していれば消す。
+    /// **state を借りたまま呼ばないこと** (中で `borrow` する)
     pub fn show_save_error(state: &Rc<RefCell<Self>>) {
-        let (msg, bar) = {
-            let mut st = state.borrow_mut();
-            let Some(msg) = st.save_error.take() else {
-                return;
-            };
-            (msg, st.warn_bar.clone())
+        let (msg, read_only, bar) = {
+            let st = state.borrow();
+            (st.save_error.clone(), st.read_only, st.warn_bar.clone())
         };
-        if let Some(bar) = bar {
-            bar.set_text(&format!("注釈を保存できません: {msg}"));
-            bar.set_visible(true);
+        let Some(bar) = bar else {
+            return;
+        };
+        match msg {
+            Some(msg) => {
+                bar.set_text(&format!("注釈を保存できません: {msg}"));
+                bar.set_visible(true);
+            }
+            // 読み取り専用の警告は保存失敗とは別物なので消さない
+            // (読み取り専用では save() が何もしないので save_error も立たない)
+            None if !read_only => {
+                bar.set_text("");
+                bar.set_visible(false);
+            }
+            None => {}
         }
     }
 
@@ -121,15 +135,19 @@ impl ReaderState {
         self.save();
     }
 
-    /// 失敗しても落とさない。理由は `save_error` に残して `show_save_error` が画面に出す
+    /// 失敗しても落とさない。結果は `save_error` に残して `show_save_error` が画面に出す
+    /// (成功したら消す。古い失敗の表示を残さないため)
     pub fn save(&mut self) {
         if self.read_only {
             return;
         }
-        if let Err(e) = self.sidecar.save(&self.pdf_path) {
-            let msg = format!("{e:#}");
-            eprintln!("miryam-reader: 注釈を保存できません: {msg}");
-            self.save_error = Some(msg);
+        match self.sidecar.save(&self.pdf_path) {
+            Ok(()) => self.save_error = None,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!("miryam-reader: 注釈を保存できません: {msg}");
+                self.save_error = Some(msg);
+            }
         }
     }
 }
@@ -342,12 +360,13 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         window.connect_close_request(move |_| {
             let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
             let page = geom::visible_page(scrolled.vadjustment().value() - geom::MARGIN, &offsets);
-            {
+            let failed = {
                 let mut st = state.borrow_mut();
                 st.sidecar.bookmark_page = page;
                 st.sidecar.opened_at = chrono::Local::now();
                 st.save();
-            }
+                st.save_failed()
+            };
             let name = state
                 .borrow()
                 .pdf_path
@@ -355,10 +374,16 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let marks = state.borrow().sidecar.highlights.len();
-            notify_miryam(&format!(
-                "『{name}』を {} ページまで読みました (マーカー {marks} 件)",
-                page + 1
-            ));
+            // 書けていないのに「読みました」とは言わない。窓はこのまま閉じる
+            let message = if failed {
+                format!("『{name}』のしおりを保存できませんでした")
+            } else {
+                format!(
+                    "『{name}』を {} ページまで読みました (マーカー {marks} 件)",
+                    page + 1
+                )
+            };
+            notify_miryam(&message);
             glib::Propagation::Proceed
         });
     }
@@ -484,6 +509,87 @@ mod tests {
         let after = std::fs::read_to_string(&path).expect("読めること");
         assert_eq!(after, "書き換えられたら消える印", "知らない id では保存しない");
         assert_eq!(state.sidecar.highlights[0].memo, "", "メモも増えない");
+    }
+
+    /// 壊れたサイドカーを置いて、その中身を返す (バイト比較の基準にする)
+    fn put_broken_sidecar(pdf: &std::path::Path) -> Vec<u8> {
+        let path = store::sidecar_path(pdf);
+        std::fs::create_dir_all(path.parent().expect("親がある")).expect("掘れること");
+        let broken = b"{ \x82\xa0 broken".to_vec();
+        std::fs::write(&path, &broken).expect("書けること");
+        broken
+    }
+
+    #[test]
+    fn a_broken_sidecar_opens_read_only_with_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        put_broken_sidecar(&pdf);
+
+        let (state, warning) =
+            ReaderState::open(pdf.clone(), vec!["yellow".into()]).expect("開けること");
+
+        assert!(state.read_only, "壊れていたら読み取り専用");
+        let warning = warning.expect("警告文が返る");
+        assert!(!warning.is_empty(), "理由が入っている");
+    }
+
+    #[test]
+    fn read_only_never_touches_the_broken_file_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let before = put_broken_sidecar(&pdf);
+
+        let (mut state, _warning) =
+            ReaderState::open(pdf.clone(), vec!["yellow".into()]).expect("開けること");
+        assert!(state.read_only, "前提: 読み取り専用");
+
+        let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
+        state.set_memo(&id, "メモ".into());
+        state.sidecar.bookmark_page = 7;
+        state.save();
+
+        let after = std::fs::read(store::sidecar_path(&pdf)).expect("読めること");
+        assert_eq!(after, before, "読み取り専用ではユーザーの記録を 1 バイトも書き換えない");
+        assert!(!state.save_failed(), "書きに行かないので失敗も記録しない");
+    }
+
+    #[test]
+    fn remove_highlight_roundtrips_through_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+        let saved = store::Sidecar::load(&pdf).expect("読めること").expect("ある");
+        assert_eq!(saved.highlights.len(), 1, "前提: 1 件保存されている");
+
+        state.remove_highlight(&id);
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("ある");
+        assert!(loaded.highlights.is_empty(), "消したらファイルからも消える");
+        assert!(state.sidecar.highlights.is_empty(), "手元の状態からも消える");
+        assert!(!state.save_failed(), "保存に失敗していない");
+    }
+
+    #[test]
+    fn a_successful_save_clears_the_recorded_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+
+        // 保存先を書けなくして 1 回失敗させる (ディレクトリを消す)
+        let sidecar_dir = store::sidecar_path(&pdf).parent().expect("親がある").to_path_buf();
+        std::fs::remove_dir_all(&sidecar_dir).expect("消せること");
+        std::fs::write(&sidecar_dir, "dir ではなくファイル").expect("書けること");
+        state.set_memo(&id, "失敗するメモ".into());
+        assert!(state.save_failed(), "前提: 保存に失敗している");
+
+        // 邪魔を取り除けば次の保存は通る
+        std::fs::remove_file(&sidecar_dir).expect("消せること");
+        state.set_memo(&id, "通るメモ".into());
+
+        assert!(!state.save_failed(), "成功したら失敗の記録は消える");
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("ある");
+        assert_eq!(loaded.highlights[0].memo, "通るメモ");
     }
 
     #[test]

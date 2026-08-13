@@ -303,7 +303,11 @@ pub fn show_news_window(
     body: &str,
     backdrop: &gdk::Texture,
 ) {
-    if let Some(prev) = slot.borrow_mut().take() {
+    // 借りを先に手放す。close() は ::close-request を同期的に発火し、
+    // そのハンドラが同じ slot を borrow_mut するので、if let の中で借りたままだと
+    // BorrowMutError → FFI 境界をまたぐ panic → abort になる
+    let previous = slot.borrow_mut().take();
+    if let Some(prev) = previous {
         prev.close();
     }
     let label = gtk::Label::new(Some(body));
@@ -358,7 +362,9 @@ pub fn show_library_window(
     backdrop: &gdk::Texture,
     on_open: impl Fn(&std::path::Path) + 'static,
 ) {
-    if let Some(prev) = slot.borrow_mut().take() {
+    // 借りを先に手放す (理由は show_news_window と同じ)
+    let previous = slot.borrow_mut().take();
+    if let Some(prev) = previous {
         prev.close();
     }
 
@@ -885,5 +891,46 @@ mod tests {
             reader_exe_path(std::path::Path::new("miryam")),
             std::path::PathBuf::from("miryam-reader")
         );
+    }
+
+    /// 窓を閉じたときに走る close ハンドラの再入を模す。
+    /// 実際のハンドラは `slot.borrow_mut().take()` をするので、ここでも同じことを試す
+    fn close_handler(slot: &std::rc::Rc<std::cell::RefCell<Option<&'static str>>>) -> bool {
+        match slot.try_borrow_mut() {
+            Ok(mut s) => {
+                s.take();
+                true
+            }
+            // 本番ではここが BorrowMutError の panic → FFI 境界をまたいで abort になる
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn borrow_inside_the_if_let_scrutinee_blocks_the_close_handler() {
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(Some("窓")));
+        let mut reentered = None;
+        // 直したかった書き方: RefMut が then ブロックの間ずっと生きている
+        if let Some(_prev) = slot.borrow_mut().take() {
+            reentered = Some(close_handler(&slot));
+        }
+        assert_eq!(
+            reentered,
+            Some(false),
+            "then ブロック中は借りが残るので close ハンドラが再入できない"
+        );
+    }
+
+    #[test]
+    fn taking_into_a_local_first_lets_the_close_handler_run() {
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(Some("窓")));
+        let mut reentered = None;
+        // 修正後の書き方: 一時変数に落とした時点で借りが切れる
+        let previous = slot.borrow_mut().take();
+        if let Some(_prev) = previous {
+            reentered = Some(close_handler(&slot));
+        }
+        assert_eq!(reentered, Some(true), "借りを先に手放せば再入できる");
+        assert!(slot.borrow().is_none(), "close ハンドラが slot を空にできている");
     }
 }
