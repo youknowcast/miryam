@@ -1365,7 +1365,9 @@ fn register_actions(
     {
         let (ui_c, timers_c) = (ui.clone(), timers.clone());
         ui.connect_menu(
-            book.chat().is_some(),
+            book.chat()
+                .map(|c| c.modes().iter().map(|m| m.name.clone()).collect())
+                .unwrap_or_default(),
             book.news().is_some(),
             move || match links::load(&links::links_path()) {
                 Ok(list) => links::build_submenu(&list),
