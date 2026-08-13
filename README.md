@@ -248,6 +248,15 @@ phrases = ["ファンが頑張っていますね"]
 - 同梱辞書は happy / troubled / sleepy を使います。ローカル辞書は同梱辞書を
   置き換えるため、表情を使うには自分の phrases.toml に `face` を追記してください
 
+### 会話窓の透かし背景
+
+会話ウィンドウ・ニュースウィンドウの右下にはキャラ絵が透かし (不透明度 30%) で
+表示されます。`~/.config/miryam/skins/<name>/backdrop.png` を置くと、立ち絵の
+代わりにその画像 (バストアップなど) が使われます。
+
+- 置いていない場合は通常立ち絵にフォールバックします
+- 後から置いても再起動は不要です (次に開いた窓から反映)
+
 ### LLM 連携 (任意)
 
 `phrases.toml` に `[llm]` セクションを書くと、定期発話の一部をローカルの LLM CLI が生成した台詞に差し替えます。既定は無効です。
@@ -271,6 +280,26 @@ timeout_secs = 30            # 超過で辞書台詞にフォールバック
 ```conf
 exec-once = /path/to/miryam/target/release/miryam
 ```
+
+### 窓を画面中央に出す
+
+会話ウィンドウやニュースウィンドウは、そのままだとマスコット (右下常駐) の後ろに
+開いて見にくいことがある。Hyprland ではウィンドウルールで中央フロート表示にできる
+(Omarchy では `~/.config/hypr/windows.conf` などユーザー設定に追記):
+
+```conf
+windowrule = float 1, match:class ^(dev\.youknow\.miryam)$
+windowrule = center 1, match:class ^(dev\.youknow\.miryam)$
+```
+
+古い Hyprland (0.55 未満) では旧構文を使う:
+
+```conf
+windowrulev2 = float, class:^(dev\.youknow\.miryam)$
+windowrulev2 = center, class:^(dev\.youknow\.miryam)$
+```
+
+マスコット本体は layer-shell surface のためウィンドウルールの影響を受けない。
 
 ## 現在の制約
 

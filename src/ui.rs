@@ -38,6 +38,9 @@ pub struct MascotUi {
     default_texture: gdk::Texture,
     /// 表情テクスチャの遅延ロードキャッシュ。None = ロード失敗済み (再試行しない)
     face_cache: std::cell::RefCell<std::collections::HashMap<String, Option<gdk::Texture>>>,
+    /// 透かし背景 (backdrop.png) の遅延ロードキャッシュ。成功時のみ保持し、
+    /// 未配置の間は毎回ファイルを確認する (後から置いても再起動不要にするため)
+    backdrop_cache: std::cell::RefCell<Option<gdk::Texture>>,
 }
 
 pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<MascotUi> {
@@ -99,6 +102,7 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
         skin: skin.map(str::to_string),
         default_texture: texture,
         face_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        backdrop_cache: std::cell::RefCell::new(None),
     })
 }
 
@@ -142,6 +146,35 @@ impl MascotUi {
                 }
             })
             .clone()
+    }
+
+    /// 会話窓・ニュース窓の透かし背景用テクスチャ。
+    /// スキンに backdrop.png (バストアップなどの専用絵) があればそれを使い、
+    /// なければ通常立ち絵にフォールバックする
+    pub fn backdrop_texture(&self) -> gdk::Texture {
+        if let Some(t) = self.backdrop_cache.borrow().as_ref() {
+            return t.clone();
+        }
+        let Some(skin) = self.skin.as_deref() else {
+            return self.default_texture.clone();
+        };
+        let path = skin_backdrop_path(&glib::user_config_dir(), skin);
+        if !path.exists() {
+            return self.default_texture.clone();
+        }
+        match texture_from_file_scaled(&path) {
+            Ok(t) => {
+                *self.backdrop_cache.borrow_mut() = Some(t.clone());
+                t
+            }
+            Err(e) => {
+                eprintln!(
+                    "miryam: backdrop.png を読み込めません。立ち絵を使います ({}): {e:#}",
+                    path.display()
+                );
+                self.default_texture.clone()
+            }
+        }
     }
 
     /// ドラッグで動かした位置を既定 (右下、マージン WINDOW_MARGIN) に戻す
@@ -235,6 +268,28 @@ impl MascotUi {
     }
 }
 
+/// 会話窓・ニュース窓の透かし背景の不透明度
+const BACKDROP_OPACITY: f64 = 0.3;
+
+/// コンテンツの下層にキャラ絵を透かしで敷いた Overlay を返す。
+/// 絵は右下寄せ (デスクトップのマスコット位置とそろえる)・contain フィット・入力透過。
+/// GtkOverlay は child がサイズを決めるため、content 側を measure 対象にして
+/// 窓のサイズ要求が Picture の原寸に引きずられないようにする
+fn with_backdrop(texture: &gdk::Texture, content: &impl IsA<gtk::Widget>) -> gtk::Overlay {
+    let picture = gtk::Picture::for_paintable(texture);
+    // contain フィットは Picture の既定 (keep-aspect-ratio=true)。
+    // ContentFit API は gtk4 の v4_8 feature が必要なため使わない (依存は v4_6 のまま)
+    picture.set_halign(gtk::Align::End);
+    picture.set_valign(gtk::Align::End);
+    picture.set_opacity(BACKDROP_OPACITY);
+    picture.set_can_target(false);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&picture));
+    overlay.add_overlay(content);
+    overlay.set_measure_overlay(content, true);
+    overlay
+}
+
 /// ニュースダイジェスト用の通常ウィンドウ (layer shell ではないフロート窓)。
 /// slot で同時 1 枚を保証する: 開き直しは前の窓を閉じてから
 pub fn show_news_window(
@@ -242,6 +297,7 @@ pub fn show_news_window(
     slot: &std::rc::Rc<std::cell::RefCell<Option<gtk::Window>>>,
     title: &str,
     body: &str,
+    backdrop: &gdk::Texture,
 ) {
     if let Some(prev) = slot.borrow_mut().take() {
         prev.close();
@@ -264,7 +320,7 @@ pub fn show_news_window(
     window.set_application(Some(app));
     window.set_title(Some(title));
     window.set_default_size(520, 640);
-    window.set_child(Some(&scrolled));
+    window.set_child(Some(&with_backdrop(backdrop, &scrolled)));
 
     let key = gtk::EventControllerKey::new();
     let win_c = window.clone();
@@ -306,7 +362,11 @@ pub struct ChatWindow {
     on_submit: SubmitCallback,
 }
 
-pub fn build_chat_window(app: &gtk::Application, title: &str) -> ChatWindow {
+pub fn build_chat_window(
+    app: &gtk::Application,
+    title: &str,
+    backdrop: &gdk::Texture,
+) -> ChatWindow {
     let history = gtk::Box::new(gtk::Orientation::Vertical, 8);
     history.set_margin_top(12);
     history.set_margin_bottom(12);
@@ -340,7 +400,7 @@ pub fn build_chat_window(app: &gtk::Application, title: &str) -> ChatWindow {
     window.set_application(Some(app));
     window.set_title(Some(title));
     window.set_default_size(520, 640);
-    window.set_child(Some(&root));
+    window.set_child(Some(&with_backdrop(backdrop, &root)));
 
     let key = gtk::EventControllerKey::new();
     let win_c = window.clone();
@@ -487,6 +547,15 @@ fn skin_character_path(config_dir: &std::path::Path, name: &str) -> std::path::P
         .join("skins")
         .join(name)
         .join("character.png")
+}
+
+/// スキン名から透かし背景 backdrop.png のパスを構築する
+fn skin_backdrop_path(config_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    config_dir
+        .join("miryam")
+        .join("skins")
+        .join(name)
+        .join("backdrop.png")
 }
 
 /// スキン名と表情名から character-<face>.png のパスを構築する
