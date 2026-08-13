@@ -46,14 +46,31 @@ impl PageView {
             area.set_content_height((page_h * zoom.get()) as i32);
             area.add_css_class("reader-page");
 
-            // 文字情報のないページ (スキャン PDF) は選択できないので断りを描く
-            let has_text = page.text().is_some_and(|t| !t.trim().is_empty());
+            // 断り書きを重ねるための入れ物。中身は必要になってから足す
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&area));
+
+            // 文字情報の有無。page.text() は全文抽出で重いので、実際に描かれたときに 1 回だけ調べる
+            let has_text: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
 
             // GObject の clone は参照カウント増加。選択処理でも同じページを使う
             let page_for_draw = page.clone();
             let zoom_for_draw = zoom.clone();
             let state_for_draw = state.clone();
+            let has_text_for_draw = has_text.clone();
+            // 強参照だと overlay → area → draw クロージャ → overlay の循環になる
+            let overlay_for_draw = overlay.downgrade();
             area.set_draw_func(move |_area, cr, _w, _h| {
+                if has_text_for_draw.get().is_none() {
+                    let found = page_for_draw.text().is_some_and(|t| !t.trim().is_empty());
+                    has_text_for_draw.set(Some(found));
+                    if !found
+                        && let Some(ov) = overlay_for_draw.upgrade()
+                    {
+                        // 描画の最中にウィジェットを足さない
+                        gtk::glib::idle_add_local_once(move || attach_no_text_note(&ov));
+                    }
+                }
                 let z = zoom_for_draw.get();
                 // 紙の白
                 cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -79,6 +96,20 @@ impl PageView {
                 let _ = cr.restore();
             });
 
+            // 開いているポップオーバーの置き場。窓が壊れるときにここから外す
+            let popover_slot: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+            {
+                let slot = popover_slot.clone();
+                area.connect_destroy(move |_| {
+                    let open = slot.borrow_mut().take();
+                    if let Some(p) = open
+                        && p.parent().is_some()
+                    {
+                        p.unparent();
+                    }
+                });
+            }
+
             // ドラッグで本文を選び、離したところで色を選ばせる
             let page_for_drag = page.clone();
             let on_created_for_drag = on_created.clone();
@@ -94,6 +125,7 @@ impl PageView {
                 let page = page_for_drag;
                 let state = state.clone();
                 let area_for_popover = area.clone();
+                let slot = popover_slot.clone();
                 drag.connect_drag_end(move |_, dx, dy| {
                     let Some((sx, sy)) = selection.replace(None) else {
                         return;
@@ -141,6 +173,7 @@ impl PageView {
                     }
                     show_color_popover(
                         &area_for_popover,
+                        &slot,
                         &state,
                         &on_created_for_drag,
                         index,
@@ -153,26 +186,7 @@ impl PageView {
             }
             area.add_controller(drag);
 
-            if has_text {
-                container.append(&area);
-            } else {
-                // 断り書きは cairo の toy font だと日本語が豆腐になる (字形の代替が効かない)。
-                // Pango を使う Label を重ねて出す
-                let overlay = gtk::Overlay::new();
-                overlay.set_child(Some(&area));
-                let note = gtk::Label::new(None);
-                note.set_markup(
-                    "<span foreground=\"#555555\">このページは文字情報がないため選択できません</span>",
-                );
-                note.set_halign(gtk::Align::Start);
-                note.set_valign(gtk::Align::Start);
-                note.set_margin_start(8);
-                note.set_margin_top(4);
-                // ページのドラッグを邪魔しない
-                note.set_can_target(false);
-                overlay.add_overlay(&note);
-                container.append(&overlay);
-            }
+            container.append(&overlay);
             areas.push(area);
         }
 
@@ -219,9 +233,24 @@ pub fn color_rgb(name: &str) -> (f64, f64, f64) {
     }
 }
 
-/// 選択直後に出す色選びのポップオーバー
+/// 文字情報のないページに出す断り書き。
+/// cairo の toy font は字形の代替が効かず日本語が豆腐になるので Pango を使う Label にする
+fn attach_no_text_note(overlay: &gtk::Overlay) {
+    let note = gtk::Label::new(None);
+    note.set_markup("<span foreground=\"#555555\">このページは文字情報がないため選択できません</span>");
+    note.set_halign(gtk::Align::Start);
+    note.set_valign(gtk::Align::Start);
+    note.set_margin_start(8);
+    note.set_margin_top(4);
+    // ページのドラッグを邪魔しない
+    note.set_can_target(false);
+    overlay.add_overlay(&note);
+}
+
+/// 選択直後に出すポップオーバー。読み取り専用のときは色を出さず、その理由を出す
 fn show_color_popover(
     anchor: &gtk::DrawingArea,
+    slot: &Rc<RefCell<Option<gtk::Popover>>>,
     state: &Rc<RefCell<ReaderState>>,
     on_created: &Rc<dyn Fn(&str)>,
     page: usize,
@@ -230,56 +259,86 @@ fn show_color_popover(
     x: f64,
     y: f64,
 ) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    // 前のポップオーバーが開いていたら先に片づける (borrow を持ったまま popdown しない)
+    let previous = slot.borrow_mut().take();
+    if let Some(p) = previous {
+        p.popdown();
+        if p.parent().is_some() {
+            p.unparent();
+        }
+    }
+
     let popover = gtk::Popover::new();
     popover.set_parent(anchor);
     popover.set_has_arrow(true);
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    // set_parent した Popover は閉じたら自分で外す。放っておくと溜まる
-    popover.connect_closed(|p| {
-        let p = p.clone();
-        gtk::glib::idle_add_local_once(move || {
+    // set_parent した Popover は閉じたら自分で外す。放っておくと親に残り続ける
+    {
+        let slot = slot.clone();
+        popover.connect_closed(move |p| {
+            let _ = slot.borrow_mut().take();
             if p.parent().is_some() {
                 p.unparent();
             }
         });
-    });
-
-    let colors = state.borrow().colors.clone();
-    // 色ボタンは 1 度だけ効く。2 度押しでハイライトが増えないよう take() で取り出す
-    let shared = Rc::new(RefCell::new(Some((rects, quote))));
-    for color in colors {
-        let button = gtk::Button::new();
-        button.set_tooltip_text(Some(&color));
-        let swatch = gtk::DrawingArea::new();
-        swatch.set_content_width(20);
-        swatch.set_content_height(20);
-        let c = color.clone();
-        swatch.set_draw_func(move |_, cr, w, h| {
-            let (r, g, b) = color_rgb(&c);
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(0.0, 0.0, w as f64, h as f64);
-            let _ = cr.fill();
-        });
-        button.set_child(Some(&swatch));
-
-        let state = state.clone();
-        let on_created = on_created.clone();
-        let popover_for_click = popover.clone();
-        let anchor = anchor.clone();
-        let shared = shared.clone();
-        button.connect_clicked(move |_| {
-            // borrow は if の外で終わらせる。on_created が何を触っても衝突しないように
-            let taken = shared.borrow_mut().take();
-            if let Some((rects, quote)) = taken {
-                let id = state.borrow_mut().add_highlight(page, &color, rects, quote);
-                anchor.queue_draw();
-                on_created(&id);
-            }
-            popover_for_click.popdown();
-        });
-        row.append(&button);
     }
-    popover.set_child(Some(&row));
+
+    let read_only = state.borrow().read_only;
+    if read_only {
+        let msg = gtk::Label::new(Some("読み取り専用のためマーカーを作れません"));
+        msg.set_margin_top(4);
+        msg.set_margin_bottom(4);
+        msg.set_margin_start(6);
+        msg.set_margin_end(6);
+        popover.set_child(Some(&msg));
+    } else {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let colors = state.borrow().colors.clone();
+        // 色ボタンは 1 度だけ効く。2 度押しでハイライトが増えないよう take() で取り出す
+        let shared = Rc::new(RefCell::new(Some((rects, quote))));
+        for color in colors {
+            let button = gtk::Button::new();
+            button.set_tooltip_text(Some(&color));
+            let swatch = gtk::DrawingArea::new();
+            swatch.set_content_width(20);
+            swatch.set_content_height(20);
+            let c = color.clone();
+            swatch.set_draw_func(move |_, cr, w, h| {
+                let (r, g, b) = color_rgb(&c);
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(0.0, 0.0, w as f64, h as f64);
+                let _ = cr.fill();
+            });
+            button.set_child(Some(&swatch));
+
+            let state = state.clone();
+            let on_created = on_created.clone();
+            let shared = shared.clone();
+            // 強参照だと popover → row → button → クロージャ → popover の循環になり、
+            // 選択のたびにポップオーバー一式が residue として残る
+            let popover_weak = popover.downgrade();
+            let anchor_weak = anchor.downgrade();
+            button.connect_clicked(move |_| {
+                // borrow は if の外で終わらせる。on_created が何を触っても衝突しないように
+                let taken = shared.borrow_mut().take();
+                if let Some((rects, quote)) = taken {
+                    let id = state.borrow_mut().add_highlight(page, &color, rects, quote);
+                    if let Some(a) = anchor_weak.upgrade() {
+                        a.queue_draw();
+                    }
+                    // 保存に失敗していたら警告バーに出す (state を借りていない状態で呼ぶ)
+                    ReaderState::show_save_error(&state);
+                    on_created(&id);
+                }
+                if let Some(p) = popover_weak.upgrade() {
+                    p.popdown();
+                }
+            });
+            row.append(&button);
+        }
+        popover.set_child(Some(&row));
+    }
+
+    slot.replace(Some(popover.clone()));
     popover.popup();
 }

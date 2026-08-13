@@ -21,29 +21,60 @@ pub struct ReaderState {
     seq: u32,
     /// サイドカーが壊れていたときは読み取り専用にして上書きしない
     pub read_only: bool,
+    /// 直近の保存失敗。`show_save_error` が拾って画面に出す
+    save_error: Option<String>,
+    /// 画面上部の警告バー。保存に失敗したことを黙って握り潰さないために持つ
+    warn_bar: Option<gtk::Label>,
 }
 
 impl ReaderState {
+    fn build(pdf_path: PathBuf, sidecar: Sidecar, colors: Vec<String>, read_only: bool) -> Self {
+        Self {
+            pdf_path,
+            sidecar,
+            colors,
+            seq: 0,
+            read_only,
+            save_error: None,
+            warn_bar: None,
+        }
+    }
+
     /// 開くのに失敗したときは読み取り専用にし、警告文を一緒に返す
     pub fn open(pdf_path: PathBuf, colors: Vec<String>) -> anyhow::Result<(Self, Option<String>)> {
         match Sidecar::load(&pdf_path) {
-            Ok(Some(sc)) => Ok((
-                Self { pdf_path, sidecar: sc, colors, seq: 0, read_only: false },
-                None,
-            )),
+            Ok(Some(sc)) => Ok((Self::build(pdf_path, sc, colors, false), None)),
             Ok(None) => {
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((Self { pdf_path, sidecar: sc, colors, seq: 0, read_only: false }, None))
+                Ok((Self::build(pdf_path, sc, colors, false), None))
             }
             Err(e) => {
                 let warn = format!("{e:#}");
                 eprintln!("miryam-reader: {warn}");
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((
-                    Self { pdf_path, sidecar: sc, colors, seq: 0, read_only: true },
-                    Some(warn),
-                ))
+                Ok((Self::build(pdf_path, sc, colors, true), Some(warn)))
             }
+        }
+    }
+
+    /// 警告バーを預ける。以後 `show_save_error` がここに書き込む
+    pub fn set_warn_bar(&mut self, bar: gtk::Label) {
+        self.warn_bar = Some(bar);
+    }
+
+    /// 保存に失敗していたら警告バーに出す。
+    /// **state を借りたまま呼ばないこと** (中で `borrow_mut` する)
+    pub fn show_save_error(state: &Rc<RefCell<Self>>) {
+        let (msg, bar) = {
+            let mut st = state.borrow_mut();
+            let Some(msg) = st.save_error.take() else {
+                return;
+            };
+            (msg, st.warn_bar.clone())
+        };
+        if let Some(bar) = bar {
+            bar.set_text(&format!("注釈を保存できません: {msg}"));
+            bar.set_visible(true);
         }
     }
 
@@ -77,12 +108,15 @@ impl ReaderState {
         self.save();
     }
 
-    pub fn save(&self) {
+    /// 失敗しても落とさない。理由は `save_error` に残して `show_save_error` が画面に出す
+    pub fn save(&mut self) {
         if self.read_only {
             return;
         }
         if let Err(e) = self.sidecar.save(&self.pdf_path) {
-            eprintln!("miryam-reader: 注釈を保存できません: {e:#}");
+            let msg = format!("{e:#}");
+            eprintln!("miryam-reader: 注釈を保存できません: {msg}");
+            self.save_error = Some(msg);
         }
     }
 }
@@ -192,15 +226,21 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     }
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // 警告バーは常に用意しておく。保存に失敗したときもここに出す
+    let warn_bar = gtk::Label::new(None);
+    warn_bar.add_css_class("reader-warning");
+    warn_bar.set_wrap(true);
+    warn_bar.set_xalign(0.0);
+    warn_bar.set_visible(false);
     if let Some(msg) = warning {
-        let bar = gtk::Label::new(Some(&format!(
-            "注釈ファイルが読めないため読み取り専用で開いています ({msg})"
-        )));
-        bar.add_css_class("reader-warning");
-        bar.set_wrap(true);
-        bar.set_xalign(0.0);
-        root.append(&bar);
+        warn_bar.set_text(&format!(
+            "注釈ファイルが読めないため読み取り専用で開いています。\
+             新しいマーカーやメモは保存されません ({msg})"
+        ));
+        warn_bar.set_visible(true);
     }
+    root.append(&warn_bar);
+    state.borrow_mut().set_warn_bar(warn_bar);
     root.append(&toolbar);
     root.append(&scrolled);
 
