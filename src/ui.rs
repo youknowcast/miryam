@@ -38,6 +38,9 @@ pub struct MascotUi {
     default_texture: gdk::Texture,
     /// 表情テクスチャの遅延ロードキャッシュ。None = ロード失敗済み (再試行しない)
     face_cache: std::cell::RefCell<std::collections::HashMap<String, Option<gdk::Texture>>>,
+    /// 透かし背景 (backdrop.png) の遅延ロードキャッシュ。成功時のみ保持し、
+    /// 未配置の間は毎回ファイルを確認する (後から置いても再起動不要にするため)
+    backdrop_cache: std::cell::RefCell<Option<gdk::Texture>>,
 }
 
 pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<MascotUi> {
@@ -99,6 +102,7 @@ pub fn build(app: &gtk::Application, skin: Option<&str>) -> anyhow::Result<Masco
         skin: skin.map(str::to_string),
         default_texture: texture,
         face_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        backdrop_cache: std::cell::RefCell::new(None),
     })
 }
 
@@ -144,9 +148,33 @@ impl MascotUi {
             .clone()
     }
 
-    /// 通常立ち絵のテクスチャ (会話窓・ニュース窓の透かし背景用)
-    pub fn character_texture(&self) -> gdk::Texture {
-        self.default_texture.clone()
+    /// 会話窓・ニュース窓の透かし背景用テクスチャ。
+    /// スキンに backdrop.png (バストアップなどの専用絵) があればそれを使い、
+    /// なければ通常立ち絵にフォールバックする
+    pub fn backdrop_texture(&self) -> gdk::Texture {
+        if let Some(t) = self.backdrop_cache.borrow().as_ref() {
+            return t.clone();
+        }
+        let Some(skin) = self.skin.as_deref() else {
+            return self.default_texture.clone();
+        };
+        let path = skin_backdrop_path(&glib::user_config_dir(), skin);
+        if !path.exists() {
+            return self.default_texture.clone();
+        }
+        match texture_from_file_scaled(&path) {
+            Ok(t) => {
+                *self.backdrop_cache.borrow_mut() = Some(t.clone());
+                t
+            }
+            Err(e) => {
+                eprintln!(
+                    "miryam: backdrop.png を読み込めません。立ち絵を使います ({}): {e:#}",
+                    path.display()
+                );
+                self.default_texture.clone()
+            }
+        }
     }
 
     /// ドラッグで動かした位置を既定 (右下、マージン WINDOW_MARGIN) に戻す
@@ -241,7 +269,7 @@ impl MascotUi {
 }
 
 /// 会話窓・ニュース窓の透かし背景の不透明度
-const BACKDROP_OPACITY: f64 = 0.15;
+const BACKDROP_OPACITY: f64 = 0.3;
 
 /// コンテンツの下層にキャラ絵を透かしで敷いた Overlay を返す。
 /// 絵は右下寄せ (デスクトップのマスコット位置とそろえる)・contain フィット・入力透過。
@@ -519,6 +547,15 @@ fn skin_character_path(config_dir: &std::path::Path, name: &str) -> std::path::P
         .join("skins")
         .join(name)
         .join("character.png")
+}
+
+/// スキン名から透かし背景 backdrop.png のパスを構築する
+fn skin_backdrop_path(config_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    config_dir
+        .join("miryam")
+        .join("skins")
+        .join(name)
+        .join("backdrop.png")
 }
 
 /// スキン名と表情名から character-<face>.png のパスを構築する

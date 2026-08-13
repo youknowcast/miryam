@@ -914,7 +914,7 @@ fn open_window_chat(ctx: &ChatCtx, mode: chat::ChatMode) {
     let win = ui::build_chat_window(
         &ctx.app,
         &format!("{} — miryam", mode.name),
-        &ctx.ui.character_texture(),
+        &ctx.ui.backdrop_texture(),
     );
     {
         let ctx_c = ctx.clone();
@@ -1401,7 +1401,7 @@ fn register_actions(
                     &news_window,
                     &format!("{}時のニュース", d.made_at.hour()),
                     &d.body,
-                    &ui.character_texture(),
+                    &ui.backdrop_texture(),
                 ),
                 None => show_text(&ui, &timers, "まだニュースがありません"),
             }
