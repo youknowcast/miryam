@@ -10,6 +10,9 @@ const ENGLISH_PERSONA: &str = "あなたはデスクトップに常駐する小�
 /// 吹き出し表示される組み込みモード名 (これ以外のモードは常に会話窓)
 pub const CASUAL_MODE_NAME: &str = "雑談";
 
+/// 会話窓モードでペルソナ直後に挿入する選択肢マーカー指示
+const CHOICES_INSTRUCTION: &str = "返答の本文の後に、ユーザーが次に選びそうな一手を「>> 候補」の形式で 1 行 1 候補、最大 3 行出力してください。候補が思いつかなければ出力しなくて構いません。";
+
 /// プロンプトに含める履歴の上限 (発言数 = 10 往復)。ノート保存用の全履歴には影響しない
 pub const PROMPT_HISTORY_MAX: usize = 20;
 /// チャット返答のハードキャップ (文字数)
@@ -85,15 +88,21 @@ pub fn chat_note(
     (title, body)
 }
 
-/// ペルソナ + 状況行 + 直近履歴 (最大 PROMPT_HISTORY_MAX 発言) + 新しい発言
-pub fn build_chat_prompt(
-    cfg: &ChatConfig,
+/// ペルソナ + (選択肢指示) + 状況行 + 直近履歴 + 新しい発言
+fn assemble_prompt(
+    persona: &str,
+    with_choices: bool,
     turns: &[Turn],
     user_input: &str,
     now: &Snapshot,
 ) -> String {
-    let persona = cfg.prompt.as_deref().unwrap_or(DEFAULT_CHAT_PERSONA);
-    let mut out = format!("{persona}\n{}\n", crate::llm::situation_line(now));
+    let mut out = format!("{persona}\n");
+    if with_choices {
+        out.push_str(CHOICES_INSTRUCTION);
+        out.push('\n');
+    }
+    out.push_str(&crate::llm::situation_line(now));
+    out.push('\n');
     let recent = &turns[turns.len().saturating_sub(PROMPT_HISTORY_MAX)..];
     if !recent.is_empty() {
         out.push_str("これまでの会話:\n");
@@ -103,6 +112,27 @@ pub fn build_chat_prompt(
     }
     out.push_str(&format!("ユーザー: {user_input}\nmiryam:"));
     out
+}
+
+/// ペルソナ + 状況行 + 直近履歴 (最大 PROMPT_HISTORY_MAX 発言) + 新しい発言 (雑談・吹き出し用)
+pub fn build_chat_prompt(
+    cfg: &ChatConfig,
+    turns: &[Turn],
+    user_input: &str,
+    now: &Snapshot,
+) -> String {
+    let persona = cfg.prompt.as_deref().unwrap_or(DEFAULT_CHAT_PERSONA);
+    assemble_prompt(persona, false, turns, user_input, now)
+}
+
+/// モードのペルソナでプロンプトを組み立てる。会話窓モードは選択肢指示付き
+pub fn build_mode_prompt(
+    mode: &ChatMode,
+    turns: &[Turn],
+    user_input: &str,
+    now: &Snapshot,
+) -> String {
+    assemble_prompt(&mode.prompt, mode.window, turns, user_input, now)
 }
 
 /// チャット返答の後処理: 全体 trim → 300 字キャップ → 空なら None。複数行は保持する
@@ -567,5 +597,41 @@ mod tests {
             toml::from_str::<ChatConfig>("[[mode]]\nname = \"A\"").is_err(),
             "prompt は必須"
         );
+    }
+
+    #[test]
+    fn build_mode_prompt_casual_equals_build_chat_prompt() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        let turns = vec![turn(Role::User, "一言目"), turn(Role::Mascot, "返答一")];
+        let casual = &cfg.modes()[0];
+        assert_eq!(
+            build_mode_prompt(casual, &turns, "二言目", &test_snapshot()),
+            build_chat_prompt(&cfg, &turns, "二言目", &test_snapshot()),
+            "雑談モードのプロンプトは従来とバイト単位で一致する"
+        );
+    }
+
+    #[test]
+    fn build_mode_prompt_window_inserts_choices_instruction() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        let design = cfg.modes().into_iter().find(|m| m.name == "設計議論").unwrap();
+        let p = build_mode_prompt(&design, &[], "マイクロサービス分割の是非", &test_snapshot());
+        assert!(p.starts_with(&design.prompt));
+        assert!(
+            p.contains("「>> 候補」の形式で 1 行 1 候補、最大 3 行"),
+            "選択肢指示が入る"
+        );
+        assert!(p.contains("状況: 時間帯=morning"));
+        assert!(p.ends_with("ユーザー: マイクロサービス分割の是非\nmiryam:"));
+        let instr_pos = p.find(">> 候補").unwrap();
+        let situation_pos = p.find("状況: ").unwrap();
+        assert!(instr_pos < situation_pos, "指示はペルソナ直後・状況行より前");
+    }
+
+    #[test]
+    fn build_chat_prompt_has_no_choices_instruction() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        let p = build_chat_prompt(&cfg, &[], "やあ", &test_snapshot());
+        assert!(!p.contains(">> 候補"), "雑談プロンプトにマーカー指示は入らない");
     }
 }
