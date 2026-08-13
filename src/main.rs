@@ -1,13 +1,4 @@
-mod chat;
-mod control;
-mod inkdrop;
-mod links;
-mod llm;
-mod news;
-mod phrases;
-mod scheduler;
-mod system;
-mod ui;
+use miryam::{chat, control, inkdrop, links, llm, news, phrases, scheduler, ui};
 
 use gtk::{gio, glib, prelude::*};
 use gtk4 as gtk;
@@ -1569,19 +1560,5 @@ fn add_link_from_text(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text:
             eprintln!("miryam: {e:#}");
             show_text(ui, timers, "links.toml への書き込みに失敗しました");
         }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_sync {
-    use std::sync::{Mutex, MutexGuard};
-
-    /// glib デフォルトメインコンテキストを使う統合テストの直列化ロック。
-    /// acquire() は他スレッド保持時に Err を返すため、これ無しでは並列テストが flaky になる
-    pub static MAIN_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
-
-    pub fn lock() -> MutexGuard<'static, ()> {
-        // 1 本の panic が以降のテストを poison で巻き込まないようにする
-        MAIN_CONTEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
