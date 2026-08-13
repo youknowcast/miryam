@@ -3,13 +3,89 @@ pub mod pages;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::reader::geom;
+use crate::reader::store::{self, Highlight, Sidecar};
 
 /// ページ間の隙間 (px)
 const PAGE_GAP: f64 = 12.0;
+
+/// 開いている PDF とその注釈。UI 全体で 1 つを共有する
+pub struct ReaderState {
+    pub pdf_path: PathBuf,
+    pub sidecar: Sidecar,
+    pub colors: Vec<String>,
+    seq: u32,
+    /// サイドカーが壊れていたときは読み取り専用にして上書きしない
+    pub read_only: bool,
+}
+
+impl ReaderState {
+    /// 開くのに失敗したときは読み取り専用にし、警告文を一緒に返す
+    pub fn open(pdf_path: PathBuf, colors: Vec<String>) -> anyhow::Result<(Self, Option<String>)> {
+        match Sidecar::load(&pdf_path) {
+            Ok(Some(sc)) => Ok((
+                Self { pdf_path, sidecar: sc, colors, seq: 0, read_only: false },
+                None,
+            )),
+            Ok(None) => {
+                let sc = Sidecar::new(&pdf_path)?;
+                Ok((Self { pdf_path, sidecar: sc, colors, seq: 0, read_only: false }, None))
+            }
+            Err(e) => {
+                let warn = format!("{e:#}");
+                eprintln!("miryam-reader: {warn}");
+                let sc = Sidecar::new(&pdf_path)?;
+                Ok((
+                    Self { pdf_path, sidecar: sc, colors, seq: 0, read_only: true },
+                    Some(warn),
+                ))
+            }
+        }
+    }
+
+    pub fn add_highlight(
+        &mut self,
+        page: usize,
+        color: &str,
+        rects: Vec<[f64; 4]>,
+        quote: String,
+    ) -> String {
+        let now = chrono::Local::now();
+        let id = store::new_id(now, self.seq);
+        self.seq = self.seq.wrapping_add(1);
+        self.sidecar.highlights.push(Highlight {
+            id: id.clone(),
+            page,
+            color: color.to_string(),
+            rects,
+            quote,
+            memo: String::new(),
+            tags: Vec::new(),
+            llm: Vec::new(),
+            created_at: now,
+        });
+        self.save();
+        id
+    }
+
+    pub fn remove_highlight(&mut self, id: &str) {
+        self.sidecar.highlights.retain(|h| h.id != id);
+        self.save();
+    }
+
+    pub fn save(&self) {
+        if self.read_only {
+            return;
+        }
+        if let Err(e) = self.sidecar.save(&self.pdf_path) {
+            eprintln!("miryam-reader: 注釈を保存できません: {e:#}");
+        }
+    }
+}
 
 pub fn run(path: PathBuf) -> glib::ExitCode {
     let app = gtk::Application::builder()
@@ -36,7 +112,18 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("ページがありません");
     }
 
-    let view = Rc::new(pages::PageView::new(&doc, PAGE_GAP)?);
+    let colors = vec![
+        "yellow".to_string(),
+        "green".to_string(),
+        "blue".to_string(),
+        "pink".to_string(),
+    ];
+    let (state, warning) = ReaderState::open(path.clone(), colors)?;
+    let state = Rc::new(RefCell::new(state));
+
+    // Task 7 の時点では作成後に何もしない。Task 8 で一覧の更新に使う
+    let on_created: Rc<dyn Fn(&str)> = Rc::new(|_id: &str| {});
+    let view = Rc::new(pages::PageView::new(&doc, PAGE_GAP, state.clone(), on_created)?);
 
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_hexpand(true);
@@ -105,6 +192,15 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     }
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    if let Some(msg) = warning {
+        let bar = gtk::Label::new(Some(&format!(
+            "注釈ファイルが読めないため読み取り専用で開いています ({msg})"
+        )));
+        bar.add_css_class("reader-warning");
+        bar.set_wrap(true);
+        bar.set_xalign(0.0);
+        root.append(&bar);
+    }
     root.append(&toolbar);
     root.append(&scrolled);
 
