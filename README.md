@@ -272,6 +272,19 @@ timeout_secs = 30            # 超過で辞書台詞にフォールバック
 exec-once = /path/to/miryam/target/release/miryam
 ```
 
+### 窓を画面中央に出す
+
+会話ウィンドウやニュースウィンドウは、そのままだとマスコット (右下常駐) の後ろに
+開いて見にくいことがある。Hyprland ではウィンドウルールで中央フロート表示にできる
+(Omarchy では `~/.config/hypr/windows.conf` などユーザー設定に追記):
+
+```conf
+windowrulev2 = float, class:^(dev\.youknow\.miryam)$
+windowrulev2 = center, class:^(dev\.youknow\.miryam)$
+```
+
+マスコット本体は layer-shell surface のためウィンドウルールの影響を受けない。
+
 ## 現在の制約
 
 - Esc キーでの終了は未対応 (右クリックメニューを使用)
