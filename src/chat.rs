@@ -492,7 +492,9 @@ mod tests {
             window: true,
         };
         let mut s = ChatSession::with_mode(
-            chrono::Local.with_ymd_and_hms(2026, 8, 9, 14, 30, 0).unwrap(),
+            chrono::Local
+                .with_ymd_and_hms(2026, 8, 9, 14, 30, 0)
+                .unwrap(),
             mode,
         );
         s.push_exchange("q".to_string(), "a".to_string());
@@ -505,9 +507,8 @@ mod tests {
 
     #[test]
     fn split_choices_extracts_up_to_three() {
-        let (body, choices) = split_choices(
-            "本文一行目。\n二行目。\n>> 候補A\n>> 候補B\n>> 候補C\n>> 候補D",
-        );
+        let (body, choices) =
+            split_choices("本文一行目。\n二行目。\n>> 候補A\n>> 候補B\n>> 候補C\n>> 候補D");
         assert_eq!(body, "本文一行目。\n二行目。");
         assert_eq!(choices, vec!["候補A", "候補B", "候補C"], "4 個目は捨てる");
     }
@@ -523,7 +524,11 @@ mod tests {
     fn split_choices_drops_empty_choice_and_keeps_midtext_marker() {
         let (body, choices) = split_choices("前半。\n>> 深掘りする\n後半。\n>>\n>>   ");
         assert_eq!(body, "前半。\n後半。", "本文途中のマーカー行も抽出される");
-        assert_eq!(choices, vec!["深掘りする"], ">> のみ・空白のみの候補は捨てる");
+        assert_eq!(
+            choices,
+            vec!["深掘りする"],
+            ">> のみ・空白のみの候補は捨てる"
+        );
     }
 
     #[test]
@@ -579,10 +584,8 @@ mod tests {
 
     #[test]
     fn modes_mode_entry_overrides_builtin_prompt_keeping_window() {
-        let cfg: ChatConfig = toml::from_str(
-            "[[mode]]\nname = \"英語表現\"\nprompt = \"custom english\"",
-        )
-        .unwrap();
+        let cfg: ChatConfig =
+            toml::from_str("[[mode]]\nname = \"英語表現\"\nprompt = \"custom english\"").unwrap();
         let modes = cfg.modes();
         let english = modes.iter().find(|m| m.name == "英語表現").unwrap();
         assert_eq!(english.prompt, "custom english");
@@ -597,7 +600,10 @@ mod tests {
         )
         .unwrap();
         let casual = &cfg.modes()[0];
-        assert_eq!(casual.prompt, "mode prompt", "[[chat.mode]] が [chat] prompt に勝つ");
+        assert_eq!(
+            casual.prompt, "mode prompt",
+            "[[chat.mode]] が [chat] prompt に勝つ"
+        );
         assert!(!casual.window, "雑談は上書きしても吹き出しのまま");
     }
 
@@ -613,8 +619,7 @@ mod tests {
 
     #[test]
     fn mode_validation_rejects_empty_and_duplicate_names() {
-        let bad: ChatConfig =
-            toml::from_str("[[mode]]\nname = \"  \"\nprompt = \"p\"").unwrap();
+        let bad: ChatConfig = toml::from_str("[[mode]]\nname = \"  \"\nprompt = \"p\"").unwrap();
         assert!(bad.validate().is_err(), "空白のみの name は拒否");
         let bad: ChatConfig = toml::from_str(
             "[[mode]]\nname = \"A\"\nprompt = \"p\"\n[[mode]]\nname = \"A\"\nprompt = \"q\"",
@@ -649,7 +654,11 @@ mod tests {
     #[test]
     fn build_mode_prompt_window_inserts_choices_instruction() {
         let cfg: ChatConfig = toml::from_str("").unwrap();
-        let design = cfg.modes().into_iter().find(|m| m.name == "設計議論").unwrap();
+        let design = cfg
+            .modes()
+            .into_iter()
+            .find(|m| m.name == "設計議論")
+            .unwrap();
         let p = build_mode_prompt(&design, &[], "マイクロサービス分割の是非", &test_snapshot());
         assert!(p.starts_with(&design.prompt));
         assert!(
@@ -660,13 +669,19 @@ mod tests {
         assert!(p.ends_with("ユーザー: マイクロサービス分割の是非\nmiryam:"));
         let instr_pos = p.find(">> 候補").unwrap();
         let situation_pos = p.find("状況: ").unwrap();
-        assert!(instr_pos < situation_pos, "指示はペルソナ直後・状況行より前");
+        assert!(
+            instr_pos < situation_pos,
+            "指示はペルソナ直後・状況行より前"
+        );
     }
 
     #[test]
     fn build_chat_prompt_has_no_choices_instruction() {
         let cfg: ChatConfig = toml::from_str("").unwrap();
         let p = build_chat_prompt(&cfg, &[], "やあ", &test_snapshot());
-        assert!(!p.contains(">> 候補"), "雑談プロンプトにマーカー指示は入らない");
+        assert!(
+            !p.contains(">> 候補"),
+            "雑談プロンプトにマーカー指示は入らない"
+        );
     }
 }
