@@ -319,16 +319,82 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         .build();
     window.present();
 
-    // 開いた直後は幅合わせにする
+    // 開いた直後は幅合わせにする。合わせたあとしおりのページへ飛ぶ
     let apply = apply_zoom.clone();
     let view2 = view.clone();
     let scrolled2 = scrolled.clone();
+    let bookmark = state.borrow().sidecar.bookmark_page;
     glib::idle_add_local_once(move || {
         let (w, _) = view2.page_sizes()[0];
         apply(geom::fit_width_scale(w, scrolled2.width() as f64));
+        let offsets = geom::page_offsets(&view2.scaled_heights(), PAGE_GAP);
+        if let Some(y) = offsets.get(bookmark) {
+            // container の set_margin_top(MARGIN) 分だけページ 0 の上端がずれている
+            scrolled2.vadjustment().set_value(*y + geom::MARGIN);
+        }
     });
 
+    // 閉じるときにしおりと最終閲覧日時を書き、マスコットへ読了を知らせる
+    {
+        let state = state.clone();
+        let view = view.clone();
+        let scrolled = scrolled.clone();
+        window.connect_close_request(move |_| {
+            let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
+            let page = geom::visible_page(scrolled.vadjustment().value() - geom::MARGIN, &offsets);
+            {
+                let mut st = state.borrow_mut();
+                st.sidecar.bookmark_page = page;
+                st.sidecar.opened_at = chrono::Local::now();
+                st.save();
+            }
+            let name = state
+                .borrow()
+                .pdf_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let marks = state.borrow().sidecar.highlights.len();
+            notify_miryam(&format!(
+                "『{name}』を {} ページまで読みました (マーカー {marks} 件)",
+                page + 1
+            ));
+            glib::Propagation::Proceed
+        });
+    }
+
     Ok(())
+}
+
+/// GVariant テキスト形式の文字列リテラル用にエスケープする
+pub fn gvariant_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n")
+}
+
+/// 起動中の miryam に喋らせる。いなければ黙って諦める
+pub fn notify_miryam(message: &str) {
+    let arg = format!("[<'{}'>]", gvariant_escape(message));
+    let argv: [&std::ffi::OsStr; 12] = [
+        "gdbus".as_ref(),
+        "call".as_ref(),
+        "--session".as_ref(),
+        "--dest".as_ref(),
+        "dev.youknow.miryam".as_ref(),
+        "--object-path".as_ref(),
+        "/dev/youknow/miryam".as_ref(),
+        "--method".as_ref(),
+        "org.gtk.Actions.Activate".as_ref(),
+        "say".as_ref(),
+        arg.as_ref(),
+        "{}".as_ref(),
+    ];
+    // 起動していないときの ServiceUnknown は想定内なので stderr は捨てる
+    match gio::Subprocess::newv(&argv, gio::SubprocessFlags::STDERR_SILENCE) {
+        Ok(proc) => {
+            let _ = proc.wait(None::<&gio::Cancellable>);
+        }
+        Err(e) => eprintln!("miryam-reader: gdbus を起動できません: {e}"),
+    }
 }
 
 fn show_fatal(app: &gtk::Application, msg: &str) {
@@ -415,5 +481,23 @@ mod tests {
         let after = std::fs::read_to_string(&path).expect("読めること");
         assert_eq!(after, "書き換えられたら消える印", "知らない id では保存しない");
         assert_eq!(state.sidecar.highlights[0].memo, "", "メモも増えない");
+    }
+
+    #[test]
+    fn escapes_backslash_quote_and_newline() {
+        assert_eq!(gvariant_escape(r"a\b"), r"a\\b");
+        assert_eq!(gvariant_escape("it's"), r"it\'s");
+        assert_eq!(gvariant_escape("a\nb"), r"a\nb");
+    }
+
+    #[test]
+    fn escape_order_does_not_double_escape() {
+        // バックスラッシュを先に処理するので、後から入る \' が壊れない
+        assert_eq!(gvariant_escape(r"\'"), r"\\\'");
+    }
+
+    #[test]
+    fn plain_text_is_untouched() {
+        assert_eq!(gvariant_escape("『本』を読みました"), "『本』を読みました");
     }
 }
