@@ -11,12 +11,19 @@ pub struct Sidebar {
     list: gtk::ListBox,
     state: Rc<RefCell<ReaderState>>,
     on_jump: Rc<dyn Fn(usize)>,
+    /// 注釈を書き換えたのでページを描き直してほしい、と頼む。
+    /// どのページの行からでも削除できるので全ページが対象になる
+    on_changed: Rc<dyn Fn()>,
     /// ハイライト ID → メモ入力欄。`focus_memo` が引く
     memo_entries: RefCell<Vec<(String, gtk::TextView)>>,
 }
 
 impl Sidebar {
-    pub fn new(state: Rc<RefCell<ReaderState>>, on_jump: Rc<dyn Fn(usize)>) -> Rc<Self> {
+    pub fn new(
+        state: Rc<RefCell<ReaderState>>,
+        on_jump: Rc<dyn Fn(usize)>,
+        on_changed: Rc<dyn Fn()>,
+    ) -> Rc<Self> {
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::None);
 
@@ -38,6 +45,7 @@ impl Sidebar {
             list,
             state,
             on_jump,
+            on_changed,
             memo_entries: RefCell::new(Vec::new()),
         });
         me.refresh();
@@ -125,10 +133,13 @@ impl Sidebar {
         let delete = gtk::Button::with_label("削除");
         delete.set_halign(gtk::Align::End);
         if read_only {
+            // 現状は到達しない (読み取り専用になるのは sidecar が読めなかったときだけで、
+            // そのとき highlights は必ず空なので行が作られない)。将来のための一貫した扱い
             delete.set_sensitive(false);
             delete.set_tooltip_text(Some("読み取り専用のため削除できません"));
         } else {
             let state = self.state.clone();
+            let on_changed = self.on_changed.clone();
             // 強参照だと list → row → button → クロージャ → Sidebar → list の循環になる
             let me = Rc::downgrade(self);
             let id = id.to_string();
@@ -136,6 +147,8 @@ impl Sidebar {
                 state.borrow_mut().remove_highlight(&id);
                 // 削除の保存が失敗したことを黙って捨てない (state を借りていない状態で呼ぶ)
                 ReaderState::show_save_error(&state);
+                // 行を消すだけではページ上の塗りが残るので、描き直しも頼む
+                on_changed();
                 if let Some(me) = me.upgrade() {
                     me.refresh();
                 }
@@ -159,6 +172,7 @@ impl Sidebar {
         memo_view.buffer().set_text(memo);
         memo_view.add_css_class("reader-memo");
         if read_only {
+            // 現状は到達しない (上の削除ボタンと同じ理由)
             memo_view.set_editable(false);
             memo_view.set_tooltip_text(Some("読み取り専用のためメモを書けません"));
         } else {

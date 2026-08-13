@@ -210,10 +210,12 @@ impl PageView {
                     let Some((px, py)) = press_at.replace(None) else {
                         return;
                     };
-                    if (x - px).abs() >= 2.0 || (y - py).abs() >= 2.0 {
+                    let z = zoom.get();
+                    // しきい値はドラッグ側と同じページ座標で測る。
+                    // ウィジェット座標のまま比べると等倍のときしか排他にならない
+                    if (x - px).abs() / z >= 2.0 || (y - py).abs() / z >= 2.0 {
                         return; // ドラッグ扱い。選択側に任せる
                     }
-                    let z = zoom.get();
                     // ウィジェット座標 → 正規化座標
                     let (nx, ny) = (x / z / pw, y / z / ph);
                     // 重なっていたら後から引いたもの (上に描かれている) を拾う
@@ -250,6 +252,13 @@ impl PageView {
 
     pub fn zoom(&self) -> f64 {
         self.zoom.get()
+    }
+
+    /// 全ページを描き直す。どのページの注釈が変わったか分からないとき (サイドバーからの削除) 用
+    pub fn queue_draw_all(&self) {
+        for area in &self.areas {
+            area.queue_draw();
+        }
     }
 
     pub fn set_zoom(&self, z: f64) {
@@ -352,6 +361,8 @@ fn show_edit_popover(
 
     let read_only = state.borrow().read_only;
     if read_only {
+        // 現状は到達しない (読み取り専用のとき highlights は必ず空で、当たり判定が空振りする)。
+        // 将来 読み取り専用でも注釈を持てるようになったときのための一貫した扱い
         popover.set_child(Some(&read_only_note("読み取り専用のため編集できません")));
     } else {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -447,6 +458,11 @@ fn show_color_popover(
             button.connect_clicked(move |_| {
                 // borrow は if の外で終わらせる。on_created が何を触っても衝突しないように
                 let taken = shared.borrow_mut().take();
+                // 先に閉じる。開いたままフォーカスを移すとポップオーバーに奪い返される
+                // (shared.take() の一度きりガードがあるので、閉じてから作っても二重にならない)
+                if let Some(p) = popover_weak.upgrade() {
+                    p.popdown();
+                }
                 if let Some((rects, quote)) = taken {
                     let id = state.borrow_mut().add_highlight(page, &color, rects, quote);
                     if let Some(a) = anchor_weak.upgrade() {
@@ -455,9 +471,6 @@ fn show_color_popover(
                     // 保存に失敗していたら警告バーに出す (state を借りていない状態で呼ぶ)
                     ReaderState::show_save_error(&state);
                     on_created(&id);
-                }
-                if let Some(p) = popover_weak.upgrade() {
-                    p.popdown();
                 }
             });
             row.append(&button);

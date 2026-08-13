@@ -283,7 +283,16 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             }
         })
     };
-    let sidebar = sidebar::Sidebar::new(state.clone(), on_jump);
+    // 一覧から注釈を消したときに残った塗りを消す。どのページの行かは分からないので全ページ
+    let redraw: Rc<dyn Fn()> = {
+        let view = Rc::downgrade(&view);
+        Rc::new(move || {
+            if let Some(view) = view.upgrade() {
+                view.queue_draw_all();
+            }
+        })
+    };
+    let sidebar = sidebar::Sidebar::new(state.clone(), on_jump, redraw);
     *sidebar_slot.borrow_mut() = Some(sidebar.clone());
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -336,4 +345,75 @@ fn show_fatal(app: &gtk::Application, msg: &str) {
         app.quit();
     });
     dialog.present();
+}
+
+/// 画面を出さずに確かめられるのは状態の側だけ。ここでは GTK を触らない
+/// (`ReaderState` は `warn_bar` を持つが、`None` のままなら初期化は要らない)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// tempdir に空でない PDF もどきを作る。中身は読まないので実体は何でもよい
+    fn fixture(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("foo.pdf");
+        let mut f = std::fs::File::create(&path).expect("作成できること");
+        f.write_all(b"%PDF-1.7\n").expect("書けること");
+        path
+    }
+
+    /// 開いてハイライトを 1 件足した状態にする (この時点で sidecar は保存済み)
+    fn opened_with_one(pdf: &std::path::Path) -> (ReaderState, String) {
+        let (mut state, warning) =
+            ReaderState::open(pdf.to_path_buf(), vec!["yellow".into()]).expect("開けること");
+        assert!(warning.is_none(), "新規なら警告は出ない");
+        let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
+        (state, id)
+    }
+
+    #[test]
+    fn set_memo_writes_the_new_text_to_the_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+
+        state.set_memo(&id, "あとで読み返す".into());
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("ある");
+        assert_eq!(loaded.highlights[0].memo, "あとで読み返す");
+        assert!(state.save_error.is_none(), "保存に失敗していない");
+    }
+
+    #[test]
+    fn set_memo_with_the_same_text_does_not_save_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+        state.set_memo(&id, "同じ文".into());
+
+        // 保存が走ったら必ず上書きされる印を置いておく
+        let path = store::sidecar_path(&pdf);
+        std::fs::write(&path, "書き換えられたら消える印").expect("書けること");
+
+        state.set_memo(&id, "同じ文".into());
+
+        let after = std::fs::read_to_string(&path).expect("読めること");
+        assert_eq!(after, "書き換えられたら消える印", "同じ値なら保存しない");
+    }
+
+    #[test]
+    fn set_memo_with_an_unknown_id_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        let path = store::sidecar_path(&pdf);
+        std::fs::write(&path, "書き換えられたら消える印").expect("書けること");
+
+        state.set_memo("そんな id は無い", "メモ".into());
+
+        let after = std::fs::read_to_string(&path).expect("読めること");
+        assert_eq!(after, "書き換えられたら消える印", "知らない id では保存しない");
+        assert_eq!(state.sidecar.highlights[0].memo, "", "メモも増えない");
+    }
 }
