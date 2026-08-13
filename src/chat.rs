@@ -108,6 +108,42 @@ pub fn postprocess_chat(stdout: &str) -> Option<String> {
     Some(trimmed.chars().take(REPLY_MAX_CHARS).collect())
 }
 
+/// 会話窓モードの選択肢マーカー (行頭)
+const CHOICE_MARKER: &str = ">>";
+/// 1 返答あたりの選択肢ボタン上限
+pub const CHOICES_MAX: usize = 3;
+/// 会話窓モード返答のハードキャップ (文字数)。吹き出しの REPLY_MAX_CHARS とは別
+pub const WINDOW_REPLY_MAX_CHARS: usize = 2000;
+
+/// 返答を本文と選択肢に分離する。行頭 (trim 後) が ">>" の行を選択肢として抽出し、
+/// 最大 CHOICES_MAX 個まで採用する。マーカーが 1 つもなければ全文が本文 —
+/// 形式が崩れても本文は失わない
+pub fn split_choices(text: &str) -> (String, Vec<String>) {
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut choices: Vec<String> = Vec::new();
+    for line in text.lines() {
+        match line.trim_start().strip_prefix(CHOICE_MARKER) {
+            Some(rest) => {
+                let choice = rest.trim();
+                if !choice.is_empty() && choices.len() < CHOICES_MAX {
+                    choices.push(choice.to_string());
+                }
+            }
+            None => body_lines.push(line),
+        }
+    }
+    (body_lines.join("\n").trim().to_string(), choices)
+}
+
+/// 会話窓モードの返答後処理: 全体 trim → 2000 字キャップ → 空なら None
+pub fn postprocess_window(stdout: &str) -> Option<String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(WINDOW_REPLY_MAX_CHARS).collect())
+}
+
 /// 返答の長さに応じた吹き出し表示秒数: 6 + 文字数/10 (上限 20)
 pub fn bubble_secs(text: &str) -> u64 {
     (6 + text.chars().count() as u64 / 10).min(20)
@@ -327,5 +363,62 @@ mod tests {
         let ended = chrono::Local.with_ymd_and_hms(2026, 8, 9, 9, 5, 0).unwrap();
         let (_, body) = chat_note(&s, &ended);
         assert!(body.starts_with("**ユーザー**: q\n**miryam**: 一行目\n二行目\n"));
+    }
+
+    #[test]
+    fn split_choices_extracts_up_to_three() {
+        let (body, choices) = split_choices(
+            "本文一行目。\n二行目。\n>> 候補A\n>> 候補B\n>> 候補C\n>> 候補D",
+        );
+        assert_eq!(body, "本文一行目。\n二行目。");
+        assert_eq!(choices, vec!["候補A", "候補B", "候補C"], "4 個目は捨てる");
+    }
+
+    #[test]
+    fn split_choices_no_marker_returns_full_body() {
+        let (body, choices) = split_choices("マーカーのない返答です。");
+        assert_eq!(body, "マーカーのない返答です。");
+        assert!(choices.is_empty());
+    }
+
+    #[test]
+    fn split_choices_drops_empty_choice_and_keeps_midtext_marker() {
+        let (body, choices) = split_choices("前半。\n>> 深掘りする\n後半。\n>>\n>>   ");
+        assert_eq!(body, "前半。\n後半。", "本文途中のマーカー行も抽出される");
+        assert_eq!(choices, vec!["深掘りする"], ">> のみ・空白のみの候補は捨てる");
+    }
+
+    #[test]
+    fn split_choices_tolerates_leading_whitespace_and_trims() {
+        let (body, choices) = split_choices("本文。\n  >> 例文を 3 つ見せて  \n");
+        assert_eq!(body, "本文。");
+        assert_eq!(choices, vec!["例文を 3 つ見せて"]);
+    }
+
+    #[test]
+    fn split_choices_all_markers_gives_empty_body() {
+        let (body, choices) = split_choices(">> A\n>> B");
+        assert_eq!(body, "");
+        assert_eq!(choices, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn postprocess_window_keeps_multiline_and_trims() {
+        assert_eq!(
+            postprocess_window("  一行目\n\n二行目  \n").as_deref(),
+            Some("一行目\n\n二行目")
+        );
+    }
+
+    #[test]
+    fn postprocess_window_caps_at_2000_chars() {
+        let long = "あ".repeat(2500);
+        assert_eq!(postprocess_window(&long).unwrap().chars().count(), 2000);
+    }
+
+    #[test]
+    fn postprocess_window_empty_is_none() {
+        assert!(postprocess_window("").is_none());
+        assert!(postprocess_window("  \n \n").is_none());
     }
 }
