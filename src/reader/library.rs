@@ -42,7 +42,10 @@ fn collect(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> std::io::Resu
     for ent in std::fs::read_dir(dir)? {
         let ent = ent?;
         let path = ent.path();
-        if path.is_dir() {
+        // `DirEntry::file_type` はシンボリックリンクを辿らない (lstat 相当)。
+        // ディレクトリへのリンクを辿ると、祖先を指すループで無限再帰しうるため
+        // `path.is_dir()` (リンクを辿る) は使わない
+        if ent.file_type()?.is_dir() {
             if recursive && path.file_name().is_some_and(|n| n != ".miryam") {
                 collect(&path, true, out)?;
             }
@@ -161,6 +164,25 @@ mod tests {
         pdf(dir.path(), ".miryam/decoy.pdf");
         let entries = scan(dir.path(), true).expect("走査");
         assert_eq!(entries.len(), 1, ".miryam の中は見ない");
+    }
+
+    #[test]
+    fn scan_does_not_follow_directory_symlink_loops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        pdf(dir.path(), "a.pdf");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("掘れること");
+        // sub/loop はライブラリフォルダ自身 (祖先) を指すディレクトリシンボリックリンク。
+        // 辿ると sub -> loop -> sub -> loop ... と無限再帰しうる
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("sub/loop"))
+            .expect("シンボリックリンクを張れること");
+
+        let entries = scan(dir.path(), true).expect("無限再帰せずに走査を終えられること");
+        let names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["a.pdf".to_string()],
+            "シンボリックリンクは辿らない"
+        );
     }
 
     #[test]
