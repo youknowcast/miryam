@@ -20,6 +20,8 @@ struct PhrasesFile {
     #[serde(default)]
     chat: Option<crate::chat::ChatConfig>,
     #[serde(default)]
+    news: Option<crate::news::NewsConfig>,
+    #[serde(default)]
     speech: Option<SpeechConfig>,
 }
 
@@ -241,6 +243,7 @@ pub struct PhraseBook {
     skin: Option<SkinConfig>,
     inkdrop: Option<crate::inkdrop::InkdropConfig>,
     chat: Option<crate::chat::ChatConfig>,
+    news: Option<crate::news::NewsConfig>,
     speech: Option<SpeechConfig>,
 }
 
@@ -254,6 +257,7 @@ impl PhraseBook {
             skin,
             inkdrop,
             chat,
+            news,
             speech,
         } = file;
         if let Some(cfg) = &llm {
@@ -267,6 +271,12 @@ impl PhraseBook {
         }
         if let Some(cfg) = &chat {
             cfg.validate().context("[chat] の設定が不正です")?;
+        }
+        if let Some(cfg) = &news {
+            cfg.validate().context("[news] の設定が不正です")?;
+            if llm.is_none() {
+                anyhow::bail!("[news] には [llm] セクションが必要です");
+            }
         }
         if let Some(cfg) = &speech {
             cfg.validate().context("[speech] の設定が不正です")?;
@@ -306,6 +316,7 @@ impl PhraseBook {
             skin,
             inkdrop,
             chat,
+            news,
             speech,
         })
     }
@@ -324,6 +335,10 @@ impl PhraseBook {
 
     pub fn chat(&self) -> Option<&crate::chat::ChatConfig> {
         self.chat.as_ref()
+    }
+
+    pub fn news(&self) -> Option<&crate::news::NewsConfig> {
+        self.news.as_ref()
     }
 
     /// 定期発話間隔の (下限, 上限) 秒。[speech] 未指定は既定の 30〜90 秒
@@ -1097,6 +1112,55 @@ mod tests {
     fn chat_absent_is_none() {
         let book = PhraseBook::from_toml_str(r#"phrases = ["x"]"#).unwrap();
         assert!(book.chat().is_none());
+    }
+
+    #[test]
+    fn parses_news_section() {
+        let book = PhraseBook::from_toml_str(
+            r#"
+            phrases = ["a"]
+            [llm]
+            [news]
+            focus = "テック中心"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(book.news().unwrap().focus.as_deref(), Some("テック中心"));
+        assert_eq!(book.news().unwrap().interval_mins, 60);
+    }
+
+    #[test]
+    fn news_requires_llm() {
+        let Err(err) = PhraseBook::from_toml_str(
+            r#"
+            phrases = ["a"]
+            [news]
+            "#,
+        ) else {
+            panic!("[llm] なしの [news] が通ってしまった");
+        };
+        assert!(format!("{err:#}").contains("[llm]"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_invalid_news_config() {
+        assert!(
+            PhraseBook::from_toml_str(
+                r#"
+                phrases = ["a"]
+                [llm]
+                [news]
+                interval_mins = 1
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn news_absent_is_none() {
+        let book = PhraseBook::from_toml_str(r#"phrases = ["a"]"#).unwrap();
+        assert!(book.news().is_none());
     }
 
     #[test]

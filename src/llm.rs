@@ -186,6 +186,16 @@ pub fn request_raw(
     request
 }
 
+/// ニュース要約用: request_raw をそのまま公開する薄いラッパ (postprocess しない)。
+/// command / timeout は [llm] の設定を使う
+pub fn request_text(
+    config: &LlmConfig,
+    prompt: &str,
+    on_done: impl FnOnce(Option<String>) + 'static,
+) -> LlmRequest {
+    request_raw(&config.command, config.timeout_secs, prompt, on_done)
+}
+
 /// 自動発話用: request_raw + postprocess (最初の非空行 60 字)
 pub fn request_phrase(
     config: &LlmConfig,
