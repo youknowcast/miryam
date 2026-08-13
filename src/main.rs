@@ -674,12 +674,15 @@ fn news_speak_failure(
 /// チャット関連関数が共有する状態の束 (既存のタプル引き回しの肥大化を避ける)
 #[derive(Clone)]
 struct ChatCtx {
+    app: gtk::Application,
     book: Rc<phrases::PhraseBook>,
     ui: Rc<ui::MascotUi>,
     timers: Rc<RefCell<Timers>>,
     muted: Rc<Cell<bool>>,
     quitting: Rc<Cell<bool>>,
     chat_book_cache: Rc<RefCell<Option<String>>>,
+    /// 会話ウィンドウの slot (同時 1 枚)。Some ⇒ chat_session も Some (mode 付き)
+    chat_window: Rc<RefCell<Option<ui::ChatWindow>>>,
     started_at: Instant,
 }
 
@@ -734,6 +737,12 @@ fn close_chat_session(ctx: &ChatCtx) -> bool {
     let was_thinking = in_flight.is_some();
     if let Some(req) = in_flight {
         req.cancel(); // pending のユーザー発言はクロージャごと破棄される
+    }
+    // 会話窓が開いていれば閉じる。close() は close_request 経由で connect_closed →
+    // 本関数を再入させるが、session は取得済みで None のため早期 return して無害
+    let window = ctx.chat_window.borrow_mut().take();
+    if let Some(win) = window {
+        win.close();
     }
     ctx.ui.close_chat();
     if was_thinking {
@@ -811,6 +820,112 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
         }
     });
     ctx.timers.borrow_mut().chat_request = Some(req);
+}
+
+/// 会話窓モードの送信: 送信中は UI 側で入力不可のため多重送信は起きない。
+/// 返答は本文と選択肢に分離し、本文のみ履歴に積む
+fn send_window_message(ctx: &ChatCtx, raw_input: String) {
+    if ctx.quitting.get() {
+        return;
+    }
+    let text = raw_input.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let cfg = ctx
+        .book
+        .chat()
+        .expect("会話窓は [chat] 有効時のみ配線される");
+    if ctx.timers.borrow().chat_request.is_some() {
+        return; // set_busy 中のはずだが念のため (多重送信防止)
+    }
+    let now = phrases::Snapshot::current(ctx.started_at);
+    let prompt = {
+        let timers = ctx.timers.borrow();
+        let Some(session) = timers.chat_session.as_ref() else {
+            return;
+        };
+        let Some(mode) = session.mode.as_ref() else {
+            return; // 会話窓は mode 付きセッションのみ
+        };
+        chat::build_mode_prompt(mode, &session.turns, &text, &now)
+    };
+    reset_chat_idle_timer(ctx);
+    {
+        let win_ref = ctx.chat_window.borrow();
+        let Some(win) = win_ref.as_ref() else { return };
+        win.push_user(&text);
+        win.begin_reply();
+        win.set_choices(&[]);
+        win.set_busy(true);
+    }
+    let ctx_c = ctx.clone();
+    let user_text = text;
+    let req = llm::request_raw(&cfg.command, cfg.timeout_secs, &prompt, move |raw| {
+        ctx_c.timers.borrow_mut().chat_request = None;
+        if ctx_c.quitting.get() {
+            return;
+        }
+        reset_chat_idle_timer(&ctx_c); // 返答受信も「操作」扱い
+        let raw_was_some = raw.is_some();
+        let processed = raw.as_deref().and_then(chat::postprocess_window);
+        let win_ref = ctx_c.chat_window.borrow();
+        let Some(win) = win_ref.as_ref() else {
+            return; // 窓が先に閉じた (close は request をキャンセル済みのはずだが念のため)
+        };
+        match processed {
+            Some(reply) => {
+                let (body, choices) = chat::split_choices(&reply);
+                if body.is_empty() {
+                    // 選択肢だけの返答は失敗扱い (本文なしでは履歴に積めない)
+                    win.finish_reply(None);
+                } else {
+                    if let Some(session) = ctx_c.timers.borrow_mut().chat_session.as_mut() {
+                        session.push_exchange(user_text, body.clone());
+                    }
+                    win.finish_reply(Some(&body));
+                    win.set_choices(&choices);
+                }
+            }
+            None => {
+                if raw_was_some {
+                    warn_chat_once("出力が空でした");
+                }
+                // 失敗ターン: user_text はここで捨てられ、履歴に残らない
+                win.finish_reply(None);
+            }
+        }
+        win.set_busy(false);
+    });
+    ctx.timers.borrow_mut().chat_request = Some(req);
+}
+
+/// 議論系モードの会話窓を開く。既存セッション (吹き出し・別窓) は閉じて保存してから
+fn open_window_chat(ctx: &ChatCtx, mode: chat::ChatMode) {
+    if ctx.quitting.get() {
+        return;
+    }
+    close_chat_session(ctx);
+    // 定期発話の LLM リクエストが飛行中なら破棄する (キャンセル規則: open_or_toggle_chat と同様)
+    let pending = ctx.timers.borrow_mut().llm_request.take();
+    if let Some(req) = pending {
+        req.cancel();
+    }
+    let win = ui::build_chat_window(&ctx.app, &format!("{} — miryam", mode.name));
+    {
+        let ctx_c = ctx.clone();
+        win.connect_submitted(move |text| send_window_message(&ctx_c, text));
+    }
+    {
+        let ctx_c = ctx.clone();
+        win.connect_closed(move || {
+            close_chat_session(&ctx_c);
+        });
+    }
+    ctx.timers.borrow_mut().chat_session =
+        Some(chat::ChatSession::with_mode(chrono::Local::now(), mode));
+    *ctx.chat_window.borrow_mut() = Some(win);
+    reset_chat_idle_timer(ctx);
 }
 
 /// セッションを Inkdrop に保存する。開始できたら true。
@@ -1017,12 +1132,14 @@ fn register_actions(
     started_at: Instant,
 ) {
     let chat_ctx = ChatCtx {
+        app: app.clone(),
         book: book.clone(),
         ui: ui.clone(),
         timers: timers.clone(),
         muted: muted.clone(),
         quitting: quitting.clone(),
         chat_book_cache: chat_book_id_cache.clone(),
+        chat_window: Rc::new(RefCell::new(None)),
         started_at,
     };
 
@@ -1228,6 +1345,27 @@ fn register_actions(
                 close_chat_session(&ctx);
             });
         }
+
+        // モード選択: メニュー「話しかける ▸ <モード名>」。雑談は既存トグルへ委譲
+        let chat_mode = gio::SimpleAction::new("chat-mode", Some(glib::VariantTy::STRING));
+        {
+            let ctx = chat_ctx.clone();
+            chat_mode.connect_activate(move |_, param| {
+                let Some(name) = param.and_then(|v| v.get::<String>()) else {
+                    return;
+                };
+                let Some(cfg) = ctx.book.chat() else { return };
+                let Some(mode) = cfg.modes().into_iter().find(|m| m.name == name) else {
+                    return; // 未知のモード名 (メニューと設定の不整合) は無視
+                };
+                if mode.window {
+                    open_window_chat(&ctx, mode);
+                } else {
+                    open_or_toggle_chat(&ctx);
+                }
+            });
+        }
+        app.add_action(&chat_mode);
     }
 
     // ニュース: メニュー「ニュースを見る」。メニュー項目は [news] 有効時しか出ないが、
