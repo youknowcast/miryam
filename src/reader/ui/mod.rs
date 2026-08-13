@@ -374,7 +374,7 @@ pub fn gvariant_escape(s: &str) -> String {
 /// 起動中の miryam に喋らせる。いなければ黙って諦める
 pub fn notify_miryam(message: &str) {
     let arg = format!("[<'{}'>]", gvariant_escape(message));
-    let argv: [&std::ffi::OsStr; 12] = [
+    let argv: [&std::ffi::OsStr; 14] = [
         "gdbus".as_ref(),
         "call".as_ref(),
         "--session".as_ref(),
@@ -387,6 +387,9 @@ pub fn notify_miryam(message: &str) {
         "say".as_ref(),
         arg.as_ref(),
         "{}".as_ref(),
+        // 窓が閉じないより届かないほうがましなので、呼び出し自体に短い上限を持たせる
+        "--timeout".as_ref(),
+        "2".as_ref(),
     ];
     // 起動していないときの ServiceUnknown は想定内なので stderr は捨てる
     match gio::Subprocess::newv(&argv, gio::SubprocessFlags::STDERR_SILENCE) {
