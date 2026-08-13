@@ -3,6 +3,13 @@ use serde::Deserialize;
 
 const DEFAULT_CHAT_PERSONA: &str = "あなたはデスクトップ右下に常駐する小さなマスコット「miryam」です。\nユーザーと雑談しています。日本語で、数文・120 文字程度までで自然に返答してください。絵文字・引用符・前置き・説明は不要です。";
 
+const DESIGN_PERSONA: &str = "あなたはデスクトップに常駐する小さなマスコット「miryam」です。\nユーザーとソフトウェア設計の議論をしています。壁打ち相手として、論点の整理・前提の確認・トレードオフの提示を簡潔に行ってください。結論を急がず、ユーザーの考えを引き出す問いを 1 つ添えてください。日本語で 400 文字程度まで。絵文字・前置きは不要です。";
+
+const ENGLISH_PERSONA: &str = "あなたはデスクトップに常駐する小さなマスコット「miryam」です。\nユーザーの「これ英語でなんて言う?」に答えています。自然な英語表現を 1〜3 個、それぞれ短い例文とニュアンスの日本語解説付きで示してください。400 文字程度まで。絵文字・前置きは不要です。";
+
+/// 吹き出し表示される組み込みモード名 (これ以外のモードは常に会話窓)
+pub const CASUAL_MODE_NAME: &str = "雑談";
+
 /// プロンプトに含める履歴の上限 (発言数 = 10 往復)。ノート保存用の全履歴には影響しない
 pub const PROMPT_HISTORY_MAX: usize = 20;
 /// チャット返答のハードキャップ (文字数)
@@ -161,6 +168,23 @@ fn default_idle_close() -> u64 {
     600
 }
 
+/// [[chat.mode]] の 1 エントリ (toml 入力)
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatModeConfig {
+    name: String,
+    prompt: String,
+}
+
+/// 実行時のモード定義 (組み込み + [[chat.mode]] マージ済み)
+#[derive(Clone, PartialEq, Debug)]
+pub struct ChatMode {
+    pub name: String,
+    pub prompt: String,
+    /// true = 会話ウィンドウ表示。false = 吹き出し (雑談専用)
+    pub window: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatConfig {
@@ -172,6 +196,8 @@ pub struct ChatConfig {
     pub idle_close_secs: u64,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default, rename = "mode")]
+    modes: Vec<ChatModeConfig>,
 }
 
 impl ChatConfig {
@@ -185,7 +211,54 @@ impl ChatConfig {
         if self.idle_close_secs == 0 {
             anyhow::bail!("[chat] idle_close_secs は 1 以上を指定してください");
         }
+        let mut seen = std::collections::HashSet::new();
+        for m in &self.modes {
+            if m.name.trim().is_empty() {
+                anyhow::bail!("[[chat.mode]] の name が空です");
+            }
+            if !seen.insert(m.name.as_str()) {
+                anyhow::bail!("[[chat.mode]] の name \"{}\" が重複しています", m.name);
+            }
+        }
         Ok(())
+    }
+
+    /// 組み込み 3 モードに [[chat.mode]] をマージする。同名は prompt 上書き
+    /// (表示先は変えない)、新名は会話窓モードとして追加。
+    /// 雑談のペルソナ優先順位: [[chat.mode]] > [chat] prompt > 既定
+    pub fn modes(&self) -> Vec<ChatMode> {
+        let casual_prompt = self
+            .prompt
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CHAT_PERSONA.to_string());
+        let mut out = vec![
+            ChatMode {
+                name: CASUAL_MODE_NAME.to_string(),
+                prompt: casual_prompt,
+                window: false,
+            },
+            ChatMode {
+                name: "設計議論".to_string(),
+                prompt: DESIGN_PERSONA.to_string(),
+                window: true,
+            },
+            ChatMode {
+                name: "英語表現".to_string(),
+                prompt: ENGLISH_PERSONA.to_string(),
+                window: true,
+            },
+        ];
+        for m in &self.modes {
+            match out.iter_mut().find(|b| b.name == m.name) {
+                Some(builtin) => builtin.prompt = m.prompt.clone(),
+                None => out.push(ChatMode {
+                    name: m.name.clone(),
+                    prompt: m.prompt.clone(),
+                    window: true,
+                }),
+            }
+        }
+        out
     }
 }
 
@@ -420,5 +493,79 @@ mod tests {
     fn postprocess_window_empty_is_none() {
         assert!(postprocess_window("").is_none());
         assert!(postprocess_window("  \n \n").is_none());
+    }
+
+    #[test]
+    fn modes_defaults_are_three_builtins() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        let modes = cfg.modes();
+        let names: Vec<&str> = modes.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["雑談", "設計議論", "英語表現"]);
+        assert!(!modes[0].window, "雑談は吹き出し");
+        assert!(modes[1].window && modes[2].window, "議論系は会話窓");
+        assert_eq!(modes[0].prompt, DEFAULT_CHAT_PERSONA);
+    }
+
+    #[test]
+    fn modes_chat_prompt_overrides_casual_persona() {
+        let cfg: ChatConfig = toml::from_str(r#"prompt = "関西弁で話して""#).unwrap();
+        assert_eq!(cfg.modes()[0].prompt, "関西弁で話して");
+    }
+
+    #[test]
+    fn modes_mode_entry_overrides_builtin_prompt_keeping_window() {
+        let cfg: ChatConfig = toml::from_str(
+            "[[mode]]\nname = \"英語表現\"\nprompt = \"custom english\"",
+        )
+        .unwrap();
+        let modes = cfg.modes();
+        let english = modes.iter().find(|m| m.name == "英語表現").unwrap();
+        assert_eq!(english.prompt, "custom english");
+        assert!(english.window, "上書きでも表示先は変わらない");
+        assert_eq!(modes.len(), 3, "上書きはモードを増やさない");
+    }
+
+    #[test]
+    fn modes_casual_mode_entry_beats_chat_prompt() {
+        let cfg: ChatConfig = toml::from_str(
+            "prompt = \"chat prompt\"\n[[mode]]\nname = \"雑談\"\nprompt = \"mode prompt\"",
+        )
+        .unwrap();
+        let casual = &cfg.modes()[0];
+        assert_eq!(casual.prompt, "mode prompt", "[[chat.mode]] が [chat] prompt に勝つ");
+        assert!(!casual.window, "雑談は上書きしても吹き出しのまま");
+    }
+
+    #[test]
+    fn modes_new_name_appends_window_mode() {
+        let cfg: ChatConfig =
+            toml::from_str("[[mode]]\nname = \"レビュー相談\"\nprompt = \"p\"").unwrap();
+        let modes = cfg.modes();
+        assert_eq!(modes.len(), 4);
+        assert_eq!(modes[3].name, "レビュー相談");
+        assert!(modes[3].window, "ユーザー定義モードは常に会話窓");
+    }
+
+    #[test]
+    fn mode_validation_rejects_empty_and_duplicate_names() {
+        let bad: ChatConfig =
+            toml::from_str("[[mode]]\nname = \"  \"\nprompt = \"p\"").unwrap();
+        assert!(bad.validate().is_err(), "空白のみの name は拒否");
+        let bad: ChatConfig = toml::from_str(
+            "[[mode]]\nname = \"A\"\nprompt = \"p\"\n[[mode]]\nname = \"A\"\nprompt = \"q\"",
+        )
+        .unwrap();
+        assert!(bad.validate().is_err(), "toml 内の name 重複は拒否");
+    }
+
+    #[test]
+    fn mode_rejects_unknown_keys_and_missing_prompt() {
+        assert!(
+            toml::from_str::<ChatConfig>("[[mode]]\nname = \"A\"\nprompt = \"p\"\nx = 1").is_err()
+        );
+        assert!(
+            toml::from_str::<ChatConfig>("[[mode]]\nname = \"A\"").is_err(),
+            "prompt は必須"
+        );
     }
 }
