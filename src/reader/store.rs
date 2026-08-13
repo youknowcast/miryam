@@ -107,7 +107,7 @@ impl Sidecar {
         Ok(Some(sc))
     }
 
-    /// 一時ファイル + rename の原子的書き込み
+    /// 一時ファイル + rename の原子的書き込み。途中で失敗したら `.tmp` を残さない
     pub fn save(&self, pdf: &Path) -> anyhow::Result<()> {
         let path = sidecar_path(pdf);
         let dir = path.parent().expect("sidecar_path は必ず親を持つ");
@@ -115,9 +115,18 @@ impl Sidecar {
             .with_context(|| format!("{} が作れません", dir.display()))?;
         let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(self).context("JSON への変換に失敗しました")?;
-        std::fs::write(&tmp, text).with_context(|| format!("{} が書けません", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("{} への差し替えに失敗しました", path.display()))?;
+        if let Err(e) =
+            std::fs::write(&tmp, text).with_context(|| format!("{} が書けません", tmp.display()))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path)
+            .with_context(|| format!("{} への差し替えに失敗しました", path.display()))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(())
     }
 }
@@ -216,6 +225,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = fixture(dir.path(), "foo.pdf");
         Sidecar::new(&pdf).expect("作れること").save(&pdf).expect("保存できること");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".miryam"))
+            .expect("読めること")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "foo.pdf.json")
+            .collect();
+        assert!(leftovers.is_empty(), "一時ファイルが残っている: {leftovers:?}");
+    }
+
+    #[test]
+    fn save_failure_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path(), "foo.pdf");
+        // 差し替え先をディレクトリにしておくと rename が失敗する
+        std::fs::create_dir_all(dir.path().join(".miryam/foo.pdf.json")).expect("掘れること");
+
+        let sc = Sidecar::new(&pdf).expect("作れること");
+        assert!(sc.save(&pdf).is_err(), "rename 失敗はエラーになる");
+
         let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".miryam"))
             .expect("読めること")
             .filter_map(|e| e.ok())
