@@ -36,7 +36,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("ページがありません");
     }
 
-    let view = Rc::new(pages::PageView::new(&doc, PAGE_GAP));
+    let view = Rc::new(pages::PageView::new(&doc, PAGE_GAP)?);
 
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_hexpand(true);
@@ -98,7 +98,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         let vadj = scrolled.vadjustment();
         vadj.connect_value_changed(move |adj| {
             let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
-            let n = geom::visible_page(adj.value(), &offsets);
+            // container の set_margin_top(MARGIN) 分、ページ 0 の上端はスクロール座標 MARGIN にある
+            let n = geom::visible_page(adj.value() - geom::MARGIN, &offsets);
             page_label.set_text(&format!("p.{}/{}", n + 1, total));
         });
     }

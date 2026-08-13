@@ -15,7 +15,7 @@ pub struct PageView {
 }
 
 impl PageView {
-    pub fn new(doc: &poppler::Document, gap: f64) -> Self {
+    pub fn new(doc: &poppler::Document, gap: f64) -> anyhow::Result<Self> {
         let container = gtk::Box::new(gtk::Orientation::Vertical, gap as i32);
         container.set_halign(gtk::Align::Center);
         container.set_margin_top(geom::MARGIN as i32);
@@ -28,7 +28,9 @@ impl PageView {
         // 変数名は後続タスク (選択・ハイライト描画) がそのまま使うので、この名前を守る
         for i in 0..doc.n_pages() {
             let index = i as usize;
-            let page = doc.page(i).expect("ページ数の範囲内");
+            let page = doc
+                .page(i)
+                .ok_or_else(|| anyhow::anyhow!("{} ページ目が読めません", i + 1))?;
             let (page_w, page_h) = page.size();
             sizes.push((page_w, page_h));
 
@@ -45,10 +47,10 @@ impl PageView {
                 // 紙の白
                 cr.set_source_rgb(1.0, 1.0, 1.0);
                 let _ = cr.paint();
-                cr.save().expect("save");
+                let _ = cr.save();
                 cr.scale(z, z);
                 page_for_draw.render(cr);
-                cr.restore().expect("restore");
+                let _ = cr.restore();
             });
 
             let _ = index; // 後続タスクで使う
@@ -56,7 +58,7 @@ impl PageView {
             areas.push(area);
         }
 
-        Self { container, areas, sizes, zoom }
+        Ok(Self { container, areas, sizes, zoom })
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -81,9 +83,10 @@ impl PageView {
         }
     }
 
-    /// 各ページの高さ (現在のズーム適用後)
+    /// 各ページの高さ (現在のズーム適用後)。ウィジェットの `set_content_height` と
+    /// 同じ丸め (切り捨て) を揃えて、`geom::page_offsets` が実際のレイアウトとずれないようにする
     pub fn scaled_heights(&self) -> Vec<f64> {
         let z = self.zoom.get();
-        self.sizes.iter().map(|(_, h)| h * z).collect()
+        self.sizes.iter().map(|(_, h)| (h * z).trunc()).collect()
     }
 }
