@@ -186,6 +186,53 @@ impl PageView {
             }
             area.add_controller(drag);
 
+            // 既存マーカーのクリックで編集ポップオーバーを出す。
+            // ドラッグと取り違えないよう、押した点からほとんど動いていないときだけ反応する
+            let click = gtk::GestureClick::new();
+            let press_at: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+            {
+                let press_at = press_at.clone();
+                click.connect_pressed(move |_, _, x, y| press_at.set(Some((x, y))));
+            }
+            {
+                let press_at = press_at.clone();
+                click.connect_cancel(move |_, _| press_at.set(None));
+            }
+            {
+                let state = state.clone();
+                let zoom = zoom.clone();
+                let slot = popover_slot.clone();
+                let on_created = on_created.clone();
+                // 強参照にすると area → コントローラ → クロージャ → area の循環になる
+                let area_weak = area.downgrade();
+                let (pw, ph) = (page_w, page_h);
+                click.connect_released(move |_, _, x, y| {
+                    let Some((px, py)) = press_at.replace(None) else {
+                        return;
+                    };
+                    if (x - px).abs() >= 2.0 || (y - py).abs() >= 2.0 {
+                        return; // ドラッグ扱い。選択側に任せる
+                    }
+                    let z = zoom.get();
+                    // ウィジェット座標 → 正規化座標
+                    let (nx, ny) = (x / z / pw, y / z / ph);
+                    // 重なっていたら後から引いたもの (上に描かれている) を拾う
+                    let hit = state
+                        .borrow()
+                        .sidecar
+                        .highlights
+                        .iter()
+                        .rev()
+                        .find(|h| h.page == index && geom::hit_test(&h.rects, nx, ny))
+                        .map(|h| h.id.clone());
+                    let (Some(id), Some(area)) = (hit, area_weak.upgrade()) else {
+                        return;
+                    };
+                    show_edit_popover(&area, &slot, &state, &on_created, &id, x, y);
+                });
+            }
+            area.add_controller(click);
+
             container.append(&overlay);
             areas.push(area);
         }
@@ -247,18 +294,13 @@ fn attach_no_text_note(overlay: &gtk::Overlay) {
     overlay.add_overlay(&note);
 }
 
-/// 選択直後に出すポップオーバー。読み取り専用のときは色を出さず、その理由を出す
-fn show_color_popover(
+/// ページ上の 1 点にポップオーバーを開く。開けるのは同時に 1 つだけ
+fn new_popover(
     anchor: &gtk::DrawingArea,
     slot: &Rc<RefCell<Option<gtk::Popover>>>,
-    state: &Rc<RefCell<ReaderState>>,
-    on_created: &Rc<dyn Fn(&str)>,
-    page: usize,
-    rects: Vec<[f64; 4]>,
-    quote: String,
     x: f64,
     y: f64,
-) {
+) -> gtk::Popover {
     // 前のポップオーバーが開いていたら先に片づける (borrow を持ったまま popdown しない)
     let previous = slot.borrow_mut().take();
     if let Some(p) = previous {
@@ -282,15 +324,99 @@ fn show_color_popover(
             }
         });
     }
+    popover
+}
+
+/// 読み取り専用のときに理由だけを出す中身
+fn read_only_note(text: &str) -> gtk::Label {
+    let msg = gtk::Label::new(Some(text));
+    msg.set_margin_top(4);
+    msg.set_margin_bottom(4);
+    msg.set_margin_start(6);
+    msg.set_margin_end(6);
+    msg
+}
+
+/// 既存マーカーをクリックしたときのポップオーバー (メモへ移動 / 削除)。
+/// 読み取り専用のときはどちらも出さず、その理由を出す
+fn show_edit_popover(
+    anchor: &gtk::DrawingArea,
+    slot: &Rc<RefCell<Option<gtk::Popover>>>,
+    state: &Rc<RefCell<ReaderState>>,
+    on_changed: &Rc<dyn Fn(&str)>,
+    id: &str,
+    x: f64,
+    y: f64,
+) {
+    let popover = new_popover(anchor, slot, x, y);
 
     let read_only = state.borrow().read_only;
     if read_only {
-        let msg = gtk::Label::new(Some("読み取り専用のためマーカーを作れません"));
-        msg.set_margin_top(4);
-        msg.set_margin_bottom(4);
-        msg.set_margin_start(6);
-        msg.set_margin_end(6);
-        popover.set_child(Some(&msg));
+        popover.set_child(Some(&read_only_note("読み取り専用のため編集できません")));
+    } else {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let memo = gtk::Button::with_label("メモを書く");
+        let delete = gtk::Button::with_label("削除");
+        row.append(&memo);
+        row.append(&delete);
+        popover.set_child(Some(&row));
+
+        {
+            let on_changed = on_changed.clone();
+            let id = id.to_string();
+            // 強参照だと popover → row → button → クロージャ → popover の循環になる
+            let popover_weak = popover.downgrade();
+            memo.connect_clicked(move |_| {
+                // 先に閉じる。開いたままフォーカスを移すとポップオーバーに奪い返される
+                if let Some(p) = popover_weak.upgrade() {
+                    p.popdown();
+                }
+                on_changed(&id);
+            });
+        }
+        {
+            let state = state.clone();
+            let on_changed = on_changed.clone();
+            let id = id.to_string();
+            let anchor_weak = anchor.downgrade();
+            let popover_weak = popover.downgrade();
+            delete.connect_clicked(move |_| {
+                state.borrow_mut().remove_highlight(&id);
+                // 削除の保存が失敗したことを黙って捨てない (state を借りていない状態で呼ぶ)
+                ReaderState::show_save_error(&state);
+                if let Some(a) = anchor_weak.upgrade() {
+                    a.queue_draw();
+                }
+                // 空文字は「一覧を作り直すだけ」
+                on_changed("");
+                if let Some(p) = popover_weak.upgrade() {
+                    p.popdown();
+                }
+            });
+        }
+    }
+
+    slot.replace(Some(popover.clone()));
+    popover.popup();
+}
+
+/// 選択直後に出すポップオーバー。読み取り専用のときは色を出さず、その理由を出す
+fn show_color_popover(
+    anchor: &gtk::DrawingArea,
+    slot: &Rc<RefCell<Option<gtk::Popover>>>,
+    state: &Rc<RefCell<ReaderState>>,
+    on_created: &Rc<dyn Fn(&str)>,
+    page: usize,
+    rects: Vec<[f64; 4]>,
+    quote: String,
+    x: f64,
+    y: f64,
+) {
+    let popover = new_popover(anchor, slot, x, y);
+
+    let read_only = state.borrow().read_only;
+    if read_only {
+        popover.set_child(Some(&read_only_note("読み取り専用のためマーカーを作れません")));
     } else {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let colors = state.borrow().colors.clone();

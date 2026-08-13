@@ -1,4 +1,5 @@
 pub mod pages;
+pub mod sidebar;
 
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -108,6 +109,18 @@ impl ReaderState {
         self.save();
     }
 
+    /// メモを書き換える。中身が変わっていなければ書き込まない
+    pub fn set_memo(&mut self, id: &str, memo: String) {
+        let Some(h) = self.sidecar.highlights.iter_mut().find(|h| h.id == id) else {
+            return;
+        };
+        if h.memo == memo {
+            return;
+        }
+        h.memo = memo;
+        self.save();
+    }
+
     /// 失敗しても落とさない。理由は `save_error` に残して `show_save_error` が画面に出す
     pub fn save(&mut self) {
         if self.read_only {
@@ -155,8 +168,21 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let (state, warning) = ReaderState::open(path.clone(), colors)?;
     let state = Rc::new(RefCell::new(state));
 
-    // Task 7 の時点では作成後に何もしない。Task 8 で一覧の更新に使う
-    let on_created: Rc<dyn Fn(&str)> = Rc::new(|_id: &str| {});
+    // サイドバーはページより後に作るので、あとから差し込む
+    let sidebar_slot: Rc<RefCell<Option<Rc<sidebar::Sidebar>>>> = Rc::new(RefCell::new(None));
+    let on_created: Rc<dyn Fn(&str)> = {
+        let slot = sidebar_slot.clone();
+        Rc::new(move |id: &str| {
+            // borrow を持ったまま refresh しない
+            let sb = slot.borrow().clone();
+            let Some(sb) = sb else { return };
+            sb.refresh();
+            // 空文字は「一覧を作り直すだけ」(削除された直後など)
+            if !id.is_empty() {
+                sb.focus_memo(id);
+            }
+        })
+    };
     let view = Rc::new(pages::PageView::new(&doc, PAGE_GAP, state.clone(), on_created)?);
 
     let scrolled = gtk::ScrolledWindow::new();
@@ -241,8 +267,35 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     }
     root.append(&warn_bar);
     state.borrow_mut().set_warn_bar(warn_bar);
-    root.append(&toolbar);
-    root.append(&scrolled);
+
+    // 一覧の行から本文へ飛ぶ。サイドバーがページ側を強く掴むと循環参照になるので弱参照で持つ
+    let on_jump: Rc<dyn Fn(usize)> = {
+        let view = Rc::downgrade(&view);
+        let scrolled = scrolled.downgrade();
+        Rc::new(move |page: usize| {
+            let (Some(view), Some(scrolled)) = (view.upgrade(), scrolled.upgrade()) else {
+                return;
+            };
+            let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
+            if let Some(y) = offsets.get(page) {
+                // container の set_margin_top(MARGIN) 分だけページ 0 の上端がずれている
+                scrolled.vadjustment().set_value(*y + geom::MARGIN);
+            }
+        })
+    };
+    let sidebar = sidebar::Sidebar::new(state.clone(), on_jump);
+    *sidebar_slot.borrow_mut() = Some(sidebar.clone());
+
+    let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    right.append(&toolbar);
+    right.append(&scrolled);
+
+    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    paned.set_start_child(Some(sidebar.widget()));
+    paned.set_end_child(Some(&right));
+    paned.set_position(280);
+    paned.set_resize_start_child(false);
+    root.append(&paned);
 
     let title = path
         .file_name()
