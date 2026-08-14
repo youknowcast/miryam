@@ -157,6 +157,18 @@ impl ReaderState {
         self.save();
     }
 
+    /// タグを書き換える。中身が変わっていなければ書き込まない (`set_memo` と同じ流儀)
+    pub fn set_tags(&mut self, id: &str, tags: Vec<String>) {
+        let Some(h) = self.sidecar.highlights.iter_mut().find(|h| h.id == id) else {
+            return;
+        };
+        if h.tags == tags {
+            return;
+        }
+        h.tags = tags;
+        self.save();
+    }
+
     /// 失敗しても落とさない。結果は `save_error` に残して `show_save_error` が画面に出す
     /// (成功したら消す。古い失敗の表示を残さないため)
     pub fn save(&mut self) {
@@ -866,6 +878,52 @@ mod tests {
         let after = std::fs::read_to_string(&path).expect("読めること");
         assert_eq!(after, "書き換えられたら消える印", "知らない id では保存しない");
         assert_eq!(state.sidecar.highlights[0].memo, "", "メモも増えない");
+    }
+
+    #[test]
+    fn set_tags_writes_the_new_tags_to_the_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+
+        state.set_tags(&id, vec!["重要".into(), "あとで読む".into()]);
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("ある");
+        assert_eq!(loaded.highlights[0].tags, vec!["重要".to_string(), "あとで読む".to_string()]);
+        assert!(state.save_error.is_none(), "保存に失敗していない");
+    }
+
+    #[test]
+    fn set_tags_with_the_same_tags_does_not_save_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+        state.set_tags(&id, vec!["重要".into()]);
+
+        // 保存が走ったら必ず上書きされる印を置いておく
+        let path = store::sidecar_path(&pdf);
+        std::fs::write(&path, "書き換えられたら消える印").expect("書けること");
+
+        state.set_tags(&id, vec!["重要".into()]);
+
+        let after = std::fs::read_to_string(&path).expect("読めること");
+        assert_eq!(after, "書き換えられたら消える印", "同じ値なら保存しない");
+    }
+
+    #[test]
+    fn set_tags_with_an_unknown_id_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        let path = store::sidecar_path(&pdf);
+        std::fs::write(&path, "書き換えられたら消える印").expect("書けること");
+
+        state.set_tags("そんな id は無い", vec!["重要".into()]);
+
+        let after = std::fs::read_to_string(&path).expect("読めること");
+        assert_eq!(after, "書き換えられたら消える印", "知らない id では保存しない");
+        assert!(state.sidecar.highlights[0].tags.is_empty(), "タグも増えない");
     }
 
     /// 壊れたサイドカーを置いて、その中身を返す (バイト比較の基準にする)
