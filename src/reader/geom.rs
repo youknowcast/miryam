@@ -57,6 +57,25 @@ pub fn bookmark_page(scroll_y: f64, offsets: &[f64], at_end: bool) -> usize {
     visible_page(scroll_y, offsets)
 }
 
+/// ズームを `old_z` から `new_z` に変えたとき、ページの高さのピクセル値が変わるか
+/// (= GTK にリサイズが積まれ、vadjustment の `changed` が飛んでくるか)。
+///
+/// 幅は見ない: ページは縦の `gtk::Box` に並んでいて各ページの高さで
+/// `content_height` が決まるため、vadjustment (縦スクロール) の `changed` を
+/// 動かすのは高さの変化だけ。幅だけ整数値が変わっても hadjustment が動くだけで
+/// vadjustment の `upper`/`page_size` はそのまま `gtk_adjustment_configure` される
+/// ので `changed` は飛ばない。ここで幅も見てしまうと「`changed` を待つべきでない
+/// のに待ってしまう」のとは逆の、「`changed` を待つべきなのに待たずに飛んでしまい、
+/// 二度とハンドラが起きない」false positive になる (幅だけ変わるケースで判明)。
+///
+/// 丸めは `pages.rs` の `set_content_height` と同じ `as i32` (`scaled_heights` の
+/// `trunc()` と同じ理由) に揃える
+pub fn resize_queued(sizes: &[(f64, f64)], old_z: f64, new_z: f64) -> bool {
+    sizes
+        .iter()
+        .any(|&(_, h)| (h * old_z) as i32 != (h * new_z) as i32)
+}
+
 /// 正規化座標の点がどれかの矩形に入っているか
 pub fn hit_test(rects: &[[f64; 4]], nx: f64, ny: f64) -> bool {
     rects
@@ -151,6 +170,43 @@ mod tests {
     fn bookmark_page_with_no_pages_is_zero() {
         // offsets が空でも offsets.len() - 1 で panic せず、先頭ページ扱いで返す
         assert_eq!(bookmark_page(10.0, &[], true), 0);
+    }
+
+    #[test]
+    fn resize_queued_same_zoom_is_false() {
+        assert!(!resize_queued(&[(500.0, 800.0), (500.0, 1000.0)], 1.2345, 1.2345));
+    }
+
+    #[test]
+    fn resize_queued_tiny_delta_not_crossing_boundary_is_false() {
+        // 800 * 1.0001 = 800.08 → 整数に丸めても 800 のまま
+        assert!(!resize_queued(&[(500.0, 800.0)], 1.0, 1.0001));
+    }
+
+    #[test]
+    fn resize_queued_one_page_crossing_boundary_is_true() {
+        // 800 * 1.002 = 801.6 → 801 に変わる
+        assert!(resize_queued(&[(500.0, 800.0)], 1.0, 1.002));
+    }
+
+    #[test]
+    fn resize_queued_width_only_change_is_false() {
+        // 幅は 1000 → 1005 (整数値が変わる) だが、高さは 100 → 100.5 (整数値は 100 のまま)。
+        // ページは縦の Box に高さで並ぶので、vadjustment の changed を動かすのは高さの変化
+        // だけ。幅を見てしまうとここが誤って true になり、`changed` が来ないのに待ち続けて
+        // しまう (残件 1 と同じ不具合を、幅だけが変わるケースで再発させてしまう)
+        assert!(!resize_queued(&[(1000.0, 100.0)], 1.0, 1.005));
+    }
+
+    #[test]
+    fn resize_queued_only_one_of_several_pages_crossing_is_enough() {
+        // 1 ページ目 (高さ 500) は境界をまたがず、2 ページ目 (高さ 1000) だけまたぐ
+        assert!(resize_queued(&[(999.0, 500.0), (999.0, 1000.0)], 1.0, 1.0015));
+    }
+
+    #[test]
+    fn resize_queued_empty_sizes_is_false() {
+        assert!(!resize_queued(&[], 1.0, 2.0));
     }
 
     #[test]

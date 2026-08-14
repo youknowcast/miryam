@@ -378,15 +378,28 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     // changed」としてゲートを通ってしまい、読んでいた場所から古いしおりへ視点を飛ばして
     // しまう (実際に発生を確認)。
     //
-    // 判別には「apply() 前後でページごとの実ピクセル寸法 (w*z as i32 の丸め) が 1 つでも
-    // 変わるか」を直接見る。`vadj.upper() > vadj.page_size()` (スクロール可能な実コンテンツが
-    // 既にあるか) では判別できない (実機で確認済み): 複数ページの文書では、今回のリサイズが
-    // 未処理でも「他のページの分だけで」既に upper が page_size を超えていることが普通にあり、
-    // その状態で `changed` を待たずに飛ぶと、GTK がまだ反映していない古い upper に対して
-    // クランプされた中途半端な位置がそのまま確定してしまう (fit-width で大きくズームされる
-    // ケースで実際に発生を確認: scale=1.44 なのに `upper > page_size` が真になり immediate 側に
-    // 入ってしまい、クランプ後の値のまま `changed` を二度と待たなくなっていた)。ページ寸法の
-    // 比較なら、これから起こる (起こらない) リサイズそのものを直接見るので取り違えない
+    // 判別には「apply() 前後でページの高さのピクセル値 (h*z as i32 の丸め) が 1 つでも
+    // 変わるか」(`geom::resize_queued`) を直接見る。`vadj.upper() > vadj.page_size()`
+    // (スクロール可能な実コンテンツが既にあるか) では判別できない (実機で確認済み):
+    // 複数ページの文書では、今回のリサイズが未処理でも「他のページの分だけで」既に upper が
+    // page_size を超えていることが普通にあり、その状態で `changed` を待たずに飛ぶと、GTK が
+    // まだ反映していない古い upper に対してクランプされた中途半端な位置がそのまま確定して
+    // しまう (fit-width で大きくズームされるケースで実際に発生を確認: scale=1.44 なのに
+    // `upper > page_size` が真になり immediate 側に入ってしまい、クランプ後の値のまま
+    // `changed` を二度と待たなくなっていた)。ページ寸法の比較なら、これから起こる
+    // (起こらない) リサイズそのものを直接見るので取り違えない。
+    //
+    // 幅は見ない: ページは縦の `gtk::Box` に高さで並んでいるので、vadjustment (縦スクロール)
+    // の `changed` を動かすのは高さの変化だけ。幅だけ整数値が変わっても hadjustment が動く
+    // だけで vadjustment はそのまま `gtk_adjustment_configure` され `changed` は飛ばない。
+    // ここで幅も見てしまうと、幅だけ変わって高さは変わらないケースで「リサイズが積まれる」
+    // と誤判定してハンドラを繋いだまま二度と `changed` が来ず、直そうとしている残件そのものが
+    // 再発する (詳しくは `geom::resize_queued` のコメント・テスト参照)。
+    //
+    // `scrolled2.width()` が 0 (まだ一度もレイアウトされておらず fit-width が 1.0 に落ちて
+    // いるだけ) のときは「変わらない」を安全側と判断できないので、必ず `changed` を待つ。
+    // フレームクロックがこの idle より先に 1 回走るので通常は 0 にならないはずだが、
+    // それを確実にコードで保証できていない以上、ここで前提を明示的にチェックする
     //
     // listen を始めるタイミングも重要: これを fit-width 適用より前に仕込むと、ウィンドウ表示
     // 直後・まだ等倍 (zoom=1.0) のままの初期レイアウトで最初の `changed` が飛んできてしまい
@@ -408,7 +421,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let bookmark = state.borrow().sidecar.bookmark_page;
     glib::idle_add_local_once(move || {
         let (w, _) = view2.page_sizes()[0];
-        let scale = geom::fit_width_scale(w, scrolled2.width() as f64);
+        let viewport_w = scrolled2.width();
+        let scale = geom::fit_width_scale(w, viewport_w as f64);
         let old_zoom = view2.zoom();
         apply(scale);
 
@@ -416,13 +430,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             return;
         }
 
-        // set_zoom が実際に何かのページの content_width/height を変えたか (= リサイズを
-        // 1 つでもキューしたか) を、GTK 側の丸め (`(px * z) as i32`) と揃えて直接判定する
-        let resize_queued = view2.page_sizes().iter().any(|&(pw, ph)| {
-            (pw * old_zoom) as i32 != (pw * scale) as i32
-                || (ph * old_zoom) as i32 != (ph * scale) as i32
-        });
-        if !resize_queued {
+        let will_resize = geom::resize_queued(&view2.page_sizes(), old_zoom, scale);
+        if viewport_w > 0 && !will_resize {
             schedule_bookmark_scroll(&view2, &scrolled2, bookmark);
             return;
         }
