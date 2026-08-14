@@ -199,6 +199,44 @@ mod tests {
         assert_eq!(got.chars().count(), ANSWER_MAX_CHARS, "文字数で切ること (バイトではない)");
     }
 
+    /// 境界: ちょうど上限 (2000 文字) はそのまま、1 文字超えると 2000 文字に切れる。
+    /// off-by-one を踏みやすい型なので、MAX+100 の飛び越えだけで済ませない
+    #[test]
+    fn postprocess_keeps_exactly_answer_max_chars() {
+        let at_cap = "あ".repeat(ANSWER_MAX_CHARS);
+        assert_eq!(postprocess(&at_cap), Some(at_cap.clone()), "ちょうど上限は切らない");
+
+        let over = "あ".repeat(ANSWER_MAX_CHARS + 1);
+        let got = postprocess(&over).expect("空ではない");
+        assert_eq!(got, at_cap, "1 文字超えたら 1 文字だけ切れる");
+    }
+
+    /// 境界: 履歴がちょうど HISTORY_MAX 件なら最古も残り、1 件増えると最古が落ちる
+    /// (MAX+5 の飛び越えでは見えない切り替わりを押さえる)。
+    /// 判定は `Q: Q{n}\nA: A{n}` の完全形で行う — 裸の "Q1" や "Q: Q1" は
+    /// "Q10" / "Q: Q10" の部分文字列として誤マッチする
+    #[test]
+    fn the_ask_prompt_keeps_exactly_history_max_exchanges() {
+        let at_cap: Vec<LlmQa> =
+            (0..HISTORY_MAX).map(|i| qa("ask", &format!("Q{i}"), &format!("A{i}"))).collect();
+        let p = (ask_action().prompt)("引用文", &at_cap, "いま");
+        assert!(p.contains("Q: Q0\nA: A0"), "ちょうど上限なら最古も残る: {p}");
+        assert!(
+            p.contains(&format!("Q: Q{}\nA: A{}", HISTORY_MAX - 1, HISTORY_MAX - 1)),
+            "最新も残る: {p}"
+        );
+
+        let over: Vec<LlmQa> =
+            (0..=HISTORY_MAX).map(|i| qa("ask", &format!("Q{i}"), &format!("A{i}"))).collect();
+        let p = (ask_action().prompt)("引用文", &over, "いま");
+        assert!(!p.contains("Q: Q0\n"), "1 件超えたら最古が落ちる: {p}");
+        assert!(p.contains("Q: Q1\nA: A1"), "最古の次は残る (切り出し位置のズレを捕まえる): {p}");
+        assert!(
+            p.contains(&format!("Q: Q{}\nA: A{}", HISTORY_MAX, HISTORY_MAX)),
+            "最新は残る: {p}"
+        );
+    }
+
     #[test]
     fn answer_cap_is_2000() {
         assert_eq!(ANSWER_MAX_CHARS, 2000);
