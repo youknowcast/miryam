@@ -89,6 +89,38 @@ pub fn selected_index(all_tags: &[String], filter: Option<&str>) -> u32 {
     all_tags.iter().position(|t| t == tag).map_or(0, |i| (i + 1) as u32)
 }
 
+/// 選択範囲についての LLM 操作をポップオーバーに出してよいか。
+///
+/// **両方満たすときだけ出す:**
+///
+/// - `has_llm`: `[llm]` が読めている (無ければ投げる先が無い)
+/// - `!read_only`: 読み取り専用ではない
+///
+/// 読み取り専用で聞けてしまうと、答えは返るのにサイドカーへ書かれない
+/// (`ReaderState::save` が早期 return する) ので、「できたように見えて保存されない」形になる。
+/// フェーズ 1・2 で削除・メモ・タグについて繰り返し塞いできたのと同じ穴なので、
+/// 判断はここに 1 つだけ置き、ポップオーバー側は結果を使うだけにする
+pub fn ask_actions_enabled(has_llm: bool, read_only: bool) -> bool {
+    has_llm && !read_only
+}
+
+/// 保存に失敗したときに警告バーへ出す文言
+pub fn save_error_text(msg: &str) -> String {
+    format!("注釈を保存できません: {msg}")
+}
+
+/// 一時的な知らせ (LLM が答えを返せなかった、など) を出すときの警告バーの文言。
+///
+/// **保存に失敗したままなら、その文言を消さずに上へ残す。** 一時的な知らせで
+/// 上書きしてしまうと、`show_save_error` は次に呼ばれるまで書き戻さないので、
+/// 「注釈を保存できません」が画面から消えたまま誰にも伝わらなくなる
+pub fn warn_bar_text(save_error: Option<&str>, notice: &str) -> String {
+    match save_error {
+        Some(err) => format!("{}\n{notice}", save_error_text(err)),
+        None => notice.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +287,53 @@ mod tests {
     #[test]
     fn selected_index_picks_the_first_of_duplicates() {
         assert_eq!(selected_index(&tags(&["a", "b", "a"]), Some("a")), 1);
+    }
+
+    /// LLM 操作を出す条件の真理値表。4 通りすべてを押さえる
+    /// (`&&` を `||` に変える・`!` を落とす・真を返しっぱなしにする、
+    /// どの変異でもどれかの行が落ちる)
+    #[test]
+    fn ask_actions_need_both_an_llm_and_a_writable_sidecar() {
+        assert!(ask_actions_enabled(true, false), "[llm] があり書けるなら出す");
+        assert!(!ask_actions_enabled(false, false), "[llm] が無ければ出さない");
+        assert!(!ask_actions_enabled(true, true), "読み取り専用なら出さない");
+        assert!(!ask_actions_enabled(false, true), "どちらも欠けていれば当然出さない");
+    }
+
+    /// 読み取り専用の側だけを見る変異 (`has_llm` を無視して `!read_only` を返す)
+    /// を捕まえる。**設定が無いのに操作だけ出る**のは「押しても何も起きない」形になる
+    #[test]
+    fn a_writable_sidecar_alone_is_not_enough() {
+        assert!(!ask_actions_enabled(false, false));
+    }
+
+    /// `[llm]` の側だけを見る変異 (`read_only` を無視して `has_llm` を返す) を捕まえる。
+    /// **これが今回のタスクで一番塞ぎたかった穴** (答えは返るのに保存されない)
+    #[test]
+    fn an_llm_alone_is_not_enough_when_the_sidecar_is_read_only() {
+        assert!(!ask_actions_enabled(true, true));
+    }
+
+    #[test]
+    fn a_notice_on_its_own_is_shown_as_is() {
+        assert_eq!(warn_bar_text(None, "答えが空でした"), "答えが空でした");
+    }
+
+    /// **一時的な知らせが、保存できていない事実を画面から消してはいけない。**
+    /// 上書きする変異 (`notice` をそのまま返す) はここで落ちる
+    #[test]
+    fn a_notice_never_hides_a_pending_save_failure() {
+        let text = warn_bar_text(Some("書けません"), "答えが空でした");
+        assert!(text.contains("注釈を保存できません: 書けません"), "保存失敗が残ること: {text}");
+        assert!(text.contains("答えが空でした"), "知らせも出ること: {text}");
+    }
+
+    /// 保存失敗の文言は `show_save_error` が出すものと同じ組み立てを使う
+    /// (併記のときだけ言い回しが変わると、同じ事実が二通りの見た目で出てしまう)
+    #[test]
+    fn the_combined_text_reuses_the_save_error_wording() {
+        let combined = warn_bar_text(Some("書けません"), "知らせ");
+        assert!(combined.starts_with(&save_error_text("書けません")), "先頭は保存失敗の文言");
+        assert!(combined.contains('\n'), "知らせは行を分けて併記する");
     }
 }

@@ -3,6 +3,7 @@ use gtk4 as gtk;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::reader::ask;
 use crate::reader::ui::ReaderState;
 use crate::reader::ui_logic::selected_index;
 
@@ -83,6 +84,17 @@ pub struct Annotations {
     /// `refresh()` が `filter_dropdown` のモデルや選択を書き換えている間、
     /// その `notify::selected` を「ユーザーが選び直した」と誤認しないためのガード
     updating_filter: std::cell::Cell<bool>,
+}
+
+/// `refresh` が一覧へ並べる 1 行分のデータ。借用を落としてから `build_row` に渡す
+struct RowData {
+    id: String,
+    page: usize,
+    quote: String,
+    memo: String,
+    tags: Vec<String>,
+    llm: Vec<crate::reader::store::LlmQa>,
+    pending: usize,
 }
 
 impl Annotations {
@@ -185,17 +197,25 @@ impl Annotations {
 
         self.sync_filter_dropdown(&all_tags, filter_value.as_deref());
 
-        let mut items: Vec<(String, usize, String, String, Vec<String>)> = self
+        let mut items: Vec<RowData> = self
             .state
             .borrow()
             .sidecar
             .highlights
             .iter()
             .filter(|h| matches_filter(&h.tags, filter_value.as_deref()))
-            .map(|h| (h.id.clone(), h.page, h.quote.clone(), h.memo.clone(), h.tags.clone()))
+            .map(|h| RowData {
+                id: h.id.clone(),
+                page: h.page,
+                quote: h.quote.clone(),
+                memo: h.memo.clone(),
+                tags: h.tags.clone(),
+                llm: h.llm.clone(),
+                pending: self.state.borrow().pending_for(&h.id),
+            })
             .collect();
         // ページ順。同じページ内は作った順のまま (sort_by_key は安定)
-        items.sort_by_key(|(_, page, _, _, _)| *page);
+        items.sort_by_key(|row| row.page);
 
         if items.is_empty() {
             let text = if filter_value.is_some() {
@@ -210,8 +230,8 @@ impl Annotations {
             return;
         }
 
-        for (id, page, quote, memo, tags) in items {
-            self.list.append(&self.build_row(&id, page, &quote, &memo, &tags, read_only));
+        for row in items {
+            self.list.append(&self.build_row(&row, read_only));
         }
     }
 
@@ -249,27 +269,20 @@ impl Annotations {
         }
     }
 
-    fn build_row(
-        self: &Rc<Self>,
-        id: &str,
-        page: usize,
-        quote: &str,
-        memo: &str,
-        tags: &[String],
-        read_only: bool,
-    ) -> gtk::Box {
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        row.set_margin_top(8);
-        row.set_margin_bottom(8);
-        row.set_margin_start(8);
-        row.set_margin_end(8);
+    fn build_row(self: &Rc<Self>, row: &RowData, read_only: bool) -> gtk::Box {
+        let row_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        row_box.set_margin_top(8);
+        row_box.set_margin_bottom(8);
+        row_box.set_margin_start(8);
+        row_box.set_margin_end(8);
 
         let head = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        let jump = gtk::Button::with_label(&format!("p.{}", page + 1));
+        let jump = gtk::Button::with_label(&format!("p.{}", row.page + 1));
         jump.set_halign(gtk::Align::Start);
         jump.set_tooltip_text(Some("このページへ移動します"));
         {
             let on_jump = self.on_jump.clone();
+            let page = row.page;
             jump.connect_clicked(move |_| on_jump(page));
         }
         head.append(&jump);
@@ -290,7 +303,7 @@ impl Annotations {
             let on_changed = self.on_changed.clone();
             // 強参照だと list → row → button → クロージャ → Annotations → list の循環になる
             let me = Rc::downgrade(self);
-            let id = id.to_string();
+            let id = row.id.clone();
             delete.connect_clicked(move |_| {
                 state.borrow_mut().remove_highlight(&id);
                 // 削除の保存が失敗したことを黙って捨てない (state を借りていない状態で呼ぶ)
@@ -303,21 +316,21 @@ impl Annotations {
             });
         }
         head.append(&delete);
-        row.append(&head);
+        row_box.append(&head);
 
-        let quote_label = gtk::Label::new(Some(quote));
+        let quote_label = gtk::Label::new(Some(&row.quote));
         quote_label.set_wrap(true);
         quote_label.set_lines(3);
         quote_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         quote_label.set_xalign(0.0);
         quote_label.set_max_width_chars(24);
         quote_label.add_css_class("reader-quote");
-        row.append(&quote_label);
+        row_box.append(&quote_label);
 
         let memo_view = gtk::TextView::new();
         memo_view.set_wrap_mode(gtk::WrapMode::WordChar);
         memo_view.set_size_request(-1, 60);
-        memo_view.buffer().set_text(memo);
+        memo_view.buffer().set_text(&row.memo);
         memo_view.add_css_class("reader-memo");
         if read_only {
             // 現状は到達しない (上の削除ボタンと同じ理由)
@@ -326,7 +339,7 @@ impl Annotations {
         } else {
             // set_text のあとで繋ぐ。作り直しのたびに保存し直さないため
             let state = self.state.clone();
-            let id = id.to_string();
+            let id = row.id.clone();
             memo_view.buffer().connect_changed(move |buf| {
                 let text = buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string();
                 state.borrow_mut().set_memo(&id, text);
@@ -336,11 +349,11 @@ impl Annotations {
         // 枠を付けて空のメモ欄が見えるようにする
         let memo_frame = gtk::Frame::new(None);
         memo_frame.set_child(Some(&memo_view));
-        row.append(&memo_frame);
+        row_box.append(&memo_frame);
 
         let tags_entry = gtk::Entry::new();
         tags_entry.set_placeholder_text(Some("タグ (カンマ区切り)"));
-        tags_entry.set_text(&tags.join(", "));
+        tags_entry.set_text(&row.tags.join(", "));
         tags_entry.add_css_class("reader-tags");
         if read_only {
             // 現状は到達しない (削除ボタン・メモ欄と同じ理由)
@@ -357,7 +370,7 @@ impl Annotations {
             // 「絞り込みに反映されていない」ように見えても、直すべきバグではない
             {
                 let state = self.state.clone();
-                let id = id.to_string();
+                let id = row.id.clone();
                 tags_entry.connect_changed(move |entry| {
                     let tags = parse_tags(&entry.text());
                     state.borrow_mut().set_tags(&id, tags);
@@ -482,10 +495,39 @@ impl Annotations {
                 });
             }
         }
-        row.append(&tags_entry);
+        row_box.append(&tags_entry);
 
-        self.memo_entries.borrow_mut().push((id.to_string(), memo_view));
-        row
+        // その注釈で LLM に聞いた問答を古い順 (積んだ順) に並べる。
+        // 見出しの選び方は ask::qa_heading (GTK 非依存・テスト付き) に任せる
+        if !row.llm.is_empty() {
+            let qa_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            for qa in &row.llm {
+                let heading = gtk::Label::new(Some(&ask::qa_heading(qa, ask::find(&qa.kind))));
+                heading.set_wrap(true);
+                heading.set_xalign(0.0);
+                heading.add_css_class("reader-qa-heading");
+                qa_box.append(&heading);
+
+                let answer = gtk::Label::new(Some(&qa.a));
+                answer.set_wrap(true);
+                answer.set_selectable(true);
+                answer.set_xalign(0.0);
+                answer.add_css_class("reader-qa-answer");
+                qa_box.append(&answer);
+            }
+            row_box.append(&qa_box);
+        }
+
+        // 投げてまだ返っていない件数。返ってきて注釈タブが作り直されると消える
+        if row.pending > 0 {
+            let waiting = gtk::Label::new(Some(&format!("聞いています… ({} 件)", row.pending)));
+            waiting.set_xalign(0.0);
+            waiting.add_css_class("reader-qa-pending");
+            row_box.append(&waiting);
+        }
+
+        self.memo_entries.borrow_mut().push((row.id.clone(), memo_view));
+        row_box
     }
 }
 

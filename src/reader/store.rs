@@ -13,8 +13,12 @@ pub struct PdfMeta {
     pub size: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmQa {
+    /// どの操作の結果か (`ask::Action::kind`)。
+    /// 古いサイドカーには無いので既定は空文字
+    #[serde(default)]
+    pub kind: String,
     pub q: String,
     pub a: String,
     pub at: DateTime<Local>,
@@ -275,6 +279,54 @@ mod tests {
         .expect("書けること");
         let err = Sidecar::load(&pdf).expect_err("未知の schema は拒否");
         assert!(err.to_string().contains("99"));
+    }
+
+    #[test]
+    fn a_sidecar_written_before_kind_existed_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path(), "foo.pdf");
+        std::fs::create_dir_all(dir.path().join(".miryam")).expect("掘れること");
+        // kind が無い時代のサイドカー。既存ファイルが読めなくなってはいけない
+        std::fs::write(
+            dir.path().join(".miryam/foo.pdf.json"),
+            r#"{"schema":1,"pdf":{"name":"foo.pdf","size":9},"bookmark_page":0,
+                "opened_at":"2026-08-13T10:00:00+09:00",
+                "highlights":[{"id":"1","page":0,"color":"yellow",
+                  "rects":[[0.0,0.0,0.1,0.1]],"quote":"q","memo":"",
+                  "tags":[],"llm":[{"q":"なに?","a":"これ","at":"2026-08-13T10:00:00+09:00"}],
+                  "created_at":"2026-08-13T10:00:00+09:00"}]}"#,
+        )
+        .expect("書けること");
+
+        let sc = Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        assert_eq!(sc.highlights[0].llm.len(), 1);
+        assert_eq!(sc.highlights[0].llm[0].kind, "", "kind が無ければ空文字");
+    }
+
+    #[test]
+    fn kind_roundtrips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path(), "foo.pdf");
+        let mut sc = Sidecar::new(&pdf).expect("作れること");
+        sc.highlights.push(Highlight {
+            id: "1".into(),
+            page: 0,
+            color: "yellow".into(),
+            rects: vec![[0.0, 0.0, 0.1, 0.1]],
+            quote: "q".into(),
+            memo: String::new(),
+            tags: vec![],
+            llm: vec![LlmQa {
+                kind: "ask".into(),
+                q: "なに?".into(),
+                a: "これ".into(),
+                at: chrono::Local::now(),
+            }],
+            created_at: chrono::Local::now(),
+        });
+        sc.save(&pdf).expect("保存できること");
+        let loaded = Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        assert_eq!(loaded.highlights[0].llm[0].kind, "ask");
     }
 
     #[test]
