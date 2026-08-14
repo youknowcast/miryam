@@ -396,6 +396,11 @@ pub fn show_library_window(
     window.set_default_size(520, 480);
     window.set_child(Some(&with_backdrop(backdrop, &scrolled)));
 
+    // Hyprland にはサーバーサイドのタイトルバーが無く、このままだと Esc しか閉じる手段が無い。
+    // HeaderBar を立てるとウィンドウコントロール (閉じるボタン) が既定で出て、ドラッグでも動かせる
+    let header = gtk::HeaderBar::new();
+    window.set_titlebar(Some(&header));
+
     let key = gtk::EventControllerKey::new();
     let window_for_key = window.clone();
     key.connect_key_pressed(move |_, keyval, _, _| {
