@@ -2,6 +2,9 @@
 name = "miryam"
 version = "0.1.0"
 edition = "2024"
+# src/main.rs (マスコット本体) と src/bin/miryam-reader.rs の 2 バイナリ構成なので、
+# README の `cargo run` (マスコット起動) が曖昧にならないよう既定を指定する
+default-run = "miryam"
 
 [dependencies]
 gtk4 = { version = "0.11", features = ["v4_6"] }
