@@ -11,6 +11,7 @@ use std::rc::Rc;
 use crate::reader::geom;
 use crate::reader::search;
 use crate::reader::store::{self, Highlight, Sidecar};
+use crate::reader::ui_logic::should_restart;
 
 /// ページ間の隙間 (px)
 const PAGE_GAP: f64 = 12.0;
@@ -352,8 +353,9 @@ fn wire_search_keys(
     entry: &gtk::SearchEntry,
     sidebar: &Rc<sidebar::Sidebar>,
 ) {
-    // 最後に走査を始めた語。Enter を「新しく検索する」と「次の一致へ飛ぶ」で使い分ける
-    let last_query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    // 最後に走査を始めた語。Enter を「新しく検索する」と「次の一致へ飛ぶ」で使い分ける。
+    // `None` は「まだ一度も走査していない」(空の語で走査した状態とは区別する)
+    let last_query: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     {
         let tab = sidebar.search().clone();
@@ -363,15 +365,30 @@ fn wire_search_keys(
         // ツールバーの entry を知らないので循環しない
         entry.connect_activate(move |entry| {
             let query = entry.text().to_string();
-            // 借用は 1 文で落とす
-            let same = *last_query.borrow() == query;
-            if same {
+            // やり直すか次へ送るかの判断は `ui_logic::should_restart` にある
+            // (GTK 非依存・テスト付き)。借用は 1 文で落とす
+            let restart = should_restart(last_query.borrow().as_deref(), &query);
+            if !restart {
                 tab.next();
                 return;
             }
-            last_query.replace(query.clone());
+            last_query.replace(Some(query.clone()));
             sidebar.show_search();
             tab.start(query);
+        });
+    }
+
+    {
+        // 検索欄の × や Escape は `activate` ではなく `stop-search` を出すので、
+        // ここを繋いでおかないと欄が空になっても一覧とページ上の強調が残る。
+        // 空の語で走査し直すのと同じ経路 (一覧を空にし、実行部が強調を消す) を通す
+        let tab = sidebar.search().clone();
+        let last_query = last_query.clone();
+        entry.connect_stop_search(move |_| {
+            // 取り消したあとに同じ語を入れ直したら、また走査し直せるようにする
+            // (`Some("foo")` を残すと次の Enter が「同じ語」と見なされてしまう)
+            last_query.replace(None);
+            tab.start(String::new());
         });
     }
 

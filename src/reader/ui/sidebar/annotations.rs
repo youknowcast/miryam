@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::reader::ui::ReaderState;
+use crate::reader::ui_logic::selected_index;
 
 /// カンマ区切りのタグ入力を正規化する: 前後の空白を落とし、空要素を捨て、
 /// 重複を落とす (先に出てきたものを残す)。GTK に依存しない純粋関数
@@ -226,11 +227,9 @@ impl Annotations {
         let model = gtk::StringList::new(&labels);
         self.filter_dropdown.set_model(Some(&model));
 
-        let selected = match filter_value {
-            None => 0,
-            Some(tag) => all_tags.iter().position(|t| t == tag).map(|i| i + 1).unwrap_or(0),
-        };
-        self.filter_dropdown.set_selected(selected as u32);
+        // 「選択インデックス ↔ タグ」の対応は `ui_logic::selected_index` にある
+        // (GTK 非依存・テスト付き)
+        self.filter_dropdown.set_selected(selected_index(all_tags, filter_value));
 
         *self.filter_options.borrow_mut() = all_tags.to_vec();
 
@@ -366,9 +365,22 @@ impl Annotations {
                 });
             }
             // 既存タグの候補を Popover で出す (EntryCompletion は GTK4 で非推奨方向のため
-            // 使わない)。候補が無ければ何も出さない。フォーカスを得たときだけ開き、
-            // 閉じるのは Popover 自身の autohide に任せる (entry 側で焦点喪失時に
-            // popdown を打つと、候補ボタンをクリックした瞬間の焦点移動と競合しかねない)
+            // 使わない)。候補が無ければ何も出さない。フォーカスを得たら開き、失ったら閉じる
+            //
+            // **Popover は必ず非モーダル (`set_autohide(false)`) にすること。**
+            // 既定の autohide == true の Popover は「表示されたときにキーボードの
+            // フォーカスを奪う」(GTK の `gtk_popover_set_autohide` の仕様)。中身が
+            // ボタンなので焦点を取れる子が見つかってしまい、タグを打とうとしても
+            // 打鍵が Popover 側へ行く。しかもモーダル Popover は閉じるときに元の
+            // ウィジェットへフォーカスを戻すので、Escape で閉じる → entry に焦点が
+            // 戻る → この has_focus ハンドラがまた開く、と往復しかねない。
+            // 非モーダルならフォーカスには一切触れず、クリックは今までどおり届く
+            //
+            // 非モーダルの Popover は自分では閉じないので、閉じるのはこちらの責任:
+            // 焦点を失ったときに popdown する。候補ボタン側は `set_focus_on_click(false)`
+            // にしてあるので、候補をクリックしても entry の焦点は動かず、
+            // 「押した瞬間にこのハンドラが Popover ごと片づけてしまって clicked が
+            // 出ない」という取りこぼしにはならない
             {
                 let state = self.state.clone();
                 let popover_slot: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
@@ -390,16 +402,24 @@ impl Annotations {
                     });
                 }
                 tags_entry.connect_has_focus_notify(move |entry| {
-                    if !entry.has_focus() {
-                        return;
-                    }
-                    // 前に開いたままのものが残っていたら片づける (通常は autohide が
-                    // 先に閉じているはずだが、念のため new_popover と同じ流儀で防御する)
-                    if let Some(p) = popover_slot.borrow_mut().take() {
+                    // 焦点の出入りどちらでも、まず開いているものを閉じる。非モーダルの
+                    // Popover は自分で閉じないので、焦点を失ったときはこれが唯一の
+                    // 閉じ道になる。焦点を得たときも、候補は今の入力によって変わるので
+                    // 開き直す
+                    //
+                    // `take()` は独立した文にする。`popdown()` は `closed` を同期的に
+                    // 発火させ、そのハンドラが `popover_slot` を borrow_mut するので、
+                    // `if let` の被検査式に置くと edition によっては借用が重なる
+                    // (2024 では本体より先に落ちるが、それに寄りかからない)
+                    let open = popover_slot.borrow_mut().take();
+                    if let Some(p) = open {
                         p.popdown();
                         if p.parent().is_some() {
                             p.unparent();
                         }
+                    }
+                    if !entry.has_focus() {
+                        return;
                     }
 
                     let current = parse_tags(&entry.text());
@@ -411,8 +431,12 @@ impl Annotations {
 
                     let popover = gtk::Popover::new();
                     popover.set_parent(entry);
-                    popover.set_autohide(true);
-                    // Popover が自分で閉じたら親から外す。放っておくと親に残り続ける
+                    // 非モーダル。フォーカスを奪わせない (この節の上のコメント参照)
+                    popover.set_autohide(false);
+                    // 閉じたら親から外す。放っておくと親に残り続ける。非モーダルなので
+                    // 閉じるのは必ずこちらから popdown したときだが、どの経路 (焦点喪失・
+                    // 候補のクリック・entry の破棄) で閉じても後始末が 1 か所で済むよう
+                    // ::closed に置く
                     {
                         let popover_slot = popover_slot.clone();
                         popover.connect_closed(move |p| {
@@ -426,6 +450,10 @@ impl Annotations {
                     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
                     for tag in candidates {
                         let button = gtk::Button::with_label(&tag);
+                        // 押しても entry から焦点を奪わない。奪うと entry の
+                        // has_focus ハンドラが走って、clicked が出る前にこの
+                        // Popover ごと片づけてしまう
+                        button.set_focus_on_click(false);
                         // 強参照だと popover → box → button → クロージャ → entry/popover の
                         // 循環になりかねないので、両方とも弱参照で持つ
                         let entry_weak = entry.downgrade();
