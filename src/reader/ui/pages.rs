@@ -629,7 +629,14 @@ fn show_question_entry(
 ) {
     let entry = gtk::Entry::new();
     entry.set_placeholder_text(Some("聞きたいことを書いて Enter"));
-    entry.set_width_chars(28);
+    // 表示中のポップオーバーに set_child で子を差し替えると、GTK の native layout
+    // (gtkpopover.c の is_acceptable_size) が「子の最小幅がサーフェスより広い」と
+    // 判断して popdown してしまう。エントリの最小幅をポップオーバーの現在幅に
+    // 収めることでサーフェスサイズを変えずに差し替える
+    // (width_chars は文字数ベースで 28 文字分 (~300px) の最小幅を要求するため、
+    // 1 文字に落として width_request で幅を制御する)
+    entry.set_width_chars(1);
+    entry.set_width_request(popover.width().max(140) - 24);
 
     {
         let state = state.clone();
