@@ -1,13 +1,4 @@
-mod chat;
-mod control;
-mod inkdrop;
-mod links;
-mod llm;
-mod news;
-mod phrases;
-mod scheduler;
-mod system;
-mod ui;
+use miryam::{chat, control, inkdrop, links, llm, news, phrases, scheduler, ui};
 
 use gtk::{gio, glib, prelude::*};
 use gtk4 as gtk;
@@ -1409,6 +1400,72 @@ fn register_actions(
     }
     app.add_action(&news_show);
 
+    // 本棚: メニュー「本棚」。[reader] が無ければアクション自体を登録しない
+    // (走査対象フォルダが無いため news-show のような無条件登録はしない)
+    let library_slot: Rc<RefCell<Option<gtk::Window>>> = Rc::new(RefCell::new(None));
+    if let Some(cfg) = book.reader() {
+        let dir = cfg.dir_path();
+        let recursive = cfg.recursive;
+        let library_show = gio::SimpleAction::new("library-show", None);
+        let slot = library_slot.clone();
+        let ui_for_library = ui.clone();
+        let app_for_library = app.clone();
+        let timers_for_library = timers.clone();
+        let running: Rc<RefCell<std::collections::HashSet<std::path::PathBuf>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
+        library_show.connect_activate(move |_, _| {
+            let entries = match miryam::reader::library::scan(&dir, recursive) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("miryam: 本棚を読めません: {e:#}");
+                    show_text(
+                        &ui_for_library,
+                        &timers_for_library,
+                        "本棚のフォルダが見つかりません",
+                    );
+                    return;
+                }
+            };
+            let running = running.clone();
+            let ui_for_open = ui_for_library.clone();
+            let timers_for_open = timers_for_library.clone();
+            ui::show_library_window(
+                &app_for_library,
+                &slot,
+                entries,
+                &ui_for_library.backdrop_texture(),
+                move |path| {
+                    if !running.borrow_mut().insert(path.to_path_buf()) {
+                        show_text(&ui_for_open, &timers_for_open, "それはもう開いています");
+                        return;
+                    }
+                    let exe = std::env::current_exe().unwrap_or_else(|_| "miryam".into());
+                    let reader = ui::reader_exe_path(&exe);
+                    let argv = [reader.as_os_str(), path.as_os_str()];
+                    match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
+                        Ok(proc) => {
+                            let running = running.clone();
+                            let path = path.to_path_buf();
+                            proc.wait_async(None::<&gio::Cancellable>, move |_| {
+                                running.borrow_mut().remove(&path);
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("miryam: reader を起動できません: {e}");
+                            running.borrow_mut().remove(path);
+                            show_text(
+                                &ui_for_open,
+                                &timers_for_open,
+                                "リーダーを起動できませんでした",
+                            );
+                        }
+                    }
+                },
+            );
+        });
+        app.add_action(&library_show);
+    }
+
     // リンク集: リンクを既定ブラウザで開く (gtk::show_uri は 4.10 deprecated のため gio 経由)
     let open_link = gio::SimpleAction::new("open-link", Some(glib::VariantTy::STRING));
     open_link.connect_activate(move |_, param| {
@@ -1526,6 +1583,7 @@ fn register_actions(
                 .map(|c| c.modes().iter().map(|m| m.name.clone()).collect())
                 .unwrap_or_default(),
             book.news().is_some(),
+            book.reader().is_some(),
             move || match links::load(&links::links_path()) {
                 Ok(list) => links::build_submenu(&list),
                 Err(e) => {
@@ -1569,19 +1627,5 @@ fn add_link_from_text(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text:
             eprintln!("miryam: {e:#}");
             show_text(ui, timers, "links.toml への書き込みに失敗しました");
         }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_sync {
-    use std::sync::{Mutex, MutexGuard};
-
-    /// glib デフォルトメインコンテキストを使う統合テストの直列化ロック。
-    /// acquire() は他スレッド保持時に Err を返すため、これ無しでは並列テストが flaky になる
-    pub static MAIN_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
-
-    pub fn lock() -> MutexGuard<'static, ()> {
-        // 1 本の panic が以降のテストを poison で巻き込まないようにする
-        MAIN_CONTEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
