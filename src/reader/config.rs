@@ -108,6 +108,22 @@ pub fn load_inkdrop() -> Option<crate::inkdrop::InkdropConfig> {
     }
 }
 
+/// 書き出し先ノートブック名。`[reader] book` → 無ければ `[inkdrop] book`。
+/// どちらも無ければ既定の "Inbox" (InkdropConfig::book の既定と同じ)
+pub fn load_book_name() -> String {
+    match crate::phrases::PhraseBook::load() {
+        Ok(book) => {
+            let reader_book = book.reader().and_then(|c| c.book.clone());
+            let inkdrop_book = book.inkdrop().map(|c| c.book.clone());
+            reader_book.or(inkdrop_book).unwrap_or_else(|| "Inbox".to_string())
+        }
+        Err(e) => {
+            eprintln!("miryam-reader: 設定を読めないため既定のノートブックを使います: {e:#}");
+            "Inbox".to_string()
+        }
+    }
+}
+
 /// 色名 → RGB (0.0〜1.0)
 pub fn color_rgb(name: &str) -> (f64, f64, f64) {
     match name {
