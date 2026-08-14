@@ -760,9 +760,11 @@ mod tests {
         let hits = find_hits(&page, "selection");
 
         assert_eq!(hits.len(), 1, "1 か所だけ一致すること");
-        let [x0, y0, x1, y1] = hits[0];
+        let [x0, _y0, x1, y1] = hits[0];
+        // ここが本題: 反転を忘れると y は下半分 (0.7 台) に出る。
+        // `y0 < y1` は `store::normalize_rect` が min/max で並べ替える以上つねに成り立つので、
+        // 反転の有無を区別しない (以前ここにあったアサーションは常に真だった)
         assert!(y1 < 0.5, "上半分に来ること (左下原点のままなら y は 0.7 台になる): {y1}");
-        assert!(y0 < y1, "y0 が上、y1 が下");
         assert!(x0 > 0.0 && x1 <= 1.0 && x0 < x1, "x は左から右へ: {x0}..{x1}");
     }
 

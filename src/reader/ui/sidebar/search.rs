@@ -28,6 +28,10 @@ pub struct SearchTab {
     runner: RefCell<Option<Runner>>,
     /// 表示中の一致 (見つかった順 = ページ昇順)
     hits: RefCell<Vec<Hit>>,
+    /// `hits` に積まれた `rects` の総数の走行合計。`update_status` が `push` の
+    /// たびに呼ばれるので、そのつど `hits` 全体を畳み込むと O(件数²) になる。
+    /// ここに走行合計を持てば `update_status` は 1 行で済む
+    total_marks: Cell<usize>,
     /// いま何番目の一致にいるか。行のクロージャからも書くので `Rc` で共有する
     /// (`Rc<Self>` を配ると list → 行 → クロージャ → SearchTab → list の循環になる)
     current: Rc<Cell<Option<usize>>>,
@@ -66,6 +70,7 @@ impl SearchTab {
             on_jump,
             runner: RefCell::new(None),
             hits: RefCell::new(Vec::new()),
+            total_marks: Cell::new(0),
             current: Rc::new(Cell::new(None)),
             running: Cell::new(false),
             searched: Cell::new(false),
@@ -102,6 +107,7 @@ impl SearchTab {
         let index = self.hits.borrow().len();
         let (page, count) = (hit.page, hit.rects.len());
         self.hits.borrow_mut().push(hit);
+        self.total_marks.set(self.total_marks.get() + count);
         self.list.append(&self.build_row(index, page, count));
         self.update_status();
     }
@@ -128,6 +134,7 @@ impl SearchTab {
             self.list.remove(&child);
         }
         self.hits.borrow_mut().clear();
+        self.total_marks.set(0);
         self.current.set(None);
     }
 
@@ -154,11 +161,8 @@ impl SearchTab {
     }
 
     fn update_status(&self) {
-        // 借用は 1 文で落とす
-        let (pages, marks) = {
-            let hits = self.hits.borrow();
-            (hits.len(), hits.iter().map(|h| h.rects.len()).sum::<usize>())
-        };
+        let pages = self.hits.borrow().len();
+        let marks = self.total_marks.get();
         let text = if self.running.get() {
             format!("検索中… ({marks} 件)")
         } else if !self.searched.get() {
