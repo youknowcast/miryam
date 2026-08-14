@@ -39,6 +39,8 @@ impl Search {
 
     /// 次に走査するページ範囲を返し、進行位置を進める
     pub fn take_chunk(&mut self, size: usize) -> std::ops::Range<usize> {
+        // `next_page` は毎回 `end` 側の clamp を通してしか更新されないため、
+        // ここで total_pages を超えて渡ってくる経路は無い。防御的に残しているだけ。
         let start = self.next_page.min(self.total_pages);
         let end = start.saturating_add(size).min(self.total_pages);
         self.next_page = end;
@@ -63,13 +65,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chunk_pages_default_is_32() {
+        assert_eq!(CHUNK_PAGES, 32);
+    }
+
+    #[test]
     fn chunks_walk_the_document_and_then_stop() {
         let mut s = Search::new("x".into(), 70);
-        assert_eq!(s.take_chunk(32), 0..32);
-        assert_eq!(s.take_chunk(32), 32..64);
-        assert_eq!(s.take_chunk(32), 64..70, "端は総ページ数で止まる");
+        assert_eq!(s.query, "x");
+        assert_eq!(s.take_chunk(CHUNK_PAGES), 0..32);
+        assert_eq!(s.take_chunk(CHUNK_PAGES), 32..64);
+        assert_eq!(s.take_chunk(CHUNK_PAGES), 64..70, "端は総ページ数で止まる");
         assert!(s.is_done());
-        assert_eq!(s.take_chunk(32), 70..70, "終わったあとは空の範囲");
+        assert_eq!(s.take_chunk(CHUNK_PAGES), 70..70, "終わったあとは空の範囲");
     }
 
     #[test]
