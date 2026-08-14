@@ -14,7 +14,6 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 poppler-rs = "0.26.0"
 cairo-rs = "0.22.0"
-poppler-sys-rs = "0.26"
 
 [dev-dependencies]
 tempfile = "3.27.0"

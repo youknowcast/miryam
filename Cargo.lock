@@ -642,7 +642,6 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "poppler-rs",
- "poppler-sys-rs",
  "rand",
  "serde",
  "serde_json",

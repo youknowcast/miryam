@@ -1,11 +1,12 @@
 //! PDF の目次 (アウトライン) を読む。
 //!
 //! `poppler-rs 0.26` は `IndexIter` の `get_action()` をバインドしていないため、
-//! ここだけ `poppler-sys-rs` を直接叩く。unsafe はこのファイルに閉じ込め、
-//! 外へは安全な型 (`OutlineItem`) だけを出す。
+//! ここだけ FFI を直接叩く (`poppler-rs` が `poppler::ffi` として再輸出している
+//! `poppler-sys-rs` を使うので、直接依存は増やさない)。
+//! unsafe はこのファイルに閉じ込め、外へは安全な型 (`OutlineItem`) だけを出す。
 
 use gtk4::glib::translate::{Stash, ToGlibPtr};
-use poppler_sys as ffi;
+use poppler::ffi;
 use std::ffi::CStr;
 use std::os::raw::c_int;
 
@@ -18,17 +19,26 @@ const MAX_DEPTH: usize = 16;
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutlineItem {
     pub title: String,
-    /// 飛び先のページ (0 始まり)。解決できなければ None
+    /// 飛び先のページ (0 始まり)。解決できなければ None。
+    ///
+    /// **総ページ数での検査はしていない**。壊れた (あるいは悪意ある) `/Dest` は
+    /// 2 ページの文書でも `Some(9998)` を返せるので、利用側でクランプすること
     pub page: Option<usize>,
     pub children: Vec<OutlineItem>,
 }
 
 /// 目次を読む。持たない PDF では空
 pub fn read(doc: &poppler::Document) -> Vec<OutlineItem> {
+    read_limited(doc, MAX_DEPTH)
+}
+
+/// 深さの上限を指定して目次を読む。上限が効いていることをテストから確かめるための入口で、
+/// 本番の入口は上限を固定した [`read`]
+fn read_limited(doc: &poppler::Document, max_depth: usize) -> Vec<OutlineItem> {
     // Stash は生ポインタを使い終えるまで束縛したままにする (途中で落とさない)
     let stash: Stash<'_, *mut ffi::PopplerDocument, poppler::Document> = doc.to_glib_none();
     let raw_doc = stash.0;
-    if raw_doc.is_null() {
+    if raw_doc.is_null() || max_depth == 0 {
         return Vec::new();
     }
     // SAFETY: raw_doc は生存中の `doc` が所有する PopplerDocument。
@@ -40,7 +50,7 @@ pub fn read(doc: &poppler::Document) -> Vec<OutlineItem> {
             // 目次を持たない PDF
             return Vec::new();
         }
-        let items = walk(raw_doc, iter, 0);
+        let items = walk(raw_doc, iter, 0, max_depth);
         ffi::poppler_index_iter_free(iter);
         items
     }
@@ -54,12 +64,11 @@ unsafe fn walk(
     doc: *mut ffi::PopplerDocument,
     iter: *mut ffi::PopplerIndexIter,
     depth: usize,
+    max_depth: usize,
 ) -> Vec<OutlineItem> {
     let mut out = Vec::new();
     loop {
-        if let Some(item) = unsafe { item_at(doc, iter, depth) } {
-            out.push(item);
-        }
+        out.push(unsafe { item_at(doc, iter, depth, max_depth) });
         if unsafe { ffi::poppler_index_iter_next(iter) } == gtk4::glib::ffi::GFALSE {
             break;
         }
@@ -67,7 +76,8 @@ unsafe fn walk(
     out
 }
 
-/// いま指している項目を読む。読めない種類のアクションなら None
+/// いま指している項目を読む。
+/// アクションが取れない・読めない種類でも、タイトルを空にして子は残す
 ///
 /// # Safety
 /// `doc` と `iter` は有効な生存中のポインタであること
@@ -75,31 +85,34 @@ unsafe fn item_at(
     doc: *mut ffi::PopplerDocument,
     iter: *mut ffi::PopplerIndexIter,
     depth: usize,
-) -> Option<OutlineItem> {
+    max_depth: usize,
+) -> OutlineItem {
     // SAFETY: get_action が返す PopplerAction の解放責任は呼び出し側。
-    // 以降 action を使い終えるまで return しない
+    // action を確保してから poppler_action_free に至るまでの間に return はしない
     let action = unsafe { ffi::poppler_index_iter_get_action(iter) };
-    if action.is_null() {
-        return None;
-    }
-    // どの種類のアクションでも先頭 2 フィールド (type_, title) の並びは共通
-    let any = unsafe { &(*action).any };
-    let title = if any.title.is_null() {
-        String::new()
+    let (title, page) = if action.is_null() {
+        (String::new(), None)
     } else {
-        unsafe { CStr::from_ptr(any.title) }.to_string_lossy().into_owned()
+        // どの種類のアクションでも先頭 2 フィールド (type_, title) の並びは共通
+        let any = unsafe { &(*action).any };
+        let title = if any.title.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(any.title) }.to_string_lossy().into_owned()
+        };
+        let page = if any.type_ == ffi::POPPLER_ACTION_GOTO_DEST {
+            // dest は action の一部なので個別には解放しない
+            let goto = unsafe { &(*action).goto_dest };
+            unsafe { page_of(doc, goto.dest) }
+        } else {
+            None
+        };
+        unsafe { ffi::poppler_action_free(action) };
+        (title, page)
     };
-    let page = if any.type_ == ffi::POPPLER_ACTION_GOTO_DEST {
-        // dest は action の一部なので個別には解放しない
-        let goto = unsafe { &(*action).goto_dest };
-        unsafe { page_of(doc, goto.dest) }
-    } else {
-        None
-    };
-    unsafe { ffi::poppler_action_free(action) };
 
     // 子は別の iter として取り、再帰的に歩く。深さの上限を超えたら取りに行かない
-    let children = if depth + 1 >= MAX_DEPTH {
+    let children = if depth + 1 >= max_depth {
         Vec::new()
     } else {
         // SAFETY: get_child が返す iter の解放責任も呼び出し側。
@@ -108,13 +121,13 @@ unsafe fn item_at(
         if child_iter.is_null() {
             Vec::new()
         } else {
-            let c = unsafe { walk(doc, child_iter, depth + 1) };
+            let c = unsafe { walk(doc, child_iter, depth + 1, max_depth) };
             unsafe { ffi::poppler_index_iter_free(child_iter) };
             c
         }
     };
 
-    Some(OutlineItem { title, page, children })
+    OutlineItem { title, page, children }
 }
 
 /// `dest` を 0 始まりのページ番号に直す。名前付き飛び先は解決してから読む
@@ -223,6 +236,30 @@ mod tests {
         build_pdf(&objects)
     }
 
+    /// 2 ページの PDF に、**名前付き飛び先** (`/Dest /d1`) を使う目次を 2 項目ぶら下げる。
+    /// カタログの `/Dests` 辞書から名前を引く形で、groff や LaTeX が実際に出す形と同じ。
+    /// `page_of` の `POPPLER_DEST_NAMED` 分岐 (`find_dest` → `page_num` → `dest_free`) を通す
+    fn named_dest_outline_pdf() -> Vec<u8> {
+        build_pdf(&[
+            // 1: カタログ
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Dests 7 0 R >>".to_string(),
+            // 2: ページツリー (2 ページ)
+            "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".to_string(),
+            // 3: 1 ページ目
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] >>".to_string(),
+            // 4: 目次の根
+            "<< /Type /Outlines /First 5 0 R /Last 8 0 R /Count 2 >>".to_string(),
+            // 5: 1 項目目。飛び先は名前 /d1
+            "<< /Title (Named one) /Parent 4 0 R /Next 8 0 R /Dest /d1 >>".to_string(),
+            // 6: 2 ページ目
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] >>".to_string(),
+            // 7: 名前付き飛び先の辞書
+            "<< /d1 [3 0 R /XYZ null null null] /d2 [6 0 R /XYZ null null null] >>".to_string(),
+            // 8: 2 項目目。飛び先は名前 /d2
+            "<< /Title (Named two) /Parent 4 0 R /Prev 5 0 R /Dest /d2 >>".to_string(),
+        ])
+    }
+
     /// 木の最大の深さ (項目が 1 つでもあれば 1)
     fn depth_of(items: &[OutlineItem]) -> usize {
         items.iter().map(|i| 1 + depth_of(&i.children)).max().unwrap_or(0)
@@ -248,14 +285,55 @@ mod tests {
         assert_eq!(items[0].children[0].children[0].title, "Level 2");
     }
 
+    /// 名前付き飛び先 (`/Dest /d1`) が正しいページ番号に解決されること。
+    /// LaTeX 由来をはじめ実際の PDF が一番よく通る経路で、`find_dest` が返した
+    /// `PopplerDest` を解放する唯一の分岐でもある
     #[test]
-    fn a_deeper_outline_is_cut_off_at_the_depth_limit() {
+    fn a_named_destination_resolves_to_its_page() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // 上限より深く入れ子にして、切り捨てが効くことを見る
-        let doc = open(dir.path(), "deep.pdf", &nested_outline_pdf(MAX_DEPTH + 8));
+        let doc = open(dir.path(), "named.pdf", &named_dest_outline_pdf());
         let items = read(&doc);
 
-        assert_eq!(depth_of(&items), MAX_DEPTH, "深さは上限で打ち切られること");
+        assert_eq!(items.len(), 2, "目次は 2 項目");
+        assert_eq!(items[0].title, "Named one");
+        assert_eq!(items[0].page, Some(0), "/d1 は 1 ページ目 (0 始まり)");
+        assert_eq!(items[1].title, "Named two");
+        assert_eq!(items[1].page, Some(1), "/d2 は 2 ページ目 (0 始まり)");
+    }
+
+    /// poppler 自身は深さを制限しないこと。
+    /// 次のテスト (打ち切り) が「poppler が止めているだけ」で通るのを防ぐ対照
+    #[test]
+    fn poppler_itself_does_not_limit_the_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = open(dir.path(), "deep.pdf", &nested_outline_pdf(24));
+
+        assert_eq!(depth_of(&read_limited(&doc, 24)), 24, "上限を緩めれば 24 段とも読めること");
+    }
+
+    /// 深さの上限が実際に打ち切っていること。
+    /// フィクスチャは 24 段で固定し、渡した上限のぶんだけ返ることを見る
+    #[test]
+    fn the_depth_limit_cuts_the_tree_at_the_given_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = open(dir.path(), "deep.pdf", &nested_outline_pdf(24));
+
+        assert_eq!(depth_of(&read_limited(&doc, 1)), 1, "1 を渡したら 1 段");
+        assert_eq!(depth_of(&read_limited(&doc, 4)), 4, "4 を渡したら 4 段");
+        assert_eq!(depth_of(&read_limited(&doc, 16)), 16, "16 を渡したら 16 段");
+        assert_eq!(read_limited(&doc, 0), Vec::new(), "0 を渡したら空");
+    }
+
+    /// 本番の入口が固定している上限。
+    /// 定数を変えたらこのテストが落ちるようにしておく (フィクスチャは 24 段で固定)
+    #[test]
+    fn read_uses_a_depth_limit_of_sixteen() {
+        assert_eq!(MAX_DEPTH, 16, "上限は 16 段");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = open(dir.path(), "deep.pdf", &nested_outline_pdf(24));
+
+        assert_eq!(depth_of(&read(&doc)), 16, "read は 16 段で打ち切ること");
     }
 
     #[test]
