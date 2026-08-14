@@ -192,6 +192,10 @@ pub fn run(path: PathBuf) -> glib::ExitCode {
 /// 目次の `page` を総ページ数でクランプする。範囲外なら「飛べない」扱いにする
 /// (`None` にする) ため、`outline::read` が返し得る範囲外のページ番号が
 /// サイドバーより先に UI へ渡らないようにする関所
+///
+/// ここは深さの上限を設けずに `children` を再帰的にたどる。安全なのは唯一の
+/// 生成元である `outline::read` (`outline.rs`) が深さ 16 で打ち切っているから
+/// で、この関数単体には歯止めが無い
 fn clamp_outline(
     items: Vec<crate::reader::outline::OutlineItem>,
     total_pages: usize,
@@ -361,10 +365,14 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     paned.set_start_child(Some(sidebar.widget()));
     paned.set_end_child(Some(&right));
-    // サイドバー自身の最小幅 (420px, sidebar/mod.rs 参照) に合わせる。
-    // 3 タブ分の StackSwitcher ボタンが収まる最小幅がこの値
-    paned.set_position(420);
+    paned.set_position(280);
     paned.set_resize_start_child(false);
+    // shrink-start-child の既定値 true のままだと、position をこれより小さくしても
+    // (ドラッグでも) start 側が中身の最小幅を割って縮み、目次タブのボタンが
+    // ペインの外 (負の x) へクリップされてしまう。false にすると position は
+    // 中身由来の最小幅 (タブ数に応じて sidebar/mod.rs が持つ) まで自動的に
+    // 切り上げられ、常に全ボタンが x>=0 に収まる
+    paned.set_shrink_start_child(false);
     root.append(&paned);
 
     let title = path
@@ -753,5 +761,59 @@ mod tests {
     #[test]
     fn plain_text_is_untouched() {
         assert_eq!(gvariant_escape("『本』を読みました"), "『本』を読みました");
+    }
+
+    fn outline_item(
+        title: &str,
+        page: Option<usize>,
+        children: Vec<crate::reader::outline::OutlineItem>,
+    ) -> crate::reader::outline::OutlineItem {
+        crate::reader::outline::OutlineItem { title: title.to_string(), page, children }
+    }
+
+    #[test]
+    fn clamp_outline_drops_a_page_beyond_total_pages() {
+        let items = vec![outline_item("A", Some(9998), vec![])];
+
+        let clamped = clamp_outline(items, 2);
+
+        assert_eq!(clamped[0].page, None, "総ページ数を超えた飛び先は飛べない扱いにする");
+    }
+
+    #[test]
+    fn clamp_outline_rejects_the_exact_boundary_but_keeps_one_below() {
+        let total_pages = 5;
+        let items = vec![
+            outline_item("最終ページ", Some(total_pages - 1), vec![]),
+            outline_item("範囲外", Some(total_pages), vec![]),
+        ];
+
+        let clamped = clamp_outline(items, total_pages);
+
+        assert_eq!(
+            clamped[0].page,
+            Some(total_pages - 1),
+            "p == total_pages - 1 は文書内の最終ページなので生き残ること"
+        );
+        assert_eq!(
+            clamped[1].page, None,
+            "p == total_pages はその文書には存在しないページなので弾くこと"
+        );
+    }
+
+    #[test]
+    fn clamp_outline_reaches_into_children() {
+        let items = vec![outline_item(
+            "親",
+            Some(0),
+            vec![outline_item("子", Some(9998), vec![])],
+        )];
+
+        let clamped = clamp_outline(items, 2);
+
+        assert_eq!(
+            clamped[0].children[0].page, None,
+            "子項目の飛び先も総ページ数でクランプされること"
+        );
     }
 }

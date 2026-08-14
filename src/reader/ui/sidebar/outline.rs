@@ -62,6 +62,9 @@ impl Outline {
 }
 
 /// 木を深さ優先で平らにする。`depth` は行に付けるインデントの段数
+///
+/// 深さの上限を設けずに再帰する。安全なのは唯一の生成元である `outline::read`
+/// (`outline.rs`) が深さ 16 で打ち切っているからで、この関数単体には歯止めが無い
 fn flatten<'a>(items: &'a [OutlineItem], depth: usize, out: &mut Vec<(&'a OutlineItem, usize)>) {
     for item in items {
         out.push((item, depth));
@@ -75,6 +78,8 @@ fn build_row(item: &OutlineItem, depth: usize) -> gtk::ListBoxRow {
     let label = gtk::Label::new(Some(&title));
     label.set_xalign(0.0);
     label.set_wrap(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(24);
     label.set_margin_start(8 + (depth as i32) * 16);
     label.set_margin_end(8);
     label.set_margin_top(4);

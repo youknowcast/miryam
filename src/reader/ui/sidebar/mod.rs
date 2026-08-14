@@ -18,8 +18,11 @@ pub struct Sidebar {
     #[allow(dead_code)]
     stack: gtk::Stack,
     annotations: Rc<annotations::Annotations>,
-    // stack は widget() で取った &gtk::Widget しか掴んでいない。Outline 自体は
-    // ここで生かしておかないと widget() が指す実体ごと消える (行のクロージャも道連れ)
+    // stack.add_titled は widget を親子付けして強い GObject 参照を取るため、
+    // ここで Outline を手放しても widget (行のクロージャ含む) 自体は消えない。
+    // それでも持たせているのは stack と同じ理由 (今は使わないが、目次タブを
+    // あとから操作する制御に要るため器の時点で持たせておく) で、破棄防止が
+    // 目的ではない
     #[allow(dead_code)]
     outline: Option<outline::Outline>,
 }
@@ -60,10 +63,15 @@ impl Sidebar {
         switcher.set_stack(Some(&stack));
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        // 3 タブ (目次/注釈/検索) 分の gtk::StackSwitcher ボタンが収まる最小幅。
-        // 2 タブ時代の 280px のままだと 3 つ目のボタンが描画から欠け、
-        // 目次タブがクリックで到達できなくなる (実機で確認した実測値に余裕を足した値)
-        root.set_size_request(420, -1);
+        // ここで指定しているのは最小幅の下駄 (280) であって上限ではない。
+        // 実際にペインへ反映される最小幅は中身 (StackSwitcher のボタン数) から
+        // 決まり、3 タブなら 400px 前後まで自然に広がる。以前はここを 420 に
+        // 広げて目次タブのボタンを救おうとしたが、クリップされていたのは
+        // 末尾ではなく先頭の「目次」ボタン自身で、原因もこの幅ではなく
+        // `ui/mod.rs` 側の `paned.set_position` と `shrink-start-child` の
+        // 設定にあった。詳細は `ui/mod.rs` の
+        // `paned.set_shrink_start_child(false)` 周辺のコメント参照
+        root.set_size_request(280, -1);
         root.append(&switcher);
         root.append(&stack);
 
