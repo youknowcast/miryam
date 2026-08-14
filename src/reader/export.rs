@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn heading_for_picks_the_nearest_preceding_section() {
-        let secs = sections(&vec![sec("第1章", Some(0), vec![]), sec("第2章", Some(5), vec![])]);
+        let secs = sections(&[sec("第1章", Some(0), vec![]), sec("第2章", Some(5), vec![])]);
         assert_eq!(heading_for(&secs, 0), Some("第1章"));
         assert_eq!(heading_for(&secs, 3), Some("第1章"), "章と章の間は前の章");
         assert_eq!(heading_for(&secs, 5), Some("第2章"));
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn heading_for_returns_none_without_sections_or_before_the_first() {
         assert_eq!(heading_for(&[], 3), None, "目次が無い");
-        let secs = sections(&vec![sec("第2章", Some(5), vec![])]);
+        let secs = sections(&[sec("第2章", Some(5), vec![])]);
         assert_eq!(heading_for(&secs, 2), None, "最初の見出しより前");
     }
 
@@ -226,7 +226,7 @@ mod tests {
             hl(0, "先頭の引用", "", &[]),
             hl(0, "同じページの二つ目", "", &[]),
         ];
-        let secs = sections(&vec![sec("第1章", Some(0), vec![]), sec("第2章", Some(5), vec![])]);
+        let secs = sections(&[sec("第1章", Some(0), vec![]), sec("第2章", Some(5), vec![])]);
         let md = highlights_markdown(&hs, &secs);
         assert!(
             md.find("先頭の引用").unwrap() < md.find("同じページの二つ目").unwrap(),

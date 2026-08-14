@@ -210,7 +210,7 @@ fn split_status(stdout: &str) -> (String, u16) {
 /// GET して (HTTP ステータス, 本文) を返す。**404 をエラーにしない** —
 /// 書き出しの更新フロー (GET /notes/<id> が 404 なら新規作成に切り替える) に要る。
 /// 既存の `request` は `-f` 付きで 4xx/5xx を `curl exit 22` に潰してしまうため使えない。
-/// ここは `-s` (黙らせない) + `-w` (ステータスを末尾行に) で拾う。
+/// ここは `-f` を付けない (4xx/5xx でも curl は exit 0 のまま) + `-w` (ステータスを末尾行に) で拾う。
 /// curl 自体が死んだとき (接続不可・タイムアウト) だけ `Err`
 pub fn get_status(
     cfg: &InkdropConfig,

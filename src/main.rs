@@ -1095,6 +1095,12 @@ fn scheduled_speak(
         )
     };
     if let Some(remark) = remark {
+        // 思い出し発話も既存のキャンセル規則に従う: 発話前に in-flight の LLM を cancel
+        // しないと、返ってきた LLM 台詞がこの吹き出しを数秒後に上書きしてしまう
+        let pending = timers.borrow_mut().llm_request.take();
+        if let Some(req) = pending {
+            req.cancel();
+        }
         show_text(ui, timers, &remark);
         return;
     }
@@ -1524,6 +1530,12 @@ fn register_actions(
                     rand::rng().random_range(0..usize::MAX),
                 );
                 if let Some(remark) = remark {
+                    // 思い出し発話も既存のキャンセル規則に従う: in-flight の LLM 台詞が
+                    // この吹き出しを数秒後に上書きしないよう、先に cancel しておく
+                    let pending = timers_for_library.borrow_mut().llm_request.take();
+                    if let Some(req) = pending {
+                        req.cancel();
+                    }
                     show_text(&ui_for_library, &timers_for_library, &remark);
                 }
             }
@@ -1566,6 +1578,12 @@ fn register_actions(
                                     )
                                 });
                                 if let Some(remark) = remark {
+                                    // 思い出し発話も既存のキャンセル規則に従う: in-flight の
+                                    // LLM 台詞がこの吹き出しを数秒後に上書きしないよう先に cancel
+                                    let pending = timers_for_open.borrow_mut().llm_request.take();
+                                    if let Some(req) = pending {
+                                        req.cancel();
+                                    }
                                     show_text(&ui_for_open, &timers_for_open, &remark);
                                 }
                             }

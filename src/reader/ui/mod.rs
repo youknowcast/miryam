@@ -597,6 +597,11 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let (state, warning) = ReaderState::open(path.clone(), colors, llm, inkdrop)?;
     let state = Rc::new(RefCell::new(state));
 
+    // 窓が閉じたかどうかの共有フラグ。書き出しが GET /books や curl の途中で閉じられた
+    // とき、在庫はまだ空で cancel_all_requests が効かないため、後から走るコールバックが
+    // LLM を spawn したりサイドカーに書き込んだりしないよう、このフラグで止める
+    let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
     // サイドバーはページより後に作るので、あとから差し込む
     let sidebar_slot: Rc<RefCell<Option<Rc<sidebar::Sidebar>>>> = Rc::new(RefCell::new(None));
     let on_created: Rc<dyn Fn(&str)> = {
@@ -752,6 +757,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
 
     if let Some(button) = export_button {
         let state = state.clone();
+        let closed = closed.clone();
         // outline_items は次の行で Sidebar::new に渡す (ムーブ済み)。ここでは clone を使う
         let outline = Rc::new(outline_items.clone());
         let doc_title = doc.title().map(|t| t.to_string());
@@ -786,6 +792,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
                 &outline,
                 doc_title.clone(),
                 book_name.clone(),
+                closed.clone(),
                 on_done.clone(),
             );
         });
@@ -942,7 +949,11 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         let state = state.clone();
         let view = view.clone();
         let scrolled = scrolled.clone();
+        let closed = closed.clone();
         window.connect_close_request(move |_| {
+            // 閉じ済みであることを共有フラグに刻む。書き出しのコールバックがこのあとに
+            // 走る場合 (GET /books の間の閉窓など) に、LLM の spawn を止めるための合図
+            closed.set(true);
             let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
             let adj = scrolled.vadjustment();
             // 末尾ではクランプにより value が offsets の最終ページ開始点まで届かないので、
@@ -1011,15 +1022,18 @@ fn resolve_book_id(
 ///
 /// 窓を閉じたときのキャンセル: LLM のリクエストは `track_request` に載るので、
 /// `connect_close_request` (フェーズ 3 で配線済み) の `cancel_all_requests` でまとめて
-/// キャンセルされる。Inkdrop の curl はキャンセルできないが 10 秒タイムアウト付きで、
-/// 窓の破棄後にコールバックが触るのは state のファイル書き込みと通知だけ (GTK ウィジェット
-/// は `show_save_error` の `warn_bar` のみ — 破棄済みなら GTK が no-op で扱う)。
-/// **新しく配線するものは無い** (フェーズ 3 の判断をここに残す)
+/// キャンセルされる。ただし GET /books の間 (在庫がまだ空) に閉じた場合はそれでは
+/// 止まらないため、`closed` フラグをコールバックで確認して、LLM の spawn と
+/// サイドカー書き込み・通知を止める。Inkdrop の curl はキャンセルできないが
+/// 10 秒タイムアウト付きで、窓の破棄後にコールバックが触るのは state のファイル書き込みと
+/// 通知だけ (GTK ウィジェットは `show_save_error` の `warn_bar` のみ — 破棄済みなら
+/// GTK が no-op で扱う)
 fn run_export(
     state: &Rc<RefCell<ReaderState>>,
     outline: &Rc<Vec<crate::reader::outline::OutlineItem>>,
     doc_title: Option<String>,
     book_name: String,
+    closed: Rc<Cell<bool>>,
     on_done: Rc<dyn Fn()>,
 ) {
     // 材料 (借用はこのブロックの中だけ)。プロンプトと Markdown は純粋関数なので
@@ -1060,6 +1074,12 @@ fn run_export(
     // 先に作って共有する (フェーズ 3 の pages::run_action と同じトークン方式)
     let token: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     resolve_book_id(inkdrop.clone(), book_name, move |book_id| {
+        // 窓を閉じたあとの続行を止める。GET /books の間に閉じた場合、在庫はまだ空で
+        // cancel_all_requests が何もしないため、ここで LLM を spawn する前に確認する
+        if closed.get() {
+            on_done();
+            return;
+        }
         let Some(book_id) = book_id else {
             notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
             on_done();
@@ -1069,6 +1089,7 @@ fn run_export(
         // 3. 抄訳を LLM に 1 回だけ頼む
         let state_for_llm = state.clone();
         let token_for_cb = token.clone();
+        let closed_for_llm = closed.clone();
         let req = crate::llm::request_text(&llm, &prompt, move |raw| {
             // 返ってきたら在庫から外す (単独文。cancel_all_requests が終了済みの
             // プロセスに cancel/force_exit をかけないため — フェーズ 3 の run_action と同じ)
@@ -1097,6 +1118,7 @@ fn run_export(
                 digest_body,
                 remarks,
                 name,
+                closed_for_llm,
                 on_done,
             );
         });
@@ -1120,14 +1142,15 @@ fn finish_export(
     digest_body: String,
     remarks: Vec<String>,
     name: String,
+    closed: Rc<Cell<bool>>,
     on_done: Rc<dyn Fn()>,
 ) -> Option<String> {
     match note_id {
         Some(id) => update_note(
-            state, cfg, book_id, id, title, body, digest_body, remarks, name, on_done,
+            state, cfg, book_id, id, title, body, digest_body, remarks, name, closed, on_done,
         ),
         None => create_note(
-            state, cfg, book_id, title, body, digest_body, remarks, name, on_done,
+            state, cfg, book_id, title, body, digest_body, remarks, name, closed, on_done,
         ),
     }
 }
@@ -1143,6 +1166,7 @@ fn update_note(
     digest_body: String,
     remarks: Vec<String>,
     name: String,
+    closed: Rc<Cell<bool>>,
     on_done: Rc<dyn Fn()>,
 ) -> Option<String> {
     // コールバック (全て 'static) に掴ませるためにここで写し取る。以後の state はこれを使う
@@ -1162,6 +1186,7 @@ fn update_note(
             };
             let payload =
                 crate::reader::export::update_payload(&book_id, &id, &rev, &title, &body);
+            let closed_for_put = closed.clone();
             crate::inkdrop::request(&cfg_for_rev, "PUT", &path_for_put, Some(payload), move |res| {
                 let ok = res.is_ok();
                 if !ok {
@@ -1169,13 +1194,30 @@ fn update_note(
                     on_done();
                     return;
                 }
-                save_digest_and_notify(&state, id, digest_body, remarks, name, on_done);
+                save_digest_and_notify(
+                    &state,
+                    id,
+                    digest_body,
+                    remarks,
+                    name,
+                    closed_for_put,
+                    on_done,
+                );
             });
         }
         Ok((404, _)) => {
             // ノートが消えている。新規作成に切り替える (仕様書)
             let _ = create_note(
-                &state, cfg_for_rev, book_id, title, body, digest_body, remarks, name, on_done,
+                &state,
+                cfg_for_rev,
+                book_id,
+                title,
+                body,
+                digest_body,
+                remarks,
+                name,
+                closed,
+                on_done,
             );
         }
         Ok((status, _)) => {
@@ -1201,6 +1243,7 @@ fn create_note(
     digest_body: String,
     remarks: Vec<String>,
     name: String,
+    closed: Rc<Cell<bool>>,
     on_done: Rc<dyn Fn()>,
 ) -> Option<String> {
     let state = state.clone();
@@ -1219,7 +1262,7 @@ fn create_note(
             on_done();
             return;
         };
-        save_digest_and_notify(&state, id, digest_body, remarks, name, on_done);
+        save_digest_and_notify(&state, id, digest_body, remarks, name, closed, on_done);
     });
     None
 }
@@ -1231,8 +1274,16 @@ fn save_digest_and_notify(
     digest_body: String,
     remarks: Vec<String>,
     name: String,
+    closed: Rc<Cell<bool>>,
     on_done: Rc<dyn Fn()>,
 ) {
+    // 窓を閉じたあとで完了した場合は何もしない。書き出し自体 (Inkdrop への curl) は
+    // 途中で止められないが、閉じた窓に向けて「送りました」と知らせたり、サイドカーを
+    // 書き換えたりはしない
+    if closed.get() {
+        on_done();
+        return;
+    }
     state.borrow_mut().save_digest(crate::reader::store::DigestData {
         body: digest_body,
         remarks,
