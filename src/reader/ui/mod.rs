@@ -326,7 +326,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             }
         })
     };
-    let sidebar = sidebar::Sidebar::new(state.clone(), on_jump, redraw);
+    // 目次は Task 5 で doc から読む。今は器だけなので空を渡す
+    let sidebar = sidebar::Sidebar::new(state.clone(), on_jump, redraw, Vec::new());
     *sidebar_slot.borrow_mut() = Some(sidebar.clone());
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);

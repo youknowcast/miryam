@@ -6,7 +6,7 @@ use std::rc::Rc;
 use crate::reader::ui::ReaderState;
 
 /// 左に置く注釈一覧。ページ順に並べ、行ごとに引用文とメモを見せる
-pub struct Sidebar {
+pub struct Annotations {
     root: gtk::Box,
     list: gtk::ListBox,
     state: Rc<RefCell<ReaderState>>,
@@ -18,7 +18,7 @@ pub struct Sidebar {
     memo_entries: RefCell<Vec<(String, gtk::TextView)>>,
 }
 
-impl Sidebar {
+impl Annotations {
     pub fn new(
         state: Rc<RefCell<ReaderState>>,
         on_jump: Rc<dyn Fn(usize)>,
@@ -140,7 +140,7 @@ impl Sidebar {
         } else {
             let state = self.state.clone();
             let on_changed = self.on_changed.clone();
-            // 強参照だと list → row → button → クロージャ → Sidebar → list の循環になる
+            // 強参照だと list → row → button → クロージャ → Annotations → list の循環になる
             let me = Rc::downgrade(self);
             let id = id.to_string();
             delete.connect_clicked(move |_| {
