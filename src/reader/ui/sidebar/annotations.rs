@@ -250,6 +250,23 @@ impl Annotations {
             {
                 let state = self.state.clone();
                 let popover_slot: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+                // entry が壊れるときにここから外す (pages.rs の area.connect_destroy と同じ理由:
+                // Popover 自身の connect_closed が popover_slot を強参照するので、::closed が
+                // 発火するまで自分で自分を生かし続ける。refresh() は行ごと tags_entry を
+                // list.remove で捨てるが、それだけでは ::closed は同期的に発火しないため、
+                // ここで明示的に slot を空にして popdown + unparent する
+                {
+                    let slot = popover_slot.clone();
+                    tags_entry.connect_destroy(move |_| {
+                        let open = slot.borrow_mut().take();
+                        if let Some(p) = open {
+                            p.popdown();
+                            if p.parent().is_some() {
+                                p.unparent();
+                            }
+                        }
+                    });
+                }
                 tags_entry.connect_has_focus_notify(move |entry| {
                     if !entry.has_focus() {
                         return;
@@ -339,5 +356,18 @@ mod tests {
     #[test]
     fn parse_tags_of_an_empty_string_is_empty() {
         assert!(parse_tags("   ").is_empty());
+    }
+
+    /// 大文字小文字は別のタグとして残す (小文字化して同一視しない)
+    #[test]
+    fn parse_tags_is_case_sensitive() {
+        assert_eq!(parse_tags("A, a"), vec!["A", "a"]);
+    }
+
+    /// 全角スペース (Unicode の空白) も前後から落ちる。ASCII スペースだけを見る
+    /// 実装 (例: trim_matches(' ')) への変異を捕まえる
+    #[test]
+    fn parse_tags_trims_full_width_space() {
+        assert_eq!(parse_tags("　重要　"), vec!["重要"]);
     }
 }
