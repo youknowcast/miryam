@@ -14,6 +14,27 @@ use crate::reader::store::{self, Highlight, Sidecar};
 /// ページ間の隙間 (px)
 const PAGE_GAP: f64 = 12.0;
 
+/// しおりのページへスクロールを予約する。呼び出し時点でレイアウトが確定している
+/// (upper/page_size が実寸を反映している) ことが前提。`changed` ハンドラ経由・
+/// レイアウトが最初から確定していた即時経路のどちらからも使う共通処理
+fn schedule_bookmark_scroll(view: &pages::PageView, scrolled: &gtk::ScrolledWindow, bookmark: usize) {
+    let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
+    let Some(&y) = offsets.get(bookmark) else {
+        return;
+    };
+    // ScrolledWindow (延いては vadjustment) を次の 1 ターンまで強参照で持ち越さない。
+    // 弱参照にして upgrade できなければ何もしない (このファイルの他のクロージャと同じ流儀)
+    let scrolled_weak = scrolled.downgrade();
+    glib::idle_add_local_once(move || {
+        let Some(scrolled) = scrolled_weak.upgrade() else {
+            return;
+        };
+        // 最終ページ近くのしおりでは y + MARGIN が upper - page_size を超えることも
+        // あるが、それは GTK が最大までクランプしてくれればよい (それが正しい挙動)
+        scrolled.vadjustment().set_value(y + geom::MARGIN);
+    });
+}
+
 /// 開いている PDF とその注釈。UI 全体で 1 つを共有する
 pub struct ReaderState {
     pub pdf_path: PathBuf,
@@ -348,6 +369,25 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     // レイアウトが実際に確定して upper/page_size が更新されたときに飛ぶ vadjustment の
     // `changed` シグナルを待ち、実寸が反映された最初の一回だけしおり位置を適用する。
     //
+    // ただし `changed` は必ず飛んでくるとは限らない。set_content_width/height は指定した
+    // 整数値が現状と変わらなければ何もせず早期returnし、リサイズをキューしない。fit-width
+    // の倍率がちょうど 1.0 前後 (だいたい 1.000〜1.002) に収まり、各ページのピクセル寸法が
+    // 直前 (zoom=1.0 の初期レイアウト) と同じ整数に丸まってしまう場合がこれに当たる。この
+    // まま無条件にハンドラを繋ぐと `changed` は一生発火せずセッション中ずっと残ってしまい、
+    // あとでユーザーがズームや窓のリサイズで `changed` を再発火させたときに「最初の
+    // changed」としてゲートを通ってしまい、読んでいた場所から古いしおりへ視点を飛ばして
+    // しまう (実際に発生を確認)。
+    //
+    // 判別には「apply() 前後でページごとの実ピクセル寸法 (w*z as i32 の丸め) が 1 つでも
+    // 変わるか」を直接見る。`vadj.upper() > vadj.page_size()` (スクロール可能な実コンテンツが
+    // 既にあるか) では判別できない (実機で確認済み): 複数ページの文書では、今回のリサイズが
+    // 未処理でも「他のページの分だけで」既に upper が page_size を超えていることが普通にあり、
+    // その状態で `changed` を待たずに飛ぶと、GTK がまだ反映していない古い upper に対して
+    // クランプされた中途半端な位置がそのまま確定してしまう (fit-width で大きくズームされる
+    // ケースで実際に発生を確認: scale=1.44 なのに `upper > page_size` が真になり immediate 側に
+    // 入ってしまい、クランプ後の値のまま `changed` を二度と待たなくなっていた)。ページ寸法の
+    // 比較なら、これから起こる (起こらない) リサイズそのものを直接見るので取り違えない
+    //
     // listen を始めるタイミングも重要: これを fit-width 適用より前に仕込むと、ウィンドウ表示
     // 直後・まだ等倍 (zoom=1.0) のままの初期レイアウトで最初の `changed` が飛んできてしまい
     // (GDK のフレームクロックはこの idle コールバックより優先度が高く先に 1 回走る)、その
@@ -368,11 +408,25 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let bookmark = state.borrow().sidecar.bookmark_page;
     glib::idle_add_local_once(move || {
         let (w, _) = view2.page_sizes()[0];
-        apply(geom::fit_width_scale(w, scrolled2.width() as f64));
+        let scale = geom::fit_width_scale(w, scrolled2.width() as f64);
+        let old_zoom = view2.zoom();
+        apply(scale);
 
         if bookmark == 0 {
             return;
         }
+
+        // set_zoom が実際に何かのページの content_width/height を変えたか (= リサイズを
+        // 1 つでもキューしたか) を、GTK 側の丸め (`(px * z) as i32`) と揃えて直接判定する
+        let resize_queued = view2.page_sizes().iter().any(|&(pw, ph)| {
+            (pw * old_zoom) as i32 != (pw * scale) as i32
+                || (ph * old_zoom) as i32 != (ph * scale) as i32
+        });
+        if !resize_queued {
+            schedule_bookmark_scroll(&view2, &scrolled2, bookmark);
+            return;
+        }
+
         let vadj = scrolled2.vadjustment();
         // ScrolledWindow (延いては vadjustment) が持つハンドラなので、view/scrolled を強参照で
         // 掴むと ScrolledWindow → vadjustment → ハンドラ → scrolled の循環になる。弱参照で持つ
@@ -401,21 +455,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             let (Some(view), Some(scrolled)) = (view3.upgrade(), scrolled3.upgrade()) else {
                 return;
             };
-            let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
-            let Some(&y) = offsets.get(bookmark) else {
-                return;
-            };
-            // ScrolledWindow を次の 1 ターンまで強参照で持ち越さない。弱参照にして
-            // upgrade できなければ何もしない (このファイルの他のクロージャと同じ流儀)
-            let scrolled4 = scrolled.downgrade();
-            glib::idle_add_local_once(move || {
-                let Some(scrolled) = scrolled4.upgrade() else {
-                    return;
-                };
-                // 最終ページ近くのしおりでは y + MARGIN が upper - page_size を超えることも
-                // あるが、それは GTK が最大までクランプしてくれればよい (それが正しい挙動)
-                scrolled.vadjustment().set_value(y + geom::MARGIN);
-            });
+            schedule_bookmark_scroll(&view, &scrolled, bookmark);
         });
         handler.set(Some(id));
     });

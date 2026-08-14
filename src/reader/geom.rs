@@ -47,7 +47,9 @@ pub fn visible_page(scroll_y: f64, offsets: &[f64]) -> usize {
 ///
 /// `scroll_y > 0.0` を要求するのは、ドキュメント全体がビューポートに収まっていて
 /// スクロールが一切できない (value も upper - page_size も 0) ケースを締め出すため。
-/// このとき `at_end` は (0 >= 0 という理屈で) 真になり得るが、正しい答えは先頭ページ
+/// このとき `at_end` は (0 >= 0 という理屈で) 真になり得るが、正しい答えは先頭ページ。
+/// `scroll_y` は生の adjustment value ではなく、呼び出し側 (close ハンドラ) が
+/// `adj.value() - geom::MARGIN` として渡す、左右余白を差し引いた後の値
 pub fn bookmark_page(scroll_y: f64, offsets: &[f64], at_end: bool) -> usize {
     if at_end && scroll_y > 0.0 && !offsets.is_empty() {
         return offsets.len() - 1;
@@ -143,6 +145,12 @@ mod tests {
     fn bookmark_page_at_start_is_the_first_page() {
         let offs = page_offsets(&[100.0, 200.0, 50.0], 10.0);
         assert_eq!(bookmark_page(0.0, &offs, false), 0);
+    }
+
+    #[test]
+    fn bookmark_page_with_no_pages_is_zero() {
+        // offsets が空でも offsets.len() - 1 で panic せず、先頭ページ扱いで返す
+        assert_eq!(bookmark_page(10.0, &[], true), 0);
     }
 
     #[test]
