@@ -381,13 +381,22 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         let handler: Rc<Cell<Option<glib::SignalHandlerId>>> = Rc::new(Cell::new(None));
         let handler_for_closure = handler.clone();
         let id = vadj.connect_changed(move |adj| {
-            // まだレイアウトが確定していない (upper が可視領域とほぼ同じ = 中身が反映されていない)
+            // ゲートの結果に関わらず、最初の changed で無条件に disarm する。connect は
+            // apply() の後で行っているので、これが最初の changed であれば「まだレイアウト
+            // 途中」ではなく「これが確定形」。幅合わせの結果ドキュメント全体がビューポートに
+            // 収まる (ページが短い/窓が縦に大きい) 場合はこの先のゲートを一度も通らないが、
+            // それは単にスクロールする先が無いだけで、レイアウトは確定している。ここで
+            // disconnect せずに return すると、ハンドラがセッション中ずっと生き残り、あとで
+            // ユーザーがズームや窓のリサイズで changed を再発火させたときにゲートを通って
+            // しまい、読んでいた場所から古いしおりへ視点を飛ばしてしまう (実際に発生を確認)
+            let Some(id) = handler_for_closure.take() else {
+                return;
+            };
+            adj.disconnect(id);
+
+            // upper が可視領域とほぼ同じ = ドキュメント全体が収まっていてスクロール不要
             if adj.upper() <= adj.page_size() + 1.0 {
                 return;
-            }
-            // 一度きり。以後ユーザーがスクロールしても引き戻さない
-            if let Some(id) = handler_for_closure.take() {
-                adj.disconnect(id);
             }
             let (Some(view), Some(scrolled)) = (view3.upgrade(), scrolled3.upgrade()) else {
                 return;
@@ -396,7 +405,13 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             let Some(&y) = offsets.get(bookmark) else {
                 return;
             };
+            // ScrolledWindow を次の 1 ターンまで強参照で持ち越さない。弱参照にして
+            // upgrade できなければ何もしない (このファイルの他のクロージャと同じ流儀)
+            let scrolled4 = scrolled.downgrade();
             glib::idle_add_local_once(move || {
+                let Some(scrolled) = scrolled4.upgrade() else {
+                    return;
+                };
                 // 最終ページ近くのしおりでは y + MARGIN が upper - page_size を超えることも
                 // あるが、それは GTK が最大までクランプしてくれればよい (それが正しい挙動)
                 scrolled.vadjustment().set_value(y + geom::MARGIN);
@@ -412,7 +427,13 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         let scrolled = scrolled.clone();
         window.connect_close_request(move |_| {
             let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
-            let page = geom::visible_page(scrolled.vadjustment().value() - geom::MARGIN, &offsets);
+            let adj = scrolled.vadjustment();
+            // 末尾ではクランプにより value が offsets の最終ページ開始点まで届かないので、
+            // visible_page だけだと 1 ページ手前を返す (bookmark_page 関数のコメント参照)。
+            // ここでの判定は「upper - page_size にほぼ達しているか」で、しおり復元側の
+            // ゲート (`upper <= page_size + 1.0`) と対になる考え方
+            let at_end = adj.value() >= adj.upper() - adj.page_size() - 1.0;
+            let page = geom::bookmark_page(adj.value() - geom::MARGIN, &offsets, at_end);
             let failed = {
                 let mut st = state.borrow_mut();
                 st.sidecar.bookmark_page = page;

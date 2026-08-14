@@ -40,6 +40,21 @@ pub fn visible_page(scroll_y: f64, offsets: &[f64]) -> usize {
     }
 }
 
+/// しおりに記録すべきページ。末尾までスクロールしている場合は最終ページとみなす
+/// (末尾では GtkAdjustment がクランプするため実際のスクロール位置は最終ページの開始点まで
+/// 届かず、そのまま `visible_page` に渡すと 1 ページ手前を返す。これをそのまま保存すると
+/// 開いて閉じるだけでしおりが 1 ページずつ後退していく)
+///
+/// `scroll_y > 0.0` を要求するのは、ドキュメント全体がビューポートに収まっていて
+/// スクロールが一切できない (value も upper - page_size も 0) ケースを締め出すため。
+/// このとき `at_end` は (0 >= 0 という理屈で) 真になり得るが、正しい答えは先頭ページ
+pub fn bookmark_page(scroll_y: f64, offsets: &[f64], at_end: bool) -> usize {
+    if at_end && scroll_y > 0.0 && !offsets.is_empty() {
+        return offsets.len() - 1;
+    }
+    visible_page(scroll_y, offsets)
+}
+
 /// 正規化座標の点がどれかの矩形に入っているか
 pub fn hit_test(rects: &[[f64; 4]], nx: f64, ny: f64) -> bool {
     rects
@@ -99,6 +114,35 @@ mod tests {
     #[test]
     fn visible_page_with_no_pages_is_zero() {
         assert_eq!(visible_page(10.0, &[]), 0);
+    }
+
+    #[test]
+    fn bookmark_page_at_end_with_real_scroll_is_the_last_page() {
+        let offs = page_offsets(&[100.0, 200.0, 50.0], 10.0);
+        // クランプで最終ページの開始点 (320.0) に届かず 300.0 止まりでも、
+        // 末尾までスクロールしていれば最終ページ扱いにする
+        assert_eq!(bookmark_page(300.0, &offs, true), 2);
+    }
+
+    #[test]
+    fn bookmark_page_at_end_but_scroll_zero_is_the_first_page() {
+        let offs = page_offsets(&[100.0, 200.0, 50.0], 10.0);
+        // ドキュメント全体がビューポートに収まっていて value も upper - page_size も
+        // 0 のケース。at_end は理屈上 true になり得るが、正しい答えは先頭ページ
+        assert_eq!(bookmark_page(0.0, &offs, true), 0);
+    }
+
+    #[test]
+    fn bookmark_page_mid_scroll_matches_visible_page() {
+        let offs = page_offsets(&[100.0, 200.0, 50.0], 10.0);
+        assert_eq!(bookmark_page(150.0, &offs, false), 1);
+        assert_eq!(bookmark_page(150.0, &offs, false), visible_page(150.0, &offs));
+    }
+
+    #[test]
+    fn bookmark_page_at_start_is_the_first_page() {
+        let offs = page_offsets(&[100.0, 200.0, 50.0], 10.0);
+        assert_eq!(bookmark_page(0.0, &offs, false), 0);
     }
 
     #[test]
