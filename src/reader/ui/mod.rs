@@ -378,18 +378,40 @@ fn wire_search_keys(
         });
     }
 
-    {
-        // 検索欄の × や Escape は `activate` ではなく `stop-search` を出すので、
-        // ここを繋いでおかないと欄が空になっても一覧とページ上の強調が残る。
-        // 空の語で走査し直すのと同じ経路 (一覧を空にし、実行部が強調を消す) を通す
+    // 検索をやめたときに一覧とページ上のオレンジの強調も消す。`activate` しか
+    // 繋いでいないと、欄が空になっても結果が残り続ける。
+    //
+    // **やめ方が 2 通りあり、どちらも `stop-search` だけでは拾えない** (GTK 4.22.4 の
+    // `gtk/gtksearchentry.c` を読んで確認):
+    //
+    // - `×` アイコン: `gtk_search_entry_icon_release()` はテキストを空にするだけで
+    //   シグナルを出さない。`stop-search` を出している箇所はファイル中に無い
+    // - Escape: 既定のキーバインドが `stop-search` を出すが、テキストは空にならない
+    //
+    // なので「空になったか」(`search-changed`) と「やめると言われたか」(`stop-search`)
+    // の両方を見る。backspace で欄を空にした場合も前者で拾える
+    let stop_search: Rc<dyn Fn()> = {
         let tab = sidebar.search().clone();
         let last_query = last_query.clone();
-        entry.connect_stop_search(move |_| {
+        Rc::new(move || {
             // 取り消したあとに同じ語を入れ直したら、また走査し直せるようにする
             // (`Some("foo")` を残すと次の Enter が「同じ語」と見なされてしまう)
             last_query.replace(None);
+            // 空の語で走査し直すのと同じ経路 (一覧を空にし、実行部が強調を消す)
             tab.start(String::new());
+        })
+    };
+    {
+        let stop = stop_search.clone();
+        entry.connect_search_changed(move |entry| {
+            if entry.text().is_empty() {
+                stop();
+            }
         });
+    }
+    {
+        let stop = stop_search.clone();
+        entry.connect_stop_search(move |_| stop());
     }
 
     {

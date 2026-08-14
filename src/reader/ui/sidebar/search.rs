@@ -103,7 +103,16 @@ impl SearchTab {
     }
 
     /// 一致を 1 件足して、行を 1 つ増やす。**走査の途中で 1 チャンクごとに呼ばれる**
+    ///
+    /// 一致が 0 件のページは積まない (「このページには無かった」を持つ意味が無く、
+    /// 「0 件」の行が並んでしまう)。呼び出し元の `install_search` も空なら呼ばないが、
+    /// **`status_text` が寄りかかっている `marks >= pages` を実際に守っているのはここ**
+    /// なので、呼び出し側の約束ではなくこの型自身の門番として持つ
+    /// (`Search::push_hits` が `Search::hits` に対して持っているのと同じ形)
     pub fn push(&self, hit: Hit) {
+        if hit.rects.is_empty() {
+            return;
+        }
         // 借用は 1 文で落とす。以降はコピーした値だけで組み立てる
         let index = self.hits.borrow().len();
         let (page, count) = (hit.page, hit.rects.len());

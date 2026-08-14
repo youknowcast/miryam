@@ -44,11 +44,15 @@ pub fn advance(current: Option<usize>, len: usize, delta: isize) -> Option<usize
 /// 走査中は 2. 〜 4. より優先する: 走査の途中で「見つかりませんでした」と
 /// 出してしまうと、まだ探している最中なのに無いと言うことになる
 ///
-/// **呼び出し側の不変条件:** 一致が空のページは積まれない (`Search::push_hits` /
-/// `install_search` が捨てる) ので、常に `marks >= pages` で、`pages == 0` と
-/// `marks == 0` は必ず同時に成り立つ。3. の判定をどちらで書いても実際の表示は
-/// 変わらない (テストでも区別できない) が、「1 件も一致するページが無かった」
-/// という意味に近い `pages` で書いてある
+/// **呼び出し側の不変条件:** `pages` と `marks` を数えているのはどちらも
+/// `SearchTab` (`hits` の要素数と `total_marks`) で、一致が空のページは積まれない。
+/// これを守っているのは `SearchTab::push` 冒頭の `rects.is_empty()` の門番
+/// (と、そこを呼ぶ `install_search` 側の `if !rects.is_empty()` フィルタ) であって、
+/// `Search::push_hits` **ではない** (あちらが守っているのは本文の強調に使う
+/// 別のベクタ `Search::hits`)。この門番がある限り常に `marks >= pages` で、
+/// `pages == 0` と `marks == 0` は必ず同時に成り立つので、3. の判定をどちらで
+/// 書いても実際の表示は変わらない (テストでも区別できない)。「1 件も一致する
+/// ページが無かった」という意味に近い `pages` で書いてある
 pub fn status_text(running: bool, searched: bool, pages: usize, marks: usize) -> String {
     if running {
         format!("検索中… ({marks} 件)")
