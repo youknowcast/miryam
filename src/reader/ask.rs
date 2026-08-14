@@ -24,12 +24,20 @@ pub struct Action {
     pub prompt: fn(quote: &str, history: &[LlmQa], question: &str) -> String,
 }
 
-pub const ACTIONS: &[Action] = &[Action {
-    kind: "ask",
-    label: "LLM に聞く",
-    needs_question: true,
-    prompt: ask_prompt,
-}];
+pub const ACTIONS: &[Action] = &[
+    Action {
+        kind: "ask",
+        label: "LLM に聞く",
+        needs_question: true,
+        prompt: ask_prompt,
+    },
+    Action {
+        kind: "translate",
+        label: "翻訳",
+        needs_question: false,
+        prompt: translate_prompt,
+    },
+];
 
 pub fn find(kind: &str) -> Option<&'static Action> {
     ACTIONS.iter().find(|a| a.kind == kind)
@@ -65,6 +73,15 @@ fn ask_prompt(quote: &str, history: &[LlmQa], question: &str) -> String {
     s.push_str("推測で補わず、一節から読み取れないことは読み取れないと言ってください。\n\n");
     s.push_str(question);
     s
+}
+
+/// 「翻訳」のプロンプト。**引用文だけ**を渡す (過去の問答は翻訳に無関係なので載せない)
+fn translate_prompt(quote: &str, _history: &[LlmQa], _question: &str) -> String {
+    format!(
+        "以下は英語の文章です。日本語に翻訳してください。\n\n---\n{quote}\n---\n\n\
+         翻訳文だけを出力してください。説明や補足は不要です。\n\
+         英語でない文章の場合は、その旨を簡潔に述べてください。"
+    )
 }
 
 /// LLM の出力を整える。前後の空白を落とし、長すぎる回答は切り詰める。
@@ -114,7 +131,7 @@ mod tests {
 
     #[test]
     fn find_returns_none_for_an_unknown_kind() {
-        assert!(find("translate").is_none(), "まだ足していない操作は None");
+        assert!(find("summarize").is_none(), "まだ足していない操作は None");
         assert!(find("").is_none());
     }
 
@@ -136,6 +153,29 @@ mod tests {
         assert_eq!(a.kind, "ask");
         assert_eq!(a.label, "LLM に聞く");
         assert!(a.needs_question, "「聞く」は質問文の入力を必要とする");
+    }
+
+    #[test]
+    fn the_translate_action_has_the_expected_kind_label_and_needs_question() {
+        let a = find("translate").expect("翻訳がある");
+        assert_eq!(a.kind, "translate");
+        assert_eq!(a.label, "翻訳");
+        assert!(!a.needs_question, "翻訳は質問文の入力を必要としない (方向固定)");
+    }
+
+    #[test]
+    fn the_translate_prompt_carries_the_quote_and_asks_for_japanese() {
+        let p = (find("translate").expect("翻訳がある").prompt)("English text", &[], "");
+        assert!(p.contains("English text"), "引用文が入る: {p}");
+        assert!(p.contains("日本語"), "日本語への翻訳を指示する: {p}");
+    }
+
+    #[test]
+    fn the_translate_prompt_ignores_past_exchanges() {
+        let history = [qa("ask", "前の質問", "前の答え")];
+        let p = (find("translate").expect("翻訳がある").prompt)("English text", &history, "");
+        assert!(!p.contains("前の質問"), "過去の問答は翻訳に載らない: {p}");
+        assert!(!p.contains("前の答え"), "過去の答えも載らない: {p}");
     }
 
     #[test]
@@ -254,17 +294,11 @@ mod tests {
         assert_eq!(qa_heading(&q, find("ask")), "この一節の主題は?");
     }
 
-    /// 質問を打たせない操作 (例: 将来の「翻訳」) は、操作名を見出しにする。
-    /// `find` にはまだ無いので、テスト用の操作を直接渡して確かめる
+    /// 質問を打たせない操作 (翻訳) は、操作名を見出しにする
     #[test]
     fn an_action_without_a_question_headings_with_its_label() {
-        let translate = Action {
-            kind: "translate",
-            label: "翻訳",
-            needs_question: false,
-            prompt: |_, _, _| String::new(),
-        };
-        assert_eq!(qa_heading(&qa("translate", "", "Bonjour"), Some(&translate)), "翻訳");
+        let translate = find("translate").expect("翻訳がある");
+        assert_eq!(qa_heading(&qa("translate", "", "Bonjour"), Some(translate)), "翻訳");
     }
 
     /// 知らない kind (将来のサイドカーを古いバイナリで開いた) は kind をそのまま出す。
