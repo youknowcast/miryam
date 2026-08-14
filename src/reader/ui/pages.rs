@@ -88,7 +88,7 @@ impl PageView {
                 {
                     let st = state_for_draw.borrow();
                     for h in st.sidecar.highlights.iter().filter(|h| h.page == index) {
-                        let (r, g, b) = color_rgb(&h.color);
+                        let (r, g, b) = crate::reader::config::color_rgb(&h.color);
                         cr.set_source_rgba(r, g, b, 0.35);
                         for rect in &h.rects {
                             let (x0, y0, x1, y1) = store::denormalize_rect(rect, page_w, page_h);
@@ -328,16 +328,6 @@ impl PageView {
     }
 }
 
-/// 色名 → RGB (0.0〜1.0)
-pub fn color_rgb(name: &str) -> (f64, f64, f64) {
-    match name {
-        "green" => (0.45, 0.85, 0.45),
-        "blue" => (0.45, 0.65, 0.95),
-        "pink" => (0.98, 0.55, 0.75),
-        _ => (0.98, 0.90, 0.35),
-    }
-}
-
 /// ページ座標の矩形 (2 点、順不同) から、選択された引用文と正規化済みの選択矩形群を得る。
 /// `connect_drag_update` (下書きの逐次計算) と `connect_drag_end` (確定時) の両方から呼ぶ、
 /// 領域計算の唯一の実装。文字情報が無い・空選択・矩形が空のいずれかなら None
@@ -568,7 +558,7 @@ fn show_color_popover(
             swatch.set_content_height(20);
             let c = color.clone();
             swatch.set_draw_func(move |_, cr, w, h| {
-                let (r, g, b) = color_rgb(&c);
+                let (r, g, b) = crate::reader::config::color_rgb(&c);
                 cr.set_source_rgb(r, g, b);
                 cr.rectangle(0.0, 0.0, w as f64, h as f64);
                 let _ = cr.fill();

@@ -198,12 +198,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("ページがありません");
     }
 
-    let colors = vec![
-        "yellow".to_string(),
-        "green".to_string(),
-        "blue".to_string(),
-        "pink".to_string(),
-    ];
+    let colors = crate::reader::config::load_colors();
     let (state, warning) = ReaderState::open(path.clone(), colors)?;
     let state = Rc::new(RefCell::new(state));
 

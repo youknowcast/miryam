@@ -66,6 +66,32 @@ impl ReaderConfig {
     }
 }
 
+/// reader 側で使う色の一覧を読む。
+/// **読み込みに失敗しても PDF は開けなければならない**ので、
+/// マスコットの辞書に問題があっても既定値へ落とす (理由は stderr に出す)
+pub fn load_colors() -> Vec<String> {
+    match crate::phrases::PhraseBook::load() {
+        Ok(book) => match book.reader() {
+            Some(cfg) => cfg.colors.clone(),
+            None => default_colors(),
+        },
+        Err(e) => {
+            eprintln!("miryam-reader: 設定を読めないため既定の色を使います: {e:#}");
+            default_colors()
+        }
+    }
+}
+
+/// 色名 → RGB (0.0〜1.0)
+pub fn color_rgb(name: &str) -> (f64, f64, f64) {
+    match name {
+        "green" => (0.45, 0.85, 0.45),
+        "blue" => (0.45, 0.65, 0.95),
+        "pink" => (0.98, 0.55, 0.75),
+        _ => (0.98, 0.90, 0.35),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +171,20 @@ colors = ["yellow", "green", "blue", "pink", "yellow", "green", "blue", "pink", 
             parse(r#"dir = "~""#).dir_path(),
             std::path::PathBuf::from("~")
         );
+    }
+
+    #[test]
+    fn color_rgb_knows_the_four_palette_colors() {
+        assert_eq!(color_rgb("green"), (0.45, 0.85, 0.45));
+        assert_eq!(color_rgb("blue"), (0.45, 0.65, 0.95));
+        assert_eq!(color_rgb("pink"), (0.98, 0.55, 0.75));
+        assert_eq!(color_rgb("yellow"), (0.98, 0.90, 0.35));
+    }
+
+    #[test]
+    fn color_rgb_falls_back_to_yellow_for_unknown_names() {
+        // 設定は KNOWN_COLORS で検証済みなので通常は来ないが、
+        // サイドカーに古い色名が残っている場合に備える
+        assert_eq!(color_rgb("mauve"), color_rgb("yellow"));
     }
 }
