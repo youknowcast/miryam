@@ -5,6 +5,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -49,10 +50,25 @@ pub struct ReaderState {
     save_error: Option<String>,
     /// 画面上部の警告バー。保存に失敗したことを黙って握り潰さないために持つ
     warn_bar: Option<gtk::Label>,
+    /// `[llm]` が読めない・無ければ None。None なら LLM 操作はメニューに出ない
+    /// (フェーズ 2 の `config::load_colors` と同じ考え方: 辞書の問題で本が読めなくならないこと)
+    pub llm: Option<crate::llm::LlmConfig>,
+    /// 注釈ごとの「投げてまだ返っていない」件数。1 つの注釈に複数投げられる
+    pending: HashMap<String, usize>,
+    /// 在庫の進行中 LLM リクエスト。`track_request` で加え、返ってきたら
+    /// `untrack_request` で外す。窓を閉じるときは `cancel_all_requests` で一括キャンセルする
+    requests: HashMap<u64, crate::llm::LlmRequest>,
+    next_request_id: u64,
 }
 
 impl ReaderState {
-    fn build(pdf_path: PathBuf, sidecar: Sidecar, colors: Vec<String>, read_only: bool) -> Self {
+    fn build(
+        pdf_path: PathBuf,
+        sidecar: Sidecar,
+        colors: Vec<String>,
+        read_only: bool,
+        llm: Option<crate::llm::LlmConfig>,
+    ) -> Self {
         Self {
             pdf_path,
             sidecar,
@@ -61,22 +77,30 @@ impl ReaderState {
             read_only,
             save_error: None,
             warn_bar: None,
+            llm,
+            pending: HashMap::new(),
+            requests: HashMap::new(),
+            next_request_id: 0,
         }
     }
 
     /// 開くのに失敗したときは読み取り専用にし、警告文を一緒に返す
-    pub fn open(pdf_path: PathBuf, colors: Vec<String>) -> anyhow::Result<(Self, Option<String>)> {
+    pub fn open(
+        pdf_path: PathBuf,
+        colors: Vec<String>,
+        llm: Option<crate::llm::LlmConfig>,
+    ) -> anyhow::Result<(Self, Option<String>)> {
         match Sidecar::load(&pdf_path) {
-            Ok(Some(sc)) => Ok((Self::build(pdf_path, sc, colors, false), None)),
+            Ok(Some(sc)) => Ok((Self::build(pdf_path, sc, colors, false, llm), None)),
             Ok(None) => {
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((Self::build(pdf_path, sc, colors, false), None))
+                Ok((Self::build(pdf_path, sc, colors, false, llm), None))
             }
             Err(e) => {
                 let warn = format!("{e:#}");
                 eprintln!("miryam-reader: {warn}");
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((Self::build(pdf_path, sc, colors, true), Some(warn)))
+                Ok((Self::build(pdf_path, sc, colors, true, llm), Some(warn)))
             }
         }
     }
@@ -168,6 +192,61 @@ impl ReaderState {
         }
         h.tags = tags;
         self.save();
+    }
+
+    /// LLM の問答を注釈に積む。id で探し、無ければ何もしない。
+    /// **末尾に push する** (`ask.rs` の「過去の問答は新しい方を残す」契約・`chat::push_exchange`
+    /// と同じ流儀)。積んだら `set_memo` / `set_tags` と同じく即保存する
+    /// (`save()` は `read_only` のとき早期 return するので読み取り専用では書かれない)
+    pub fn push_qa(&mut self, id: &str, qa: store::LlmQa) {
+        let Some(h) = self.sidecar.highlights.iter_mut().find(|h| h.id == id) else {
+            return;
+        };
+        h.llm.push(qa);
+        self.save();
+    }
+
+    /// その注釈で「投げてまだ返っていない」件数
+    pub fn pending_for(&self, id: &str) -> usize {
+        self.pending.get(id).copied().unwrap_or(0)
+    }
+
+    /// LLM へ投げたことを記録する (返るまで `pending_for` が増えたままになる)
+    pub fn note_pending(&mut self, id: &str) {
+        *self.pending.entry(id.to_string()).or_insert(0) += 1;
+    }
+
+    /// 1 件返ってきたので記録を減らす。0 になったら記録自体を消す
+    /// (知らない id・既に 0 の id では何もしない)
+    pub fn clear_pending(&mut self, id: &str) {
+        let Some(count) = self.pending.get_mut(id) else {
+            return;
+        };
+        if *count <= 1 {
+            self.pending.remove(id);
+        } else {
+            *count -= 1;
+        }
+    }
+
+    /// 進行中の LLM リクエストを在庫に加える。返り値は `untrack_request` に渡す識別子
+    pub fn track_request(&mut self, req: crate::llm::LlmRequest) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.requests.insert(id, req);
+        id
+    }
+
+    /// 結果が返った (または不要になった) リクエストを在庫から外す。無ければ何もしない
+    pub fn untrack_request(&mut self, id: u64) {
+        self.requests.remove(&id);
+    }
+
+    /// 進行中のリクエストを全部キャンセルする。窓を閉じるときに呼ぶ
+    pub fn cancel_all_requests(&mut self) {
+        for (_, req) in self.requests.drain() {
+            req.cancel();
+        }
     }
 
     /// 失敗しても落とさない。結果は `save_error` に残して `show_save_error` が画面に出す
@@ -468,7 +547,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     }
 
     let colors = crate::reader::config::load_colors();
-    let (state, warning) = ReaderState::open(path.clone(), colors)?;
+    let llm = crate::reader::config::load_llm();
+    let (state, warning) = ReaderState::open(path.clone(), colors, llm)?;
     let state = Rc::new(RefCell::new(state));
 
     // サイドバーはページより後に作るので、あとから差し込む
@@ -770,6 +850,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             let page = geom::bookmark_page(adj.value() - geom::MARGIN, &offsets, at_end);
             let failed = {
                 let mut st = state.borrow_mut();
+                // 窓を閉じるので、返ってきていない LLM リクエストはここで全部キャンセルする
+                st.cancel_all_requests();
                 st.sidecar.bookmark_page = page;
                 st.sidecar.opened_at = chrono::Local::now();
                 st.save();
@@ -867,7 +949,7 @@ mod tests {
     /// 開いてハイライトを 1 件足した状態にする (この時点で sidecar は保存済み)
     fn opened_with_one(pdf: &std::path::Path) -> (ReaderState, String) {
         let (mut state, warning) =
-            ReaderState::open(pdf.to_path_buf(), vec!["yellow".into()]).expect("開けること");
+            ReaderState::open(pdf.to_path_buf(), vec!["yellow".into()], None).expect("開けること");
         assert!(warning.is_none(), "新規なら警告は出ない");
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
         (state, id)
@@ -965,6 +1047,136 @@ mod tests {
         assert!(state.sidecar.highlights[0].tags.is_empty(), "タグも増えない");
     }
 
+    /// テスト用の問答を作る
+    fn qa(kind: &str, q: &str, a: &str) -> store::LlmQa {
+        store::LlmQa {
+            kind: kind.into(),
+            q: q.into(),
+            a: a.into(),
+            at: chrono::Local::now(),
+        }
+    }
+
+    #[test]
+    fn push_qa_appends_and_saves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+
+        state.push_qa(&id, qa("ask", "なに?", "これ"));
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        assert_eq!(loaded.highlights[0].llm.len(), 1, "ディスクに載ること");
+        assert_eq!(loaded.highlights[0].llm[0].kind, "ask");
+        assert_eq!(loaded.highlights[0].llm[0].a, "これ");
+    }
+
+    #[test]
+    fn push_qa_appends_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, id) = opened_with_one(&pdf);
+
+        state.push_qa(&id, qa("ask", "1 つ目", "A1"));
+        state.push_qa(&id, qa("ask", "2 つ目", "A2"));
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        let qs: Vec<&str> = loaded.highlights[0].llm.iter().map(|x| x.q.as_str()).collect();
+        assert_eq!(qs, vec!["1 つ目", "2 つ目"], "古い順に積む");
+    }
+
+    #[test]
+    fn push_qa_to_an_unknown_id_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        state.push_qa("いない", qa("ask", "x", "y"));
+
+        assert!(state.sidecar.highlights[0].llm.is_empty());
+    }
+
+    #[test]
+    fn pending_counts_are_per_highlight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, a) = opened_with_one(&pdf);
+        let b = state.add_highlight(1, "yellow", vec![[0.3, 0.3, 0.4, 0.4]], "別".into());
+
+        state.note_pending(&a);
+        state.note_pending(&a);
+        state.note_pending(&b);
+        assert_eq!(state.pending_for(&a), 2, "同じ注釈に複数投げられる");
+        assert_eq!(state.pending_for(&b), 1);
+
+        state.clear_pending(&a);
+        assert_eq!(state.pending_for(&a), 1, "1 件返っても残りは待ったまま");
+        assert_eq!(state.pending_for("いない"), 0, "知らない id は 0");
+    }
+
+    /// 在庫に積んだ `LlmRequest` を token で外せること (`ask.rs` の実行部が使う経路)。
+    /// GTK は不要だが `llm::request_raw` は gio のサブプロセス機構を使うので、
+    /// llm.rs のテストと同じ流儀で MainContext を確保しシリアライズする
+    #[test]
+    fn track_request_can_be_removed_by_its_token() {
+        let _lock = crate::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().expect("acquire できること");
+        let ml = glib::MainLoop::new(None, false);
+
+        let req = crate::llm::request_raw(&["true".to_string()], 5, "prompt", |_| {});
+        let token = state.track_request(req);
+        assert_eq!(state.requests.len(), 1, "積んだら在庫が増える");
+
+        state.untrack_request(token);
+        assert_eq!(state.requests.len(), 0, "返ってきたら在庫から外れる");
+
+        // 積んだリクエストが裏で走らせた glib のソースを、次のテストへ持ち越さず掃く
+        let ml_c = ml.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || ml_c.quit());
+        ml.run();
+    }
+
+    /// 窓を閉じるときの一括キャンセルで在庫が空になり、かつ本当にキャンセルされて
+    /// on_done が呼ばれないこと。在庫を空にするだけ (`clear()` など) では
+    /// このテストは通らない — `cancel()` を呼んでいるかどうかまで見る
+    #[test]
+    fn cancel_all_requests_empties_the_inventory_and_actually_cancels() {
+        let _lock = crate::test_sync::lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().expect("acquire できること");
+        let ml = glib::MainLoop::new(None, false);
+
+        let called = Rc::new(Cell::new(false));
+        let called_a = called.clone();
+        let called_b = called.clone();
+        state.track_request(crate::llm::request_raw(&["true".into()], 5, "a", move |_| {
+            called_a.set(true);
+        }));
+        state.track_request(crate::llm::request_raw(&["true".into()], 5, "b", move |_| {
+            called_b.set(true);
+        }));
+        assert_eq!(state.requests.len(), 2, "前提: 2 件積まれている");
+
+        state.cancel_all_requests();
+        assert_eq!(state.requests.len(), 0, "キャンセルしたら在庫は空になる");
+
+        // キャンセルしていなければここで on_done が呼ばれてしまうはずの猶予を与える
+        let ml_c = ml.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || ml_c.quit());
+        ml.run();
+
+        assert!(!called.get(), "本当に cancel() されていれば on_done は呼ばれない");
+    }
+
     /// 壊れたサイドカーを置いて、その中身を返す (バイト比較の基準にする)
     fn put_broken_sidecar(pdf: &std::path::Path) -> Vec<u8> {
         let path = store::sidecar_path(pdf);
@@ -981,7 +1193,7 @@ mod tests {
         put_broken_sidecar(&pdf);
 
         let (state, warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()]).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
 
         assert!(state.read_only, "壊れていたら読み取り専用");
         let warning = warning.expect("警告文が返る");
@@ -995,7 +1207,7 @@ mod tests {
         let before = put_broken_sidecar(&pdf);
 
         let (mut state, _warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()]).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
         assert!(state.read_only, "前提: 読み取り専用");
 
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
@@ -1006,6 +1218,24 @@ mod tests {
         let after = std::fs::read(store::sidecar_path(&pdf)).expect("読めること");
         assert_eq!(after, before, "読み取り専用ではユーザーの記録を 1 バイトも書き換えない");
         assert!(!state.save_failed(), "書きに行かないので失敗も記録しない");
+    }
+
+    #[test]
+    fn read_only_never_writes_a_qa_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let before = put_broken_sidecar(&pdf);
+
+        let (mut state, _warning) =
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
+        assert!(state.read_only, "前提: 読み取り専用");
+
+        let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
+        state.push_qa(&id, qa("ask", "なに?", "これ"));
+
+        let after = std::fs::read(store::sidecar_path(&pdf)).expect("読めること");
+        assert_eq!(after, before, "壊れたファイルはバイト単位で変わらない");
+        assert!(!state.save_failed(), "読み取り専用では保存を試みないので失敗もしない");
     }
 
     #[test]

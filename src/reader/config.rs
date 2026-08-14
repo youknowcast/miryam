@@ -82,6 +82,19 @@ pub fn load_colors() -> Vec<String> {
     }
 }
 
+/// reader 側で使う LLM 設定を読む。
+/// **読み込みに失敗しても PDF は開けなければならない**ので、失敗時は None に落とす
+/// (理由は stderr に出す)。None なら LLM 操作はメニューに出ない
+pub fn load_llm() -> Option<crate::llm::LlmConfig> {
+    match crate::phrases::PhraseBook::load() {
+        Ok(book) => book.llm().cloned(),
+        Err(e) => {
+            eprintln!("miryam-reader: 設定を読めないため LLM 操作を無効にします: {e:#}");
+            None
+        }
+    }
+}
+
 /// 色名 → RGB (0.0〜1.0)
 pub fn color_rgb(name: &str) -> (f64, f64, f64) {
     match name {

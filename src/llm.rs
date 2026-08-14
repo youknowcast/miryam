@@ -23,7 +23,7 @@ fn default_timeout() -> u64 {
     30
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
     #[serde(default = "default_command")]
