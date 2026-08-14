@@ -189,6 +189,26 @@ pub fn run(path: PathBuf) -> glib::ExitCode {
     app.run_with_args::<&str>(&[])
 }
 
+/// 目次の `page` を総ページ数でクランプする。範囲外なら「飛べない」扱いにする
+/// (`None` にする) ため、`outline::read` が返し得る範囲外のページ番号が
+/// サイドバーより先に UI へ渡らないようにする関所
+fn clamp_outline(
+    items: Vec<crate::reader::outline::OutlineItem>,
+    total_pages: usize,
+) -> Vec<crate::reader::outline::OutlineItem> {
+    items
+        .into_iter()
+        .map(|item| {
+            let crate::reader::outline::OutlineItem { title, page, children } = item;
+            crate::reader::outline::OutlineItem {
+                title,
+                page: page.filter(|&p| p < total_pages),
+                children: clamp_outline(children, total_pages),
+            }
+        })
+        .collect()
+}
+
 fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let uri = glib::filename_to_uri(path, None)
         .map_err(|e| anyhow::anyhow!("パスを URI にできません: {e}"))?;
@@ -326,8 +346,12 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             }
         })
     };
-    // 目次は Task 5 で doc から読む。今は器だけなので空を渡す
-    let sidebar = sidebar::Sidebar::new(state.clone(), on_jump, redraw, Vec::new());
+    // outline::read は総ページ数を見ずに /Dest を数値化するだけなので、壊れた・
+    // 悪意ある PDF では範囲外のページ番号が返り得る (outline.rs のドキュメント参照)。
+    // ジャンプする前に総ページ数でクランプし、範囲外は「飛べない」扱いにする
+    let total_pages = usize::try_from(doc.n_pages()).unwrap_or(0);
+    let outline_items = clamp_outline(crate::reader::outline::read(&doc), total_pages);
+    let sidebar = sidebar::Sidebar::new(state.clone(), on_jump, redraw, outline_items);
     *sidebar_slot.borrow_mut() = Some(sidebar.clone());
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -337,7 +361,9 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     paned.set_start_child(Some(sidebar.widget()));
     paned.set_end_child(Some(&right));
-    paned.set_position(280);
+    // サイドバー自身の最小幅 (420px, sidebar/mod.rs 参照) に合わせる。
+    // 3 タブ分の StackSwitcher ボタンが収まる最小幅がこの値
+    paned.set_position(420);
     paned.set_resize_start_child(false);
     root.append(&paned);
 
