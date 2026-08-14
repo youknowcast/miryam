@@ -53,6 +53,9 @@ pub struct ReaderState {
     /// `[llm]` が読めない・無ければ None。None なら LLM 操作はメニューに出ない
     /// (フェーズ 2 の `config::load_colors` と同じ考え方: 辞書の問題で本が読めなくならないこと)
     pub llm: Option<crate::llm::LlmConfig>,
+    /// `[inkdrop]` が読めない・無ければ None。None なら「Inkdrop に送る」ボタンが出ない
+    /// (load_colors / load_llm と同じ考え方: 辞書の問題で本が読めなくならないこと)
+    pub inkdrop: Option<crate::inkdrop::InkdropConfig>,
     /// 注釈ごとの「投げてまだ返っていない」件数。1 つの注釈に複数投げられる
     pending: HashMap<String, usize>,
     /// 在庫の進行中 LLM リクエスト。`track_request` で加え、返ってきたら
@@ -68,6 +71,7 @@ impl ReaderState {
         colors: Vec<String>,
         read_only: bool,
         llm: Option<crate::llm::LlmConfig>,
+        inkdrop: Option<crate::inkdrop::InkdropConfig>,
     ) -> Self {
         Self {
             pdf_path,
@@ -78,6 +82,7 @@ impl ReaderState {
             save_error: None,
             warn_bar: None,
             llm,
+            inkdrop,
             pending: HashMap::new(),
             requests: HashMap::new(),
             next_request_id: 0,
@@ -89,18 +94,19 @@ impl ReaderState {
         pdf_path: PathBuf,
         colors: Vec<String>,
         llm: Option<crate::llm::LlmConfig>,
+        inkdrop: Option<crate::inkdrop::InkdropConfig>,
     ) -> anyhow::Result<(Self, Option<String>)> {
         match Sidecar::load(&pdf_path) {
-            Ok(Some(sc)) => Ok((Self::build(pdf_path, sc, colors, false, llm), None)),
+            Ok(Some(sc)) => Ok((Self::build(pdf_path, sc, colors, false, llm, inkdrop), None)),
             Ok(None) => {
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((Self::build(pdf_path, sc, colors, false, llm), None))
+                Ok((Self::build(pdf_path, sc, colors, false, llm, inkdrop), None))
             }
             Err(e) => {
                 let warn = format!("{e:#}");
                 eprintln!("miryam-reader: {warn}");
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((Self::build(pdf_path, sc, colors, true, llm), Some(warn)))
+                Ok((Self::build(pdf_path, sc, colors, true, llm, inkdrop), Some(warn)))
             }
         }
     }
@@ -236,6 +242,13 @@ impl ReaderState {
         h.llm.push(qa);
         self.save();
         true
+    }
+
+    /// 抄訳と感想台詞をサイドカーに保存する。**上書き** (1 PDF = 1 ノート)。
+    /// 積んだら即保存 (`set_memo` と同じ流儀。`save()` は `read_only` のとき早期 return する)
+    pub fn save_digest(&mut self, digest: store::DigestData) {
+        self.sidecar.digest = Some(digest);
+        self.save();
     }
 
     /// その注釈で「投げてまだ返っていない」件数
@@ -580,7 +593,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
 
     let colors = crate::reader::config::load_colors();
     let llm = crate::reader::config::load_llm();
-    let (state, warning) = ReaderState::open(path.clone(), colors, llm)?;
+    let inkdrop = crate::reader::config::load_inkdrop();
+    let (state, warning) = ReaderState::open(path.clone(), colors, llm, inkdrop)?;
     let state = Rc::new(RefCell::new(state));
 
     // サイドバーはページより後に作るので、あとから差し込む
@@ -980,8 +994,8 @@ mod tests {
 
     /// 開いてハイライトを 1 件足した状態にする (この時点で sidecar は保存済み)
     fn opened_with_one(pdf: &std::path::Path) -> (ReaderState, String) {
-        let (mut state, warning) =
-            ReaderState::open(pdf.to_path_buf(), vec!["yellow".into()], None).expect("開けること");
+        let (mut state, warning) = ReaderState::open(pdf.to_path_buf(), vec!["yellow".into()], None, None)
+            .expect("開けること");
         assert!(warning.is_none(), "新規なら警告は出ない");
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
         (state, id)
@@ -1132,6 +1146,62 @@ mod tests {
     }
 
     #[test]
+    fn save_digest_writes_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        state.save_digest(store::DigestData {
+            body: "抄訳本文".into(),
+            remarks: vec!["面白かった".into()],
+            made_at: chrono::Local::now(),
+            note_id: Some("note:abc".into()),
+        });
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        let digest = loaded.digest.expect("digest が書かれている");
+        assert_eq!(digest.body, "抄訳本文");
+        assert_eq!(digest.remarks, vec!["面白かった"]);
+        assert_eq!(digest.note_id.as_deref(), Some("note:abc"));
+    }
+
+    #[test]
+    fn save_digest_overwrites_the_previous_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        state.save_digest(store::DigestData {
+            body: "1 回目".into(), remarks: vec![], made_at: chrono::Local::now(), note_id: None,
+        });
+        state.save_digest(store::DigestData {
+            body: "2 回目".into(), remarks: vec![], made_at: chrono::Local::now(), note_id: Some("note:z".into()),
+        });
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        assert_eq!(loaded.digest.as_ref().expect("ある").body, "2 回目", "1 PDF = 1 ノートの更新");
+        assert_eq!(loaded.digest.as_ref().expect("ある").note_id.as_deref(), Some("note:z"));
+    }
+
+    #[test]
+    fn save_digest_in_read_only_mode_changes_nothing_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let before = put_broken_sidecar(&pdf);
+
+        let (mut state, _warning) = ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None)
+            .expect("開けること");
+        assert!(state.read_only, "前提: 読み取り専用");
+
+        state.save_digest(store::DigestData {
+            body: "x".into(), remarks: vec![], made_at: chrono::Local::now(), note_id: None,
+        });
+
+        let after = std::fs::read(store::sidecar_path(&pdf)).expect("読めること");
+        assert_eq!(after, before, "壊れたファイルはバイト単位で変わらない");
+    }
+
+    #[test]
     fn pending_counts_are_per_highlight() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = fixture(dir.path());
@@ -1228,7 +1298,7 @@ mod tests {
         put_broken_sidecar(&pdf);
 
         let (state, warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None).expect("開けること");
 
         assert!(state.read_only, "壊れていたら読み取り専用");
         let warning = warning.expect("警告文が返る");
@@ -1242,7 +1312,7 @@ mod tests {
         let before = put_broken_sidecar(&pdf);
 
         let (mut state, _warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None).expect("開けること");
         assert!(state.read_only, "前提: 読み取り専用");
 
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
@@ -1262,7 +1332,7 @@ mod tests {
         let before = put_broken_sidecar(&pdf);
 
         let (mut state, _warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None).expect("開けること");
         assert!(state.read_only, "前提: 読み取り専用");
 
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());

@@ -95,6 +95,19 @@ pub fn load_llm() -> Option<crate::llm::LlmConfig> {
     }
 }
 
+/// reader 側で使う Inkdrop 設定を読む。
+/// **読み込みに失敗しても PDF は開けなければならない**ので、失敗時は None に落とす
+/// (理由は stderr に出す)。None なら「Inkdrop に送る」ボタンが出ない
+pub fn load_inkdrop() -> Option<crate::inkdrop::InkdropConfig> {
+    match crate::phrases::PhraseBook::load() {
+        Ok(book) => book.inkdrop().cloned(),
+        Err(e) => {
+            eprintln!("miryam-reader: 設定を読めないため Inkdrop 連携を無効にします: {e:#}");
+            None
+        }
+    }
+}
+
 /// 色名 → RGB (0.0〜1.0)
 pub fn color_rgb(name: &str) -> (f64, f64, f64) {
     match name {
