@@ -47,6 +47,13 @@ pub fn hit_test(rects: &[[f64; 4]], nx: f64, ny: f64) -> bool {
         .any(|r| nx >= r[0] && nx <= r[2] && ny >= r[1] && ny <= r[3])
 }
 
+/// 2 つの矩形集合が異なるか。ドラッグ中の選択の再描画を、実際に選択が変わったとき
+/// (ポインタがグリフ境界をまたいだとき) だけに絞り込むための比較述語。
+/// 同じ入力を同じ計算にかければ同じ浮動小数点値が返る前提で、丸め誤差の吸収はしない
+pub fn rects_changed(prev: &[[f64; 4]], next: &[[f64; 4]]) -> bool {
+    prev != next
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +109,30 @@ mod tests {
         assert!(!hit_test(&rects, 0.8, 0.15));
         assert!(!hit_test(&rects, 0.05, 0.05));
         assert!(!hit_test(&[], 0.5, 0.5));
+    }
+
+    #[test]
+    fn rects_changed_when_length_differs() {
+        let a = [[0.0, 0.0, 0.1, 0.1]];
+        let b = [[0.0, 0.0, 0.1, 0.1], [0.2, 0.2, 0.3, 0.3]];
+        assert!(rects_changed(&a, &b));
+        assert!(rects_changed(&b, &a));
+    }
+
+    #[test]
+    fn rects_unchanged_when_identical() {
+        let a = [[0.0, 0.0, 0.1, 0.1], [0.2, 0.2, 0.3, 0.3]];
+        let b = a;
+        assert!(!rects_changed(&a, &b));
+    }
+
+    #[test]
+    fn rects_changed_from_empty_to_nonempty() {
+        assert!(rects_changed(&[], &[[0.0, 0.0, 0.1, 0.1]]));
+    }
+
+    #[test]
+    fn rects_changed_from_nonempty_to_empty() {
+        assert!(rects_changed(&[[0.0, 0.0, 0.1, 0.1]], &[]));
     }
 }

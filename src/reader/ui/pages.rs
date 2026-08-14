@@ -53,11 +53,16 @@ impl PageView {
             // 文字情報の有無。page.text() は全文抽出で重いので、実際に描かれたときに 1 回だけ調べる
             let has_text: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
 
+            // ドラッグ中だけ生きる、コミット前の選択範囲 (ページ座標を正規化した矩形群)。
+            // 保存済みハイライトと同じ形なので描画は同じ経路 (denormalize_rect) を使う
+            let live_selection: Rc<RefCell<Option<Vec<[f64; 4]>>>> = Rc::new(RefCell::new(None));
+
             // GObject の clone は参照カウント増加。選択処理でも同じページを使う
             let page_for_draw = page.clone();
             let zoom_for_draw = zoom.clone();
             let state_for_draw = state.clone();
             let has_text_for_draw = has_text.clone();
+            let live_selection_for_draw = live_selection.clone();
             // 強参照だと overlay → area → draw クロージャ → overlay の循環になる
             let overlay_for_draw = overlay.downgrade();
             area.set_draw_func(move |_area, cr, _w, _h| {
@@ -93,6 +98,17 @@ impl PageView {
                     }
                 }
 
+                // ドラッグ中の選択範囲を選択青で重ねる (マーカーの 4 色とは別の色にして、
+                // コミット前の下書きだと一目でわかるようにする)
+                if let Some(rects) = live_selection_for_draw.borrow().as_ref() {
+                    cr.set_source_rgba(0.10, 0.45, 0.95, 0.45);
+                    for rect in rects {
+                        let (x0, y0, x1, y1) = store::denormalize_rect(rect, page_w, page_h);
+                        cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+                    }
+                    let _ = cr.fill();
+                }
+
                 let _ = cr.restore();
             });
 
@@ -110,8 +126,10 @@ impl PageView {
                 });
             }
 
-            // ドラッグで本文を選び、離したところで色を選ばせる
+            // ドラッグで本文を選び、離したところで色を選ばせる。ドラッグ中は live_selection に
+            // 実際の poppler 選択領域を入れておき、上の draw_func が選択青で重ねて見せる
             let page_for_drag = page.clone();
+            let page_for_drag_update = page.clone();
             let on_created_for_drag = on_created.clone();
             let drag = gtk::GestureDrag::new();
             let selection: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
@@ -120,14 +138,70 @@ impl PageView {
                 drag.connect_drag_begin(move |_, x, y| selection.set(Some((x, y))));
             }
             {
+                // シーケンスが cancel されたとき (例: 親の ScrolledWindow のパンジェスチャに
+                // グラブを奪われた) は drag-end が来ない可能性がある。その場合でも下書きを
+                // 残さない。GTK4 は通常この後 ::end も出すが、それに頼らず無条件で消す
+                let selection = selection.clone();
+                let live_selection = live_selection.clone();
+                let area_weak = area.downgrade();
+                drag.connect_cancel(move |_, _| {
+                    selection.set(None);
+                    if let Some(area) = area_weak.upgrade() {
+                        clear_live_selection(&live_selection, &area);
+                    }
+                });
+            }
+            {
+                let selection = selection.clone();
+                let zoom = zoom.clone();
+                let page = page_for_drag_update;
+                // 強参照だと area → コントローラ → クロージャ → area の循環になる
+                let area_weak_for_update = area.downgrade();
+                let live_selection = live_selection.clone();
+                drag.connect_drag_update(move |_, dx, dy| {
+                    let Some((sx, sy)) = selection.get() else {
+                        return;
+                    };
+                    let z = zoom.get();
+                    // ウィジェット座標 → ページ座標
+                    let (x0, y0) = (sx / z, sy / z);
+                    let (x1, y1) = ((sx + dx) / z, (sy + dy) / z);
+                    // 実測 (数百語/ページの本文で ~20〜50µs、ページ内最初の 1 回でも ~1ms) は
+                    // 動きイベントの予算 (目安 8ms) を大きく下回るので compute_selection 自体は
+                    // 間引かない。だが本当のコストは選択計算ではなく毎回のページ全再描画
+                    // (DrawingArea に部分再描画は無く、draw_func は毎回 render(cr) からやり直す)
+                    // なので、再描画は選択矩形が実際に変わった (ポインタがグリフ境界をまたいだ)
+                    // ときだけに絞る。これで単語の中をゆっくり動かす間の再描画も、しきい値未満の
+                    // 微動を伴う単なるクリックの再描画も消える
+                    let rects = compute_selection(&page, x0, y0, x1, y1).map(|(_, rects)| rects);
+                    let changed = {
+                        let current = live_selection.borrow();
+                        let prev: &[[f64; 4]] = current.as_deref().unwrap_or(&[]);
+                        let next: &[[f64; 4]] = rects.as_deref().unwrap_or(&[]);
+                        geom::rects_changed(prev, next)
+                    };
+                    if !changed {
+                        return;
+                    }
+                    *live_selection.borrow_mut() = rects;
+                    if let Some(area) = area_weak_for_update.upgrade() {
+                        area.queue_draw();
+                    }
+                });
+            }
+            {
                 let selection = selection.clone();
                 let zoom = zoom.clone();
                 let page = page_for_drag;
                 let state = state.clone();
                 let area_for_popover = area.clone();
                 let slot = popover_slot.clone();
+                let live_selection = live_selection.clone();
                 drag.connect_drag_end(move |_, dx, dy| {
                     let Some((sx, sy)) = selection.replace(None) else {
+                        // 理論上しか無い経路 (drag-begin 抜きの drag-end) だが、
+                        // 早期 return はすべて live_selection を消す方針を徹底する
+                        clear_live_selection(&live_selection, &area_for_popover);
                         return;
                     };
                     let z = zoom.get();
@@ -135,42 +209,16 @@ impl PageView {
                     let (x0, y0) = (sx / z, sy / z);
                     let (x1, y1) = ((sx + dx) / z, (sy + dy) / z);
                     if (x1 - x0).abs() < 2.0 && (y1 - y0).abs() < 2.0 {
-                        return; // クリック扱い。選択にはしない
-                    }
-                    let mut rect = poppler::Rectangle::default();
-                    rect.set_x1(x0.min(x1));
-                    rect.set_y1(y0.min(y1));
-                    rect.set_x2(x0.max(x1));
-                    rect.set_y2(y0.max(y1));
-
-                    let quote = page
-                        .selected_text(poppler::SelectionStyle::Glyph, &mut rect)
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    if quote.trim().is_empty() {
-                        return; // 文字情報が無い or 空選択
-                    }
-                    let Some(region) =
-                        page.selected_region(1.0, poppler::SelectionStyle::Glyph, &mut rect)
-                    else {
+                        // クリック扱い。選択にはしない。drag_update で入った下書きも消しておく
+                        clear_live_selection(&live_selection, &area_for_popover);
                         return;
+                    }
+                    let Some((quote, rects)) = compute_selection(&page, x0, y0, x1, y1) else {
+                        clear_live_selection(&live_selection, &area_for_popover);
+                        return; // 文字情報が無い / 空選択 / 選択領域が空
                     };
-                    let (pw, ph) = page.size();
-                    let mut rects = Vec::new();
-                    for i in 0..region.num_rectangles() {
-                        let r = region.rectangle(i);
-                        rects.push(store::normalize_rect(
-                            r.x() as f64,
-                            r.y() as f64,
-                            (r.x() + r.width()) as f64,
-                            (r.y() + r.height()) as f64,
-                            pw,
-                            ph,
-                        ));
-                    }
-                    if rects.is_empty() {
-                        return;
-                    }
+                    // ここでは live_selection をまだ消さない。色ポップオーバーが開いている間も
+                    // 選択範囲を見せ続け、閉じたとき (色を選んでも Esc で消しても) に消す
                     show_color_popover(
                         &area_for_popover,
                         &slot,
@@ -181,6 +229,7 @@ impl PageView {
                         quote,
                         sx,
                         sy,
+                        live_selection.clone(),
                     );
                 });
             }
@@ -289,6 +338,57 @@ pub fn color_rgb(name: &str) -> (f64, f64, f64) {
     }
 }
 
+/// ページ座標の矩形 (2 点、順不同) から、選択された引用文と正規化済みの選択矩形群を得る。
+/// `connect_drag_update` (下書きの逐次計算) と `connect_drag_end` (確定時) の両方から呼ぶ、
+/// 領域計算の唯一の実装。文字情報が無い・空選択・矩形が空のいずれかなら None
+fn compute_selection(
+    page: &poppler::Page,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+) -> Option<(String, Vec<[f64; 4]>)> {
+    let mut rect = poppler::Rectangle::default();
+    rect.set_x1(x0.min(x1));
+    rect.set_y1(y0.min(y1));
+    rect.set_x2(x0.max(x1));
+    rect.set_y2(y0.max(y1));
+
+    let quote = page
+        .selected_text(poppler::SelectionStyle::Glyph, &mut rect)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    if quote.trim().is_empty() {
+        return None; // 文字情報が無い or 空選択
+    }
+    let region = page.selected_region(1.0, poppler::SelectionStyle::Glyph, &mut rect)?;
+    let (pw, ph) = page.size();
+    let mut rects = Vec::new();
+    for i in 0..region.num_rectangles() {
+        let r = region.rectangle(i);
+        rects.push(store::normalize_rect(
+            r.x() as f64,
+            r.y() as f64,
+            (r.x() + r.width()) as f64,
+            (r.y() + r.height()) as f64,
+            pw,
+            ph,
+        ));
+    }
+    if rects.is_empty() {
+        return None;
+    }
+    Some((quote, rects))
+}
+
+/// ドラッグ中の下書き選択を消して、消えたときだけ再描画する
+fn clear_live_selection(live: &Rc<RefCell<Option<Vec<[f64; 4]>>>>, area: &gtk::DrawingArea) {
+    let had = live.borrow_mut().take().is_some();
+    if had {
+        area.queue_draw();
+    }
+}
+
 /// 文字情報のないページに出す断り書き。
 /// cairo の toy font は字形の代替が効かず日本語が豆腐になるので Pango を使う Label にする
 fn attach_no_text_note(overlay: &gtk::Overlay) {
@@ -357,6 +457,10 @@ fn show_edit_popover(
     x: f64,
     y: f64,
 ) {
+    // live_selection を消す handler はここには付けない。クリックとドラッグは排他
+    // (押した点からのしきい値で振り分け) なので、ここに来る時点で live_selection は
+    // 既に空か、直前の色ポップオーバー自身の connect_closed で既に消されている。
+    // 順序に依存するので、new_popover の呼び出し順を変えるときは要注意
     let popover = new_popover(anchor, slot, x, y);
 
     let read_only = state.borrow().read_only;
@@ -422,8 +526,31 @@ fn show_color_popover(
     quote: String,
     x: f64,
     y: f64,
+    live_selection: Rc<RefCell<Option<Vec<[f64; 4]>>>>,
 ) {
     let popover = new_popover(anchor, slot, x, y);
+
+    // このポップオーバーが提示する選択そのものを live_selection に書き直す (new_popover が
+    // 返った後に書く)。new_popover は前のポップオーバーを同期的に popdown() し得て、それが
+    // 同じページの色ポップオーバーだった場合、その connect_closed が同じ live_selection を
+    // 消す。実際には autohide のグラブで同一ページ上の多重ドラッグ開始には到達しない見込み
+    // だが、防御として new_popover の後に書き、drag_update の最後の値との食い違いも正す
+    *live_selection.borrow_mut() = Some(rects.clone());
+    anchor.queue_draw();
+
+    // ポップオーバーが閉じたら選択青の下書きを消す。色を選んだ場合はマーカーとして
+    // add_highlight 済みなので保存済みハイライトの描画に切り替わるだけで見た目は変わらず、
+    // Esc で消した場合は下書きごと消える (どちらの経路でも closed は必ず飛ぶ)
+    {
+        let live_selection = live_selection.clone();
+        // 強参照だと popover → クロージャ → anchor (area) → ... の循環になりうるので弱参照
+        let anchor_weak = anchor.downgrade();
+        popover.connect_closed(move |_| {
+            if let Some(a) = anchor_weak.upgrade() {
+                clear_live_selection(&live_selection, &a);
+            }
+        });
+    }
 
     let read_only = state.borrow().read_only;
     if read_only {
@@ -480,4 +607,78 @@ fn show_color_popover(
 
     slot.replace(Some(popover.clone()));
     popover.popup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// 実テキストを含む最小限の 1 ページ PDF を組み立てて poppler で開く。
+    /// xref のオフセットは実際に書いたバイト数から計算するので手打ちの数値に頼らない。
+    /// `store::tests::fixture` (ヘッダだけの PDF もどき) では `selected_text` /
+    /// `selected_region` を検証できないので、ここだけ本物の内容を持たせる
+    fn text_fixture(dir: &std::path::Path) -> poppler::Document {
+        let stream = "BT /F1 24 Tf 10 150 Td (Hello selection test line) Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+        ];
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(buf.len());
+            buf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref_offset = buf.len();
+        buf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let path = dir.join("text-fixture.pdf");
+        std::fs::File::create(&path).expect("作成できること").write_all(&buf).expect("書けること");
+        poppler::Document::from_file(&format!("file://{}", path.display()), None)
+            .expect("最小 PDF を開けること")
+    }
+
+    /// 抑制 (queue_draw を選択が実際に変わったときだけ呼ぶ) の前提になっている性質。
+    /// 同じ矩形で `compute_selection` を 2 回呼んでも rects が変わらないこと
+    #[test]
+    fn compute_selection_is_stable_for_the_same_rect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        let a = compute_selection(&page, 0.0, 0.0, 150.0, 80.0).expect("選択できること");
+        let b = compute_selection(&page, 0.0, 0.0, 150.0, 80.0).expect("選択できること");
+        assert!(!geom::rects_changed(&a.1, &b.1), "同じ矩形なら rects は変化しない");
+    }
+
+    /// 選択範囲が実際に変われば rects も変わり、抑制が効かず再描画されること
+    #[test]
+    fn compute_selection_differs_when_the_rect_widens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        let narrow = compute_selection(&page, 0.0, 0.0, 60.0, 80.0).expect("選択できること");
+        let wide = compute_selection(&page, 0.0, 0.0, 300.0, 80.0).expect("選択できること");
+        assert!(geom::rects_changed(&narrow.1, &wide.1), "選択範囲が広がれば rects も変わる");
+    }
 }
