@@ -1055,6 +1055,10 @@ fn run_export(
     let state = state.clone();
 
     // 2. ノートブック ID を解決。失敗なら LLM を呼ばずに諦める
+    // 在庫の識別子はリクエストを作ったあとにしか分からないが、コールバックが走るのは
+    // 必ずメインループの次のターン以降 (spawn 失敗も idle 経由) なので、ここで置き場だけ
+    // 先に作って共有する (フェーズ 3 の pages::run_action と同じトークン方式)
+    let token: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     resolve_book_id(inkdrop.clone(), book_name, move |book_id| {
         let Some(book_id) = book_id else {
             notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
@@ -1064,7 +1068,13 @@ fn run_export(
 
         // 3. 抄訳を LLM に 1 回だけ頼む
         let state_for_llm = state.clone();
+        let token_for_cb = token.clone();
         let req = crate::llm::request_text(&llm, &prompt, move |raw| {
+            // 返ってきたら在庫から外す (単独文。cancel_all_requests が終了済みの
+            // プロセスに cancel/force_exit をかけないため — フェーズ 3 の run_action と同じ)
+            if let Some(t) = token_for_cb.get() {
+                state_for_llm.borrow_mut().untrack_request(t);
+            }
             let Some(raw) = raw else {
                 notify_miryam(&format!("『{name}』の抄訳を作れませんでした"));
                 on_done();
@@ -1090,8 +1100,10 @@ fn run_export(
                 on_done,
             );
         });
-        // 単独文 (窓を閉じたら cancel_all_requests でキャンセルされる — run_export の doc 参照)
-        state.borrow_mut().track_request(req);
+        // 単独文 (窓を閉じたら cancel_all_requests でキャンセルされる — run_export の doc 参照)。
+        // 識別子はコールバックの先頭で untrack_request に使うため、ここで共有しておく
+        let t = state.borrow_mut().track_request(req);
+        token.set(Some(t));
     });
 }
 
