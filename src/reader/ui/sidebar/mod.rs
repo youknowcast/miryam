@@ -1,5 +1,6 @@
 pub mod annotations;
 pub mod outline;
+pub mod search;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -13,11 +14,10 @@ use crate::reader::ui::ReaderState;
 /// タブごとに中身を別ファイルに分けてある (1 ファイルに詰めると借用と参照循環が絡むため)
 pub struct Sidebar {
     root: gtk::Box,
-    // 今はタブを足すだけで使わないが、Task 6 で検索タブへ切り替えるといった
-    // 制御に要る。器の時点で持たせておく
-    #[allow(dead_code)]
+    /// タブの切り替えに使う (`Ctrl+F` で検索タブへ移る)
     stack: gtk::Stack,
     annotations: Rc<annotations::Annotations>,
+    search: Rc<search::SearchTab>,
     // stack.add_titled は widget を親子付けして強い GObject 参照を取るため、
     // ここで Outline を手放しても widget (行のクロージャ含む) 自体は消えない。
     // それでも持たせているのは stack と同じ理由 (今は使わないが、目次タブを
@@ -49,12 +49,13 @@ impl Sidebar {
             Some(tab)
         };
 
+        // 検索タブも on_jump を使うので、annotations が消費する前に複製しておく
+        let search = search::SearchTab::new(on_jump.clone());
+
         let annotations = annotations::Annotations::new(state, on_jump, on_changed);
         stack.add_titled(annotations.widget(), Some("annotations"), "注釈");
 
-        // 検索タブの中身は Task 6 で作る
-        let search_placeholder = gtk::Label::new(Some("(準備中)"));
-        stack.add_titled(&search_placeholder, Some("search"), "検索");
+        stack.add_titled(search.widget(), Some("search"), "検索");
 
         // 起動時に選ばれているのは「注釈」
         stack.set_visible_child_name("annotations");
@@ -75,11 +76,21 @@ impl Sidebar {
         root.append(&switcher);
         root.append(&stack);
 
-        Rc::new(Self { root, stack, annotations, outline })
+        Rc::new(Self { root, stack, annotations, search, outline })
     }
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// 検索タブ。走査の実行部を預けたり、`Ctrl+F` / Enter から操作したりする
+    pub fn search(&self) -> &Rc<search::SearchTab> {
+        &self.search
+    }
+
+    /// 検索タブを前面に出す (`Ctrl+F`)
+    pub fn show_search(&self) {
+        self.stack.set_visible_child_name("search");
     }
 
     /// 注釈タブを作り直す。注釈が増減したときに呼ぶ

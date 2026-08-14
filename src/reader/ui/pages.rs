@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::reader::geom;
+use crate::reader::search::Hit;
 use crate::reader::store;
 use crate::reader::ui::ReaderState;
 
@@ -14,6 +15,9 @@ pub struct PageView {
     /// (幅, 高さ) をポイント単位で
     sizes: Vec<(f64, f64)>,
     zoom: Rc<Cell<f64>>,
+    /// ページごとの検索ヒット (正規化矩形)。`areas` と同じ並び。
+    /// 各要素は対応するページの draw クロージャと共有する
+    search_hits: Vec<Rc<RefCell<Vec<[f64; 4]>>>>,
 }
 
 impl PageView {
@@ -31,6 +35,7 @@ impl PageView {
         let zoom = Rc::new(Cell::new(1.0_f64));
         let mut areas = Vec::new();
         let mut sizes = Vec::new();
+        let mut search_hits = Vec::new();
 
         // 変数名は後続タスク (選択・ハイライト描画) がそのまま使うので、この名前を守る
         for i in 0..doc.n_pages() {
@@ -57,12 +62,17 @@ impl PageView {
             // 保存済みハイライトと同じ形なので描画は同じ経路 (denormalize_rect) を使う
             let live_selection: Rc<RefCell<Option<Vec<[f64; 4]>>>> = Rc::new(RefCell::new(None));
 
+            // このページの検索ヒット。`set_search_hits` が書き、draw クロージャが読む。
+            // 書き手は idle (走査) だけで、描画中に書き換わることはない
+            let page_hits: Rc<RefCell<Vec<[f64; 4]>>> = Rc::new(RefCell::new(Vec::new()));
+
             // GObject の clone は参照カウント増加。選択処理でも同じページを使う
             let page_for_draw = page.clone();
             let zoom_for_draw = zoom.clone();
             let state_for_draw = state.clone();
             let has_text_for_draw = has_text.clone();
             let live_selection_for_draw = live_selection.clone();
+            let page_hits_for_draw = page_hits.clone();
             // 強参照だと overlay → area → draw クロージャ → overlay の循環になる
             let overlay_for_draw = overlay.downgrade();
             area.set_draw_func(move |_area, cr, _w, _h| {
@@ -107,6 +117,20 @@ impl PageView {
                         cr.rectangle(x0, y0, x1 - x0, y1 - y0);
                     }
                     let _ = cr.fill();
+                }
+
+                // 検索ヒットを一番上に橙で重ねる (選択青ともマーカーの 4 色とも別の色にして、
+                // 「いま検索で当たっているところ」だと一目で分かるようにする)
+                {
+                    let hits = page_hits_for_draw.borrow();
+                    if !hits.is_empty() {
+                        cr.set_source_rgba(1.0, 0.55, 0.0, 0.45);
+                        for rect in hits.iter() {
+                            let (x0, y0, x1, y1) = store::denormalize_rect(rect, page_w, page_h);
+                            cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+                        }
+                        let _ = cr.fill();
+                    }
                 }
 
                 let _ = cr.restore();
@@ -286,9 +310,10 @@ impl PageView {
 
             container.append(&overlay);
             areas.push(area);
+            search_hits.push(page_hits);
         }
 
-        Ok(Self { container, areas, sizes, zoom })
+        Ok(Self { container, areas, sizes, zoom, search_hits })
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -306,6 +331,35 @@ impl PageView {
     /// 全ページを描き直す。どのページの注釈が変わったか分からないとき (サイドバーからの削除) 用
     pub fn queue_draw_all(&self) {
         for area in &self.areas {
+            area.queue_draw();
+        }
+    }
+
+    /// 検索ヒットの強調を入れ替える。**空の `hits` を渡すと全ページの強調が消える**
+    ///
+    /// 走査は少しずつ進むので、これは 1 チャンクごとに「そこまでに見つかった全部」で
+    /// 呼ばれる。毎回全ページを描き直すと重いので、**矩形集合が実際に変わった
+    /// ページだけ** `queue_draw` する (DrawingArea に部分再描画は無く、描き直しは
+    /// `render(cr)` からのやり直しになるため。`geom::rects_changed` の用途は
+    /// ドラッグ選択の抑制と同じ)
+    pub fn set_search_hits(&self, hits: Vec<Hit>) {
+        let mut next: Vec<Vec<[f64; 4]>> = vec![Vec::new(); self.areas.len()];
+        for hit in &hits {
+            // 範囲外のページ番号は捨てる (走査は総ページ数の中を歩くので通常は無い)
+            if let Some(slot) = next.get_mut(hit.page) {
+                slot.extend_from_slice(&hit.rects);
+            }
+        }
+        for (i, area) in self.areas.iter().enumerate() {
+            // 借用は比較の間だけ。書き込みと queue_draw はガードを落としてから
+            let changed = {
+                let current = self.search_hits[i].borrow();
+                geom::rects_changed(&current, &next[i])
+            };
+            if !changed {
+                continue;
+            }
+            *self.search_hits[i].borrow_mut() = std::mem::take(&mut next[i]);
             area.queue_draw();
         }
     }
@@ -369,6 +423,28 @@ fn compute_selection(
         return None;
     }
     Some((quote, rects))
+}
+
+/// ページ内の `query` の一致をすべて探し、正規化矩形 (左上原点) にして返す。
+/// 一致が無ければ空。全文検索の走査から 1 ページにつき 1 回呼ぶ
+///
+/// **`find_text` は PDF 座標 (左下原点) で返す。`selected_region` (左上原点) とは
+/// 別の系なので上下を反転してから正規化する。** 実測 (下のテスト): 300x200 のページで
+/// 下から 150pt の位置 (ベースライン) に置いた文字が y1=145.0 / y2=167.2 で返る。
+/// 反転せずに `normalize_rect` へ渡すと、強調がページの上下逆の位置に出る
+///
+/// 大文字小文字は `find_text` の既定どおり区別しない
+pub fn find_hits(page: &poppler::Page, query: &str) -> Vec<[f64; 4]> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let (page_w, page_h) = page.size();
+    page.find_text(query)
+        .iter()
+        .map(|r| {
+            store::normalize_rect(r.x1(), page_h - r.y2(), r.x2(), page_h - r.y1(), page_w, page_h)
+        })
+        .collect()
 }
 
 /// ドラッグ中の下書き選択を消して、消えたときだけ再描画する
@@ -670,5 +746,52 @@ mod tests {
         let narrow = compute_selection(&page, 0.0, 0.0, 60.0, 80.0).expect("選択できること");
         let wide = compute_selection(&page, 0.0, 0.0, 300.0, 80.0).expect("選択できること");
         assert!(geom::rects_changed(&narrow.1, &wide.1), "選択範囲が広がれば rects も変わる");
+    }
+
+    /// `find_text` の座標系 (左下原点) を左上原点に直せていること。
+    /// fixture は 300x200 のページの下から 150pt (= 上から 50pt) の位置に 1 行だけ持つので、
+    /// 正しく反転できていれば矩形はページの上半分に来る。反転を忘れると下半分に出る
+    #[test]
+    fn find_hits_are_flipped_to_top_left_origin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        let hits = find_hits(&page, "selection");
+
+        assert_eq!(hits.len(), 1, "1 か所だけ一致すること");
+        let [x0, y0, x1, y1] = hits[0];
+        assert!(y1 < 0.5, "上半分に来ること (左下原点のままなら y は 0.7 台になる): {y1}");
+        assert!(y0 < y1, "y0 が上、y1 が下");
+        assert!(x0 > 0.0 && x1 <= 1.0 && x0 < x1, "x は左から右へ: {x0}..{x1}");
+    }
+
+    #[test]
+    fn find_hits_is_case_insensitive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        // find_text の既定は大文字小文字を区別しない。検索欄の入力をそのまま渡す前提
+        assert_eq!(find_hits(&page, "SELECTION"), find_hits(&page, "selection"));
+    }
+
+    #[test]
+    fn find_hits_of_an_absent_word_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        assert!(find_hits(&page, "そんな語は無い").is_empty());
+    }
+
+    /// 空の検索語で `find_text` を呼ぶと全ページが一致扱いになりかねないので手前で止める
+    #[test]
+    fn find_hits_with_an_empty_query_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        assert!(find_hits(&page, "").is_empty());
     }
 }

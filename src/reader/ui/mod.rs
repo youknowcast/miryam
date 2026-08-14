@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::reader::geom;
+use crate::reader::search;
 use crate::reader::store::{self, Highlight, Sidecar};
 
 /// ページ間の隙間 (px)
@@ -213,6 +214,199 @@ fn clamp_outline(
         .collect()
 }
 
+/// 全文検索の走査部を組み立てて検索タブへ預ける。**探すのは PDF 本文だけ**
+///
+/// メインループを止めないよう、`glib::idle_add_local` で 1 回につき
+/// `search::CHUNK_PAGES` ページずつ進む。一致は出るたびにタブへ足すので、
+/// 走査が全部終わるのを待たずに結果が並び始める
+///
+/// **借用の約束:** `current` (`Search`) を借りたまま `find_text` も UI 更新も呼ばない。
+/// `Search::hits_for` のように借用を返す API を歩いている最中に `push_hits` を呼ぶと
+/// `BorrowMutError` になり、idle (= FFI の向こう) から呼ばれているので abort する。
+/// 借用は「範囲を取り出すブロック」と「結果を積んで写し取るブロック」の 2 つに閉じ、
+/// どちらもコピーした値だけを外へ渡す
+fn install_search(
+    doc: &poppler::Document,
+    tab: &Rc<sidebar::search::SearchTab>,
+    view: &Rc<pages::PageView>,
+) {
+    // 走査でページを 1 枚ずつ触るので手元に持っておく (GObject の clone は参照カウント
+    // 増加なので、PageView が持っているのと同じページを指す)。読めないページに当たったら
+    // そこで打ち切り、その手前までを検索対象にする (`PageView::new` が全ページを読めて
+    // いなければ窓自体が開かないので、実際には起こらないはず)
+    let mut collected = Vec::new();
+    for i in 0..doc.n_pages() {
+        let Some(page) = doc.page(i) else {
+            eprintln!("miryam-reader: {} ページ目が読めないので検索対象から外します", i + 1);
+            break;
+        };
+        collected.push(page);
+    }
+    let pages = Rc::new(collected);
+
+    // 検索を始めるたびに 1 つ進める。古い idle は自分の世代と食い違ったら黙って降りる
+    let generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    let current: Rc<RefCell<Option<search::Search>>> = Rc::new(RefCell::new(None));
+
+    // このクロージャは SearchTab が持つので、tab を強参照で掴むと
+    // SearchTab → runner → SearchTab の循環になる。view も同じ理由で弱参照にする
+    let tab_weak = Rc::downgrade(tab);
+    let view_weak = Rc::downgrade(view);
+    let runner: sidebar::search::Runner = Rc::new(move |query: String| {
+        // 進行中の走査を捨てる。古い idle が生きていても世代が違えば何もせず降りる
+        let this_generation = generation.get().wrapping_add(1);
+        generation.set(this_generation);
+        // 前の検索の強調を消す
+        if let Some(view) = view_weak.upgrade() {
+            view.set_search_hits(Vec::new());
+        }
+        if query.trim().is_empty() {
+            *current.borrow_mut() = None;
+            return;
+        }
+        *current.borrow_mut() = Some(search::Search::new(query, pages.len()));
+
+        let pages = pages.clone();
+        let generation = generation.clone();
+        let current = current.clone();
+        let tab_weak = tab_weak.clone();
+        let view_weak = view_weak.clone();
+        glib::idle_add_local(move || {
+            // 自分より新しい検索が始まっていたらここで終わり
+            if generation.get() != this_generation {
+                return glib::ControlFlow::Break;
+            }
+            // 窓が閉じたあとまで走り続けない
+            let (Some(tab), Some(view)) = (tab_weak.upgrade(), view_weak.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+
+            // (1) 走査する範囲と検索語を取り出す。借用はこのブロックの中だけ
+            let chunk = {
+                let mut slot = current.borrow_mut();
+                slot.as_mut().map(|s| (s.query.clone(), s.take_chunk(search::CHUNK_PAGES)))
+            };
+            let Some((query, range)) = chunk else {
+                return glib::ControlFlow::Break;
+            };
+
+            // (2) 借用を持たずに poppler を叩く
+            let mut found = Vec::new();
+            for index in range {
+                let Some(page) = pages.get(index) else {
+                    continue;
+                };
+                let rects = pages::find_hits(page, &query);
+                if !rects.is_empty() {
+                    found.push(search::Hit { page: index, rects });
+                }
+            }
+
+            // (3) 見つかった分を積み、進行状況を写し取る。借用はこのブロックの中だけ
+            let (all_hits, done) = {
+                let mut slot = current.borrow_mut();
+                let Some(s) = slot.as_mut() else {
+                    return glib::ControlFlow::Break;
+                };
+                for hit in &found {
+                    s.push_hits(hit.page, hit.rects.clone());
+                }
+                // 何も見つからなかったチャンクでは強調の入れ替えごと省く
+                let all = (!found.is_empty()).then(|| s.hits.clone());
+                (all, s.is_done())
+            };
+
+            // (4) ここではもう何も借りていない。UI を触ってよい
+            for hit in found {
+                tab.push(hit);
+            }
+            if let Some(all) = all_hits {
+                view.set_search_hits(all);
+            }
+            if done {
+                tab.set_running(false);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    });
+    tab.set_runner(runner);
+}
+
+/// 検索欄の Enter / Shift+Enter と、窓全体の `Ctrl+F` を配線する
+fn wire_search_keys(
+    window: &gtk::ApplicationWindow,
+    entry: &gtk::SearchEntry,
+    sidebar: &Rc<sidebar::Sidebar>,
+) {
+    // 最後に走査を始めた語。Enter を「新しく検索する」と「次の一致へ飛ぶ」で使い分ける
+    let last_query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+    {
+        let tab = sidebar.search().clone();
+        let sidebar = sidebar.clone();
+        let last_query = last_query.clone();
+        // entry → ハンドラ → Sidebar (→ SearchTab) の向きしかない。Sidebar 側は
+        // ツールバーの entry を知らないので循環しない
+        entry.connect_activate(move |entry| {
+            let query = entry.text().to_string();
+            // 借用は 1 文で落とす
+            let same = *last_query.borrow() == query;
+            if same {
+                tab.next();
+                return;
+            }
+            last_query.replace(query.clone());
+            sidebar.show_search();
+            tab.start(query);
+        });
+    }
+
+    {
+        // Shift+Enter で前の一致へ。SearchEntry の既定では Enter (activate) しか
+        // 拾えないので、修飾キー付きだけをここで横取りする
+        let tab = sidebar.search().clone();
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, state| {
+            let enter = matches!(
+                keyval,
+                gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
+            );
+            if enter && state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                tab.prev();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        entry.add_controller(key);
+    }
+
+    {
+        // Ctrl+F: 検索タブを出して検索欄へフォーカスを移す。ページ側のジェスチャや
+        // 他のウィジェットに先に食われないよう capture 相で受ける
+        let sidebar = sidebar.clone();
+        // 窓 → コントローラ → クロージャ → entry と辿れてしまうと、entry は窓の子なので
+        // 参照が輪になる。弱参照で持ち、取れなければ何もしない
+        let entry_weak = entry.downgrade();
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key.connect_key_pressed(move |_, keyval, _, state| {
+            if !state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                || !matches!(keyval, gtk::gdk::Key::f | gtk::gdk::Key::F)
+            {
+                return glib::Propagation::Proceed;
+            }
+            sidebar.show_search();
+            if let Some(entry) = entry_weak.upgrade() {
+                entry.grab_focus();
+            }
+            glib::Propagation::Stop
+        });
+        window.add_controller(key);
+    }
+}
+
 fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let uri = glib::filename_to_uri(path, None)
         .map_err(|e| anyhow::anyhow!("パスを URI にできません: {e}"))?;
@@ -265,6 +459,14 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     toolbar.append(&zoom_label);
     toolbar.append(&zoom_in);
     toolbar.append(&fit);
+
+    // 本文の全文検索。走査の中身は install_search / wire_search_keys で後から繋ぐ
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("本文を検索 (Ctrl+F)"));
+    search_entry.set_hexpand(true);
+    search_entry.set_halign(gtk::Align::End);
+    search_entry.set_width_chars(20);
+    toolbar.append(&search_entry);
 
     let apply_zoom = {
         let view = view.clone();
@@ -357,6 +559,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     let outline_items = clamp_outline(crate::reader::outline::read(&doc), total_pages);
     let sidebar = sidebar::Sidebar::new(state.clone(), on_jump, redraw, outline_items);
     *sidebar_slot.borrow_mut() = Some(sidebar.clone());
+    install_search(&doc, sidebar.search(), &view);
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
     right.append(&toolbar);
@@ -386,6 +589,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         .default_height(800)
         .child(&root)
         .build();
+    wire_search_keys(&window, &search_entry, &sidebar);
     window.present();
 
     // 開いた直後は幅合わせにする。合わせたあとしおりのページへ飛ぶ。

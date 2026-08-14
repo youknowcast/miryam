@@ -3,9 +3,17 @@
 //! 検索はメインループを止めないよう idle で少しずつ進める。ここはその
 //! 「どこまで進んだか」「何が見つかったか」だけを持つ。
 
-/// 1 回の idle で走査するページ数の初期値。
-/// **実測して調整すること** (1 回の idle が 8ms を超えないのが目安)
-pub const CHUNK_PAGES: usize = 32;
+/// 1 回の idle で走査するページ数。
+///
+/// **実測値 (release/debug とも同程度、poppler の C 側が支配的なので差が出ない):**
+/// groff で作った文字の詰まった 366 ページの PDF (`.ll 6i` 幅、1 ページ 40 行超) を
+/// `find_hits` (正規化込み) で全ページ走査したところ、1 ページあたり概ね 0.7〜0.8ms。
+/// 元の 32 は 1 チャンクあたり平均 21〜33ms・最大 35ms となり、8ms の目安を大きく超えていた。
+/// 実機で `install_search` の idle クロージャそのものを計測しても同じ桁 (32 ページで
+/// 20〜35ms) だったので、UI 側の追加コスト (`tab.push` の行構築・`set_search_hits` の
+/// 比較・`queue_draw`) は無視できる程度で、find_text 自体が支配的と確認できた。
+/// 6 ページなら実測で最大 7.4ms・平均 5ms 前後に収まったので、この値を採用する
+pub const CHUNK_PAGES: usize = 6;
 
 /// 1 ページ分の一致。`rects` は正規化座標 (左上原点、0.0〜1.0)
 #[derive(Debug, Clone, PartialEq)]
@@ -65,17 +73,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_pages_default_is_32() {
-        assert_eq!(CHUNK_PAGES, 32);
+    fn chunk_pages_default_is_6() {
+        // 実測 (レポート参照): groff 製 366 ページの詰まった PDF で 1 ページ 0.7〜0.8ms、
+        // 32 ページ単位だと最大 35ms/チャンクとなり 8ms の目安を大きく超えた。
+        // 6 ページなら最大 7.4ms・平均 5ms 前後に収まる
+        assert_eq!(CHUNK_PAGES, 6);
     }
 
     #[test]
     fn chunks_walk_the_document_and_then_stop() {
         let mut s = Search::new("x".into(), 70);
         assert_eq!(s.query, "x");
-        assert_eq!(s.take_chunk(CHUNK_PAGES), 0..32);
-        assert_eq!(s.take_chunk(CHUNK_PAGES), 32..64);
-        assert_eq!(s.take_chunk(CHUNK_PAGES), 64..70, "端は総ページ数で止まる");
+        let mut start = 0;
+        while start < 70 {
+            let end = (start + CHUNK_PAGES).min(70);
+            assert_eq!(s.take_chunk(CHUNK_PAGES), start..end);
+            start = end;
+        }
+        assert_eq!(start, 70, "端は総ページ数で止まる");
         assert!(s.is_done());
         assert_eq!(s.take_chunk(CHUNK_PAGES), 70..70, "終わったあとは空の範囲");
     }
