@@ -87,7 +87,8 @@ pub struct Annotations {
 }
 
 /// `refresh` が一覧へ並べる 1 行分のデータ。借用を落としてから `build_row` に渡す
-struct RowData {    id: String,
+struct RowData {
+    id: String,
     page: usize,
     quote: String,
     memo: String,
