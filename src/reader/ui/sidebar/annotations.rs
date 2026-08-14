@@ -22,13 +22,21 @@ fn parse_tags(input: &str) -> Vec<String> {
     out
 }
 
-/// 同じ PDF 内で既に使われているタグを重複なく集める (補完候補用)。
-/// `Annotations` のメソッドにせず `state` だけを取るのは、補完のクロージャが
-/// `Rc<Annotations>` を強参照で抱え込んで循環を作らないようにするため
-fn known_tags(state: &Rc<RefCell<ReaderState>>) -> Vec<String> {
+/// `filter` が `None` なら常に一致 (絞り込みなし)。`Some(tag)` なら
+/// `tags` にその文字列と全く同じ要素があるときだけ一致する。
+/// 空文字列は「タグが無い」ことを表さない — 空 `tags` は空文字列フィルタにも一致しない
+fn matches_filter(tags: &[String], filter: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some(want) => tags.iter().any(|t| t == want),
+    }
+}
+
+/// 渡された `Highlight` 全体からタグを重複なく、初出順に集める (絞り込み欄の選択肢用)
+fn collect_tags(highlights: &[crate::reader::store::Highlight]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for h in &state.borrow().sidecar.highlights {
+    for h in highlights {
         for tag in &h.tags {
             if seen.insert(tag.clone()) {
                 out.push(tag.clone());
@@ -36,6 +44,13 @@ fn known_tags(state: &Rc<RefCell<ReaderState>>) -> Vec<String> {
         }
     }
     out
+}
+
+/// 同じ PDF 内で既に使われているタグを重複なく集める (補完候補用)。
+/// `Annotations` のメソッドにせず `state` だけを取るのは、補完のクロージャが
+/// `Rc<Annotations>` を強参照で抱え込んで循環を作らないようにするため
+fn known_tags(state: &Rc<RefCell<ReaderState>>) -> Vec<String> {
+    collect_tags(&state.borrow().sidecar.highlights)
 }
 
 /// 左に置く注釈一覧。ページ順に並べ、行ごとに引用文とメモを見せる
@@ -49,6 +64,18 @@ pub struct Annotations {
     on_changed: Rc<dyn Fn()>,
     /// ハイライト ID → メモ入力欄。`focus_memo` が引く
     memo_entries: RefCell<Vec<(String, gtk::TextView)>>,
+    /// タグでの絞り込み UI。「すべて」+ `collect_tags` の結果を並べる
+    filter_dropdown: gtk::DropDown,
+    /// 絞り込みの選択状態そのもの (`None` は「すべて」)。ドロップダウンの
+    /// 選択インデックスではなくタグ文字列で持つのは、`refresh()` のたびに
+    /// 選択肢の並びが変わりうるため
+    filter: RefCell<Option<String>>,
+    /// 直近で `filter_dropdown` に並べたタグ (先頭の「すべて」を除く)。
+    /// 選択インデックス → タグ文字列の変換に使う
+    filter_options: RefCell<Vec<String>>,
+    /// `refresh()` が `filter_dropdown` のモデルや選択を書き換えている間、
+    /// その `notify::selected` を「ユーザーが選び直した」と誤認しないためのガード
+    updating_filter: std::cell::Cell<bool>,
 }
 
 impl Annotations {
@@ -65,12 +92,19 @@ impl Annotations {
         scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scrolled.set_child(Some(&list));
 
+        // 選択肢は refresh() が毎回作り直すので、ここでは空の状態で置いておく
+        let filter_dropdown = gtk::DropDown::from_strings(&["すべて"]);
+        filter_dropdown.set_margin_start(8);
+        filter_dropdown.set_margin_end(8);
+        filter_dropdown.set_margin_bottom(4);
+
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.set_size_request(280, -1);
         let header = gtk::Label::new(Some("注釈"));
         header.set_margin_top(8);
         header.set_margin_bottom(4);
         root.append(&header);
+        root.append(&filter_dropdown);
         root.append(&scrolled);
 
         let me = Rc::new(Self {
@@ -80,7 +114,37 @@ impl Annotations {
             on_jump,
             on_changed,
             memo_entries: RefCell::new(Vec::new()),
+            filter_dropdown,
+            filter: RefCell::new(None),
+            filter_options: RefCell::new(Vec::new()),
+            updating_filter: std::cell::Cell::new(false),
         });
+
+        // 強参照だと dropdown → クロージャ → Annotations → root → dropdown の循環になる
+        // (delete ボタンの connect_clicked と同じ理由)。DropDown 自体は root の子として
+        // Annotations と寿命を共にするので、破棄時に別途始末するものは無い
+        {
+            let weak = Rc::downgrade(&me);
+            me.filter_dropdown.connect_selected_notify(move |dd| {
+                let Some(me) = weak.upgrade() else {
+                    return;
+                };
+                // refresh() 自身がモデル/選択を書き換えている最中の発火は無視する。
+                // ここで refresh() を呼び返すと再入して借用が重なりかねない
+                if me.updating_filter.get() {
+                    return;
+                }
+                let selected = dd.selected() as usize;
+                let tag = if selected == 0 {
+                    None
+                } else {
+                    me.filter_options.borrow().get(selected - 1).cloned()
+                };
+                *me.filter.borrow_mut() = tag;
+                me.refresh();
+            });
+        }
+
         me.refresh();
         me
     }
@@ -98,19 +162,41 @@ impl Annotations {
 
         // 読み取り専用のときは「書けたように見えて保存されない」状態を作らない
         let read_only = self.state.borrow().read_only;
+        let all_tags = collect_tags(&self.state.borrow().sidecar.highlights);
+
+        // 選んでいたタグがもう誰も持っていない (最後の 1 件のタグ欄を書き換えた、など)
+        // なら「すべて」に戻す。選んだままにすると選択肢に無い値を保持し続けてしまう
+        {
+            let mut filter = self.filter.borrow_mut();
+            if let Some(tag) = filter.as_ref()
+                && !all_tags.iter().any(|t| t == tag)
+            {
+                *filter = None;
+            }
+        }
+        let filter_value = self.filter.borrow().clone();
+
+        self.sync_filter_dropdown(&all_tags, filter_value.as_deref());
+
         let mut items: Vec<(String, usize, String, String, Vec<String>)> = self
             .state
             .borrow()
             .sidecar
             .highlights
             .iter()
+            .filter(|h| matches_filter(&h.tags, filter_value.as_deref()))
             .map(|h| (h.id.clone(), h.page, h.quote.clone(), h.memo.clone(), h.tags.clone()))
             .collect();
         // ページ順。同じページ内は作った順のまま (sort_by_key は安定)
         items.sort_by_key(|(_, page, _, _, _)| *page);
 
         if items.is_empty() {
-            let empty = gtk::Label::new(Some("まだマーカーがありません"));
+            let text = if filter_value.is_some() {
+                "このタグのマーカーはありません"
+            } else {
+                "まだマーカーがありません"
+            };
+            let empty = gtk::Label::new(Some(text));
             empty.set_margin_top(12);
             empty.set_wrap(true);
             self.list.append(&empty);
@@ -120,6 +206,29 @@ impl Annotations {
         for (id, page, quote, memo, tags) in items {
             self.list.append(&self.build_row(&id, page, &quote, &memo, &tags, read_only));
         }
+    }
+
+    /// 絞り込み用ドロップダウンの選択肢を最新のタグ一覧に合わせて作り直し、
+    /// `filter_value` に対応する項目を選び直す。選択の書き換え自体が
+    /// `notify::selected` を発火させるので、その間は `updating_filter` で
+    /// ハンドラ側に無視させる
+    fn sync_filter_dropdown(&self, all_tags: &[String], filter_value: Option<&str>) {
+        self.updating_filter.set(true);
+
+        let mut labels: Vec<&str> = vec!["すべて"];
+        labels.extend(all_tags.iter().map(String::as_str));
+        let model = gtk::StringList::new(&labels);
+        self.filter_dropdown.set_model(Some(&model));
+
+        let selected = match filter_value {
+            None => 0,
+            Some(tag) => all_tags.iter().position(|t| t == tag).map(|i| i + 1).unwrap_or(0),
+        };
+        self.filter_dropdown.set_selected(selected as u32);
+
+        *self.filter_options.borrow_mut() = all_tags.to_vec();
+
+        self.updating_filter.set(false);
     }
 
     /// 指定 ID のメモ欄にフォーカスする。マーカーを引いた直後にそのまま書けるように
@@ -369,5 +478,67 @@ mod tests {
     #[test]
     fn parse_tags_trims_full_width_space() {
         assert_eq!(parse_tags("　重要　"), vec!["重要"]);
+    }
+
+    #[test]
+    fn no_filter_matches_everything() {
+        assert!(matches_filter(&[], None));
+        assert!(matches_filter(&["重要".into()], None));
+    }
+
+    #[test]
+    fn a_filter_matches_only_rows_carrying_that_tag() {
+        let tags = vec!["重要".to_string(), "あとで".to_string()];
+        assert!(matches_filter(&tags, Some("重要")));
+        assert!(!matches_filter(&tags, Some("保留")));
+        assert!(!matches_filter(&[], Some("重要")), "タグ無しは絞り込みに残らない");
+    }
+
+    /// タグだけを差し替えた Highlight を作る。他のフィールドはこのテストでは見ない
+    fn hl(tags: &[&str]) -> crate::reader::store::Highlight {
+        crate::reader::store::Highlight {
+            id: "x".into(),
+            page: 0,
+            color: "yellow".into(),
+            rects: vec![[0.0, 0.0, 0.1, 0.1]],
+            quote: "q".into(),
+            memo: String::new(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            llm: vec![],
+            created_at: chrono::Local::now(),
+        }
+    }
+
+    #[test]
+    fn collect_tags_is_deduped_and_in_first_seen_order() {
+        let hs = vec![hl(&["b", "a"]), hl(&["a", "c"]), hl(&[])];
+        assert_eq!(collect_tags(&hs), vec!["b", "a", "c"]);
+    }
+
+    /// フィルタが空文字列のとき (タグ欄が空のまま選ばれることは無いはずだが、
+    /// 空文字列という値そのものは「一致しない」を返す健全な振る舞いにしておく)
+    #[test]
+    fn empty_string_filter_matches_nothing_unless_the_tag_itself_is_empty() {
+        assert!(!matches_filter(&["重要".into()], Some("")));
+    }
+
+    #[test]
+    fn collect_tags_of_no_highlights_is_empty() {
+        assert!(collect_tags(&[]).is_empty());
+    }
+
+    /// 大文字小文字を区別する (parse_tags と同じ扱い)。ここを崩すと
+    /// `t.eq_ignore_ascii_case(want)` のような変異が素通りしてしまう
+    #[test]
+    fn matches_filter_is_case_sensitive() {
+        assert!(!matches_filter(&["A".into()], Some("a")));
+        assert!(matches_filter(&["a".into()], Some("a")));
+    }
+
+    /// collect_tags も大文字小文字を同一視しない (parse_tags と同じ扱い)
+    #[test]
+    fn collect_tags_is_case_sensitive() {
+        let hs = vec![hl(&["A"]), hl(&["a"])];
+        assert_eq!(collect_tags(&hs), vec!["A", "a"]);
     }
 }
