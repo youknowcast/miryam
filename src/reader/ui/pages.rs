@@ -3,6 +3,7 @@ use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use crate::reader::ask;
 use crate::reader::geom;
 use crate::reader::search::Hit;
 use crate::reader::store;
@@ -512,6 +513,184 @@ fn read_only_note(text: &str) -> gtk::Label {
     msg
 }
 
+/// 選択範囲について LLM に投げる。**ここに来る時点でハイライトの id は確定している**
+///
+/// **借用の規律:** 材料 (設定・引用文・過去の問答) は 1 つのブロックの中で写し取り、
+/// そこを出たら何も借りていない状態にする。プロンプトの組み立ても LLM の呼び出しも
+/// 借用を持たずに行う。返ってきたあとのコールバックはメインループの後で走るので、
+/// そこでも `state.borrow_mut()` は単独の文にしてガードを即落とす
+/// (ここは FFI の向こうから呼ばれる。`BorrowMutError` で panic すると abort する)
+fn run_action(
+    state: &Rc<RefCell<ReaderState>>,
+    on_changed: &Rc<dyn Fn(&str)>,
+    action: &'static ask::Action,
+    id: &str,
+    question: String,
+) {
+    // 設定とプロンプトを作る。借用はこのブロックの中だけで終わらせる。
+    // プロンプトの組み立ては操作ごとの関数 (ask.rs) で、GTK にも state にも触らない
+    // 純粋な計算なので、借用したまま呼んでも借用が重なることはない
+    // (`LlmQa` は Clone ではないので、過去の問答は写し取らずここで読む)
+    let material = {
+        let st = state.borrow();
+        let llm = st.llm.clone();
+        let found = st.sidecar.highlights.iter().find(|h| h.id == id);
+        match (llm, found) {
+            (Some(cfg), Some(h)) => Some((cfg, (action.prompt)(&h.quote, &h.llm, &question))),
+            _ => None,
+        }
+    };
+    let Some((cfg, prompt)) = material else {
+        // ボタンを出す条件を満たしていない ([llm] が無い) か、注釈が消えた。何も蓄積しない
+        ReaderState::show_notice(state, "LLM の設定か、聞く先の注釈が見つかりません");
+        return;
+    };
+
+    state.borrow_mut().note_pending(id);
+
+    // 在庫の識別子はリクエストを作ったあとにしか分からないが、コールバックが走るのは
+    // 必ずメインループの次のターン以降 (spawn 失敗も idle 経由) なので、ここで置き場だけ
+    // 先に作って共有する
+    let token: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+    let request = {
+        let state = state.clone();
+        let on_changed = on_changed.clone();
+        let token = token.clone();
+        let id = id.to_string();
+        crate::llm::request_text(&cfg, &prompt, move |raw| {
+            if let Some(t) = token.get() {
+                state.borrow_mut().untrack_request(t);
+            }
+            state.borrow_mut().clear_pending(&id);
+
+            // 失敗・タイムアウト・空出力はその場で知らせるだけ。**何も蓄積しない**
+            let Some(raw) = raw else {
+                ReaderState::show_notice(
+                    &state,
+                    &format!("「{}」に失敗しました (応答が無いかタイムアウト)", action.label),
+                );
+                return;
+            };
+            let Some(answer) = ask::postprocess(&raw) else {
+                ReaderState::show_notice(
+                    &state,
+                    &format!("「{}」の答えが空でした", action.label),
+                );
+                return;
+            };
+
+            let qa = store::LlmQa {
+                kind: action.kind.to_string(),
+                q: question,
+                a: answer,
+                at: chrono::Local::now(),
+            };
+            state.borrow_mut().push_qa(&id, qa);
+            // 積んだあとの保存が失敗したことを黙って捨てない (state を借りていない状態で呼ぶ)
+            ReaderState::show_save_error(&state);
+            // 空文字は「一覧を作り直すだけ」(メモ欄へ焦点は移さない)
+            on_changed("");
+        })
+    };
+    let t = state.borrow_mut().track_request(request);
+    token.set(Some(t));
+}
+
+/// ポップオーバーの中身を質問の入力欄に差し替える。`Enter` で送信、`Esc` で取り消し
+///
+/// **ここでは既定のモーダル (`set_autohide(true)`) のままにする。** フェーズ 2 でタグ補完の
+/// ポップオーバーを非モーダルにしたのは、**入力欄がポップオーバーの外**にあって打鍵を
+/// 横取りされたからで、ここは逆に入力欄がポップオーバーの中にある。モーダルのグラブは
+/// 打鍵をこの入力欄へ届けるために要る。`Esc` で閉じるのも外を押して閉じるのも
+/// `gtk::Popover` 自身の作りに任せられる (取り消しても `resolve_id` を呼ばないので
+/// ハイライトも作られず、何も残らない)
+fn show_question_entry(
+    popover: &gtk::Popover,
+    state: &Rc<RefCell<ReaderState>>,
+    on_changed: &Rc<dyn Fn(&str)>,
+    action: &'static ask::Action,
+    resolve_id: Rc<dyn Fn() -> Option<String>>,
+) {
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("聞きたいことを書いて Enter"));
+    entry.set_width_chars(28);
+
+    {
+        let state = state.clone();
+        let on_changed = on_changed.clone();
+        // 強参照だと popover → 入力欄 → クロージャ → popover の循環になる
+        let popover_weak = popover.downgrade();
+        // Enter 連打で二重に投げない (押した瞬間に閉じるので通常は届かないが、
+        // 送信の一度きりは色ボタンの take() と同じくここで担保する)
+        let sent = Rc::new(Cell::new(false));
+        entry.connect_activate(move |e| {
+            let question = e.text().trim().to_string();
+            if question.is_empty() || sent.replace(true) {
+                return;
+            }
+            // 先に閉じて読書に戻れるようにする。返事は待たない
+            if let Some(p) = popover_weak.upgrade() {
+                p.popdown();
+            }
+            let Some(id) = resolve_id() else {
+                return;
+            };
+            run_action(&state, &on_changed, action, &id, question);
+        });
+    }
+
+    popover.set_child(Some(&entry));
+    entry.grab_focus();
+}
+
+/// 選択範囲についての LLM 操作を `container` に並べる。
+///
+/// **次の 2 つを両方満たすときだけ出す:** `[llm]` があること・読み取り専用でないこと。
+/// 読み取り専用で聞けてしまうと「答えたのに保存されない」形になる
+///
+/// `resolve_id` は投げる先のハイライト id を確定する (まだ無ければ作る)。
+/// 押されるまで呼ばないので、取り消したときには何も作られない
+fn append_ask_buttons(
+    popover: &gtk::Popover,
+    container: &gtk::Box,
+    state: &Rc<RefCell<ReaderState>>,
+    on_changed: &Rc<dyn Fn(&str)>,
+    resolve_id: Rc<dyn Fn() -> Option<String>>,
+) {
+    let enabled = {
+        let st = state.borrow();
+        st.llm.is_some() && !st.read_only
+    };
+    if !enabled {
+        return;
+    }
+
+    for action in ask::ACTIONS {
+        let button = gtk::Button::with_label(action.label);
+        let state = state.clone();
+        let on_changed = on_changed.clone();
+        let resolve_id = resolve_id.clone();
+        // 強参照だと popover → 中身 → button → クロージャ → popover の循環になる
+        let popover_weak = popover.downgrade();
+        button.connect_clicked(move |_| {
+            let Some(popover) = popover_weak.upgrade() else {
+                return;
+            };
+            if action.needs_question {
+                show_question_entry(&popover, &state, &on_changed, action, resolve_id.clone());
+                return;
+            }
+            // 質問文の要らない操作は入力欄を出さずに即実行する。先に閉じる
+            popover.popdown();
+            let Some(id) = resolve_id() else {
+                return;
+            };
+            run_action(&state, &on_changed, action, &id, String::new());
+        });
+        container.append(&button);
+    }
+}
+
 /// 既存マーカーをクリックしたときのポップオーバー (メモへ移動 / 削除)。
 /// 読み取り専用のときはどちらも出さず、その理由を出す
 fn show_edit_popover(
@@ -535,12 +714,22 @@ fn show_edit_popover(
         // 将来 読み取り専用でも注釈を持てるようになったときのための一貫した扱い
         popover.set_child(Some(&read_only_note("読み取り専用のため編集できません")));
     } else {
+        // 操作は縦に積む: 1 行目がメモ / 削除、その下に LLM 操作
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let memo = gtk::Button::with_label("メモを書く");
         let delete = gtk::Button::with_label("削除");
         row.append(&memo);
         row.append(&delete);
-        popover.set_child(Some(&row));
+        content.append(&row);
+
+        // 既存のハイライトなので id はもう決まっている (2 つ目以降の質問はこちらから投げる)
+        let resolve_id: Rc<dyn Fn() -> Option<String>> = {
+            let id = id.to_string();
+            Rc::new(move || Some(id.clone()))
+        };
+        append_ask_buttons(&popover, &content, state, on_changed, resolve_id);
+        popover.set_child(Some(&content));
 
         {
             let on_changed = on_changed.clone();
@@ -624,6 +813,8 @@ fn show_color_popover(
     } else {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let colors = state.borrow().colors.clone();
+        // 色を選ばずに LLM へ聞いたときに使う既定色。色が空なら color_rgb の既定と揃える
+        let default_color = colors.first().cloned().unwrap_or_else(|| "yellow".to_string());
         // 色ボタンは 1 度だけ効く。2 度押しでハイライトが増えないよう take() で取り出す
         let shared = Rc::new(RefCell::new(Some((rects, quote))));
         for color in colors {
@@ -668,7 +859,45 @@ fn show_color_popover(
             });
             row.append(&button);
         }
-        popover.set_child(Some(&row));
+
+        // 操作は縦に積む: 1 行目が色、その下に LLM 操作
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.append(&row);
+
+        // **まだハイライトは作られていない。** 押されたときに初めて既定色で作り、
+        // その id に対して投げる (色ボタンと同じ `shared` を take するので、
+        // どちらか一方しか作らない)。押されなければ何も作らない
+        let resolve_id: Rc<dyn Fn() -> Option<String>> = {
+            let state = state.clone();
+            let on_created = on_created.clone();
+            let shared = shared.clone();
+            // 同じポップオーバーから 2 度呼ばれても増やさない (作った id を覚えておく)
+            let created: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+            // 強参照だと popover → 中身 → button → クロージャ → anchor (area) → ... の
+            // 循環になりうるので弱参照
+            let anchor_weak = anchor.downgrade();
+            Rc::new(move || {
+                // 借用は 1 文で落とす。この先で add_highlight / on_created を呼ぶ
+                let existing = created.borrow().clone();
+                if existing.is_some() {
+                    return existing;
+                }
+                let taken = shared.borrow_mut().take();
+                let (rects, quote) = taken?;
+                let id = state.borrow_mut().add_highlight(page, &default_color, rects, quote);
+                // 保存に失敗していたら警告バーに出す (state を借りていない状態で呼ぶ)
+                ReaderState::show_save_error(&state);
+                if let Some(a) = anchor_weak.upgrade() {
+                    a.queue_draw();
+                }
+                created.replace(Some(id.clone()));
+                // 空文字は「一覧を作り直すだけ」。メモ欄へ焦点は移さない (読書に戻れること)
+                on_created("");
+                Some(id)
+            })
+        };
+        append_ask_buttons(&popover, &content, state, on_created, resolve_id);
+        popover.set_child(Some(&content));
     }
 
     slot.replace(Some(popover.clone()));

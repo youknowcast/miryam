@@ -140,6 +140,24 @@ impl ReaderState {
         }
     }
 
+    /// 保存とは関係のない一時的な知らせ (LLM が答えを返せなかった、など) を警告バーに出す。
+    /// **state を借りたまま呼ばないこと** (中で `borrow` する)
+    ///
+    /// `show_save_error` と同じバーを使う。次に保存が成功したときに消えるので、
+    /// 古い知らせが画面に残り続けることはない。**ここでは何も蓄積しない**
+    /// (失敗した問答をサイドカーに書かない) のが要点
+    pub fn show_notice(state: &Rc<RefCell<Self>>, msg: &str) {
+        let bar = {
+            let st = state.borrow();
+            st.warn_bar.clone()
+        };
+        let Some(bar) = bar else {
+            return;
+        };
+        bar.set_text(msg);
+        bar.set_visible(true);
+    }
+
     pub fn add_highlight(
         &mut self,
         page: usize,
