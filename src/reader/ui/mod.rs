@@ -4,7 +4,7 @@ pub mod sidebar;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -337,7 +337,31 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         .build();
     window.present();
 
-    // 開いた直後は幅合わせにする。合わせたあとしおりのページへ飛ぶ
+    // 開いた直後は幅合わせにする。合わせたあとしおりのページへ飛ぶ。
+    //
+    // しおり側は fit-width の適用より後、かつ GTK のレイアウトが実際に確定してから動く必要が
+    // ある。set_zoom はページの set_content_width/height を変えてリサイズをキューするだけで、
+    // GtkAdjustment の upper は GTK の次のレイアウトパスまで古いまま。同じコールバックの中で
+    // vadjustment().set_value() を呼ぶと、値はまだ小さすぎる upper に対してクランプされ、
+    // 0 に落ちてしまう (GtkAdjustment::set_value は失敗を出さず黙ってクランプする)。
+    //
+    // レイアウトが実際に確定して upper/page_size が更新されたときに飛ぶ vadjustment の
+    // `changed` シグナルを待ち、実寸が反映された最初の一回だけしおり位置を適用する。
+    //
+    // listen を始めるタイミングも重要: これを fit-width 適用より前に仕込むと、ウィンドウ表示
+    // 直後・まだ等倍 (zoom=1.0) のままの初期レイアウトで最初の `changed` が飛んできてしまい
+    // (GDK のフレームクロックはこの idle コールバックより優先度が高く先に 1 回走る)、その
+    // ときの offsets はまだ fit-width 後の寸法ではないので誤ったスクロール位置を計算して
+    // 自分を切り離してしまう。connect は apply() の後、この idle コールバックの中で行う。
+    //
+    // さらに、`changed` ハンドラの中で直接 vadjustment().set_value() を呼んではいけない
+    // (実機で確認済み): このハンドラはまさにいま処理中のリサイズの途中で飛んでくるので、
+    // ここで set_value しても GTK 側がまだ続けているそのリサイズの残りの処理 (ビューポート
+    // 自身のスクロール位置維持ロジック) に、`value-changed` を発火させないまま上書きされて
+    // 消える。プロパティの読み出しは変更後の値を返す (借用は壊れていないように見える) のに、
+    // 実際に描画される内容は追従しない。呼び出しスタックを抜けてから
+    // (`changed` の中で `glib::idle_add_local_once` により次の 1 ターン後に) 設定することで
+    // GTK 自身の後処理が終わってから安全に反映できる
     let apply = apply_zoom.clone();
     let view2 = view.clone();
     let scrolled2 = scrolled.clone();
@@ -345,11 +369,40 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     glib::idle_add_local_once(move || {
         let (w, _) = view2.page_sizes()[0];
         apply(geom::fit_width_scale(w, scrolled2.width() as f64));
-        let offsets = geom::page_offsets(&view2.scaled_heights(), PAGE_GAP);
-        if let Some(y) = offsets.get(bookmark) {
-            // container の set_margin_top(MARGIN) 分だけページ 0 の上端がずれている
-            scrolled2.vadjustment().set_value(*y + geom::MARGIN);
+
+        if bookmark == 0 {
+            return;
         }
+        let vadj = scrolled2.vadjustment();
+        // ScrolledWindow (延いては vadjustment) が持つハンドラなので、view/scrolled を強参照で
+        // 掴むと ScrolledWindow → vadjustment → ハンドラ → scrolled の循環になる。弱参照で持つ
+        let view3 = Rc::downgrade(&view2);
+        let scrolled3 = scrolled2.downgrade();
+        let handler: Rc<Cell<Option<glib::SignalHandlerId>>> = Rc::new(Cell::new(None));
+        let handler_for_closure = handler.clone();
+        let id = vadj.connect_changed(move |adj| {
+            // まだレイアウトが確定していない (upper が可視領域とほぼ同じ = 中身が反映されていない)
+            if adj.upper() <= adj.page_size() + 1.0 {
+                return;
+            }
+            // 一度きり。以後ユーザーがスクロールしても引き戻さない
+            if let Some(id) = handler_for_closure.take() {
+                adj.disconnect(id);
+            }
+            let (Some(view), Some(scrolled)) = (view3.upgrade(), scrolled3.upgrade()) else {
+                return;
+            };
+            let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
+            let Some(&y) = offsets.get(bookmark) else {
+                return;
+            };
+            glib::idle_add_local_once(move || {
+                // 最終ページ近くのしおりでは y + MARGIN が upper - page_size を超えることも
+                // あるが、それは GTK が最大までクランプしてくれればよい (それが正しい挙動)
+                scrolled.vadjustment().set_value(y + geom::MARGIN);
+            });
+        });
+        handler.set(Some(id));
     });
 
     // 閉じるときにしおりと最終閲覧日時を書き、マスコットへ読了を知らせる
