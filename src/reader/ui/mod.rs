@@ -127,7 +127,7 @@ impl ReaderState {
         };
         match msg {
             Some(msg) => {
-                bar.set_text(&format!("注釈を保存できません: {msg}"));
+                bar.set_text(&crate::reader::ui_logic::save_error_text(&msg));
                 bar.set_visible(true);
             }
             // 読み取り専用の警告は保存失敗とは別物なので消さない
@@ -146,15 +146,21 @@ impl ReaderState {
     /// `show_save_error` と同じバーを使う。次に保存が成功したときに消えるので、
     /// 古い知らせが画面に残り続けることはない。**ここでは何も蓄積しない**
     /// (失敗した問答をサイドカーに書かない) のが要点
+    ///
+    /// **保存に失敗したままのときは、その文言を消さずに上へ残して併記する。**
+    /// 単に上書きすると「注釈を保存できません」が画面から消え、`show_save_error` は
+    /// 次に呼ばれるまで書き戻さないので、**保存できていない事実が誰にも伝わらないまま
+    /// になる** (一時的な知らせが恒久的な失敗を隠してはいけない)
     pub fn show_notice(state: &Rc<RefCell<Self>>, msg: &str) {
-        let bar = {
+        let (bar, save_error) = {
             let st = state.borrow();
-            st.warn_bar.clone()
+            (st.warn_bar.clone(), st.save_error.clone())
         };
         let Some(bar) = bar else {
             return;
         };
-        bar.set_text(msg);
+        // 文言の組み立ては ui_logic (GTK 非依存・テスト付き)
+        bar.set_text(&crate::reader::ui_logic::warn_bar_text(save_error.as_deref(), msg));
         bar.set_visible(true);
     }
 
@@ -216,12 +222,20 @@ impl ReaderState {
     /// **末尾に push する** (`ask.rs` の「過去の問答は新しい方を残す」契約・`chat::push_exchange`
     /// と同じ流儀)。積んだら `set_memo` / `set_tags` と同じく即保存する
     /// (`save()` は `read_only` のとき早期 return するので読み取り専用では書かれない)
-    pub fn push_qa(&mut self, id: &str, qa: store::LlmQa) {
+    ///
+    /// **返り値は「積めたか」。** 投げてから返るまでの間にそのマーカーが消されている
+    /// ことがある (答えは 20 秒後に返る)。そのとき黙って捨てると、`save()` も走らないので
+    /// `save_error` は `None` のままになり、続けて `show_save_error` を呼ぶと
+    /// 「保存に成功した」枝に入って警告バーを消してしまう。**呼び出し側は false を
+    /// 受け取ったら、そのことを画面に出すこと** (`show_notice`)
+    #[must_use]
+    pub fn push_qa(&mut self, id: &str, qa: store::LlmQa) -> bool {
         let Some(h) = self.sidecar.highlights.iter_mut().find(|h| h.id == id) else {
-            return;
+            return false;
         };
         h.llm.push(qa);
         self.save();
+        true
     }
 
     /// その注釈で「投げてまだ返っていない」件数
@@ -1081,7 +1095,7 @@ mod tests {
         let pdf = fixture(dir.path());
         let (mut state, id) = opened_with_one(&pdf);
 
-        state.push_qa(&id, qa("ask", "なに?", "これ"));
+        assert!(state.push_qa(&id, qa("ask", "なに?", "これ")), "積めたと返すこと");
 
         let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
         assert_eq!(loaded.highlights[0].llm.len(), 1, "ディスクに載ること");
@@ -1095,21 +1109,24 @@ mod tests {
         let pdf = fixture(dir.path());
         let (mut state, id) = opened_with_one(&pdf);
 
-        state.push_qa(&id, qa("ask", "1 つ目", "A1"));
-        state.push_qa(&id, qa("ask", "2 つ目", "A2"));
+        assert!(state.push_qa(&id, qa("ask", "1 つ目", "A1")));
+        assert!(state.push_qa(&id, qa("ask", "2 つ目", "A2")));
 
         let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
         let qs: Vec<&str> = loaded.highlights[0].llm.iter().map(|x| x.q.as_str()).collect();
         assert_eq!(qs, vec!["1 つ目", "2 つ目"], "古い順に積む");
     }
 
+    /// 投げてから返るまでの間にマーカーが消されている経路。**黙って捨てたと分かること**
+    /// (false を返さないと、呼び出し側は積めたと思って `show_save_error` を呼び、
+    /// `save_error` が `None` のままなので警告バーを消してしまう)
     #[test]
-    fn push_qa_to_an_unknown_id_changes_nothing() {
+    fn push_qa_to_an_unknown_id_changes_nothing_and_says_so() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = fixture(dir.path());
         let (mut state, _id) = opened_with_one(&pdf);
 
-        state.push_qa("いない", qa("ask", "x", "y"));
+        assert!(!state.push_qa("いない", qa("ask", "x", "y")), "積めなかったと返すこと");
 
         assert!(state.sidecar.highlights[0].llm.is_empty());
     }
@@ -1249,7 +1266,8 @@ mod tests {
         assert!(state.read_only, "前提: 読み取り専用");
 
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
-        state.push_qa(&id, qa("ask", "なに?", "これ"));
+        // 手元の注釈には積む (返り値は「その id があったか」で、書けたかではない)
+        assert!(state.push_qa(&id, qa("ask", "なに?", "これ")));
 
         let after = std::fs::read(store::sidecar_path(&pdf)).expect("読めること");
         assert_eq!(after, before, "壊れたファイルはバイト単位で変わらない");

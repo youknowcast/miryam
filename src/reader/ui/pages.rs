@@ -585,7 +585,20 @@ fn run_action(
                 a: answer,
                 at: chrono::Local::now(),
             };
-            state.borrow_mut().push_qa(&id, qa);
+            let stored = state.borrow_mut().push_qa(&id, qa);
+            if !stored {
+                // 投げてから返るまでの間にマーカーが消された。**黙って捨てない**
+                // (ここで show_save_error を呼ぶと、保存が走っていない = save_error が
+                // None なので「成功した」枝に入って警告バーを消してしまう)
+                ReaderState::show_notice(
+                    &state,
+                    &format!(
+                        "「{}」の答えを残せませんでした (聞いたマーカーが見つかりません)",
+                        action.label
+                    ),
+                );
+                return;
+            }
             // 積んだあとの保存が失敗したことを黙って捨てない (state を借りていない状態で呼ぶ)
             ReaderState::show_save_error(&state);
             // 空文字は「一覧を作り直すだけ」(メモ欄へ焦点は移さない)
@@ -645,8 +658,8 @@ fn show_question_entry(
 
 /// 選択範囲についての LLM 操作を `container` に並べる。
 ///
-/// **次の 2 つを両方満たすときだけ出す:** `[llm]` があること・読み取り専用でないこと。
-/// 読み取り専用で聞けてしまうと「答えたのに保存されない」形になる
+/// **出す条件の判断は `ui_logic::ask_actions_enabled` にある** (GTK 非依存・テスト付き)。
+/// `[llm]` があること・読み取り専用でないことの両方が要る
 ///
 /// `resolve_id` は投げる先のハイライト id を確定する (まだ無ければ作る)。
 /// 押されるまで呼ばないので、取り消したときには何も作られない
@@ -657,9 +670,10 @@ fn append_ask_buttons(
     on_changed: &Rc<dyn Fn(&str)>,
     resolve_id: Rc<dyn Fn() -> Option<String>>,
 ) {
+    // 借用は述語に渡す真偽値を写し取る間だけ
     let enabled = {
         let st = state.borrow();
-        st.llm.is_some() && !st.read_only
+        crate::reader::ui_logic::ask_actions_enabled(st.llm.is_some(), st.read_only)
     };
     if !enabled {
         return;
