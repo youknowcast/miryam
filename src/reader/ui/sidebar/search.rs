@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::reader::search::Hit;
+use crate::reader::ui_logic::{STATUS_IDLE, advance, status_text};
 
 /// 走査の実行部。検索語を受け取って走査を始める
 pub type Runner = Rc<dyn Fn(String)>;
@@ -139,16 +140,11 @@ impl SearchTab {
     }
 
     fn step(&self, delta: isize) {
+        // 「次はどれか」の判断は `ui_logic::advance` にある (GTK 非依存・テスト付き)。
+        // ここは借用を短く保って結果をウィジェットへ流すだけ
         let len = self.hits.borrow().len();
-        if len == 0 {
+        let Some(index) = advance(self.current.get(), len, delta) else {
             return;
-        }
-        let index = match self.current.get() {
-            // まだどこにもいないなら、進むときは先頭・戻るときは末尾から始める
-            None if delta > 0 => 0,
-            None => len - 1,
-            // `rem_euclid` は負でも 0..len に収まるので、はみ出しで落ちない
-            Some(i) => (i as isize + delta).rem_euclid(len as isize) as usize,
         };
         // 借用は 1 文で落とす。`on_jump` はページ側を触るので借りたまま呼ばない
         let page = self.hits.borrow().get(index).map(|h| h.page);
@@ -161,17 +157,10 @@ impl SearchTab {
     }
 
     fn update_status(&self) {
+        // どの文言を選ぶかの判断は `ui_logic::status_text` にある (GTK 非依存・テスト付き)
         let pages = self.hits.borrow().len();
         let marks = self.total_marks.get();
-        let text = if self.running.get() {
-            format!("検索中… ({marks} 件)")
-        } else if !self.searched.get() {
-            STATUS_IDLE.to_string()
-        } else if pages == 0 {
-            "見つかりませんでした".to_string()
-        } else {
-            format!("{marks} 件見つかりました ({pages} ページ)")
-        };
+        let text = status_text(self.running.get(), self.searched.get(), pages, marks);
         self.status.set_text(&text);
     }
 
@@ -205,9 +194,6 @@ impl SearchTab {
         row
     }
 }
-
-/// 何も検索していないときの案内
-const STATUS_IDLE: &str = "語を入れて Enter で検索します (Ctrl+F)";
 
 /// `index` 番目の行を選択状態にする。行が無ければ何もしない
 fn select_row(list: &gtk::ListBox, index: usize) {

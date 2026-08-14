@@ -5,3 +5,4 @@ pub mod outline;
 pub mod search;
 pub mod store;
 pub mod ui;
+pub mod ui_logic;
