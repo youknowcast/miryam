@@ -135,4 +135,13 @@ mod tests {
     fn rects_changed_from_nonempty_to_empty() {
         assert!(rects_changed(&[[0.0, 0.0, 0.1, 0.1]], &[]));
     }
+
+    #[test]
+    fn rects_changed_when_same_length_but_coordinates_differ() {
+        // 1 行の中をポインタが横になぞる間、矩形の個数は 1 のまま座標だけ伸びる。
+        // 長さだけ見る実装だとここを取りこぼす
+        let a = [[0.0, 0.0, 0.1, 0.1]];
+        let b = [[0.0, 0.0, 0.2, 0.1]];
+        assert!(rects_changed(&a, &b));
+    }
 }
