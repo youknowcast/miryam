@@ -13,7 +13,7 @@ pub struct PdfMeta {
     pub size: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmQa {
     /// どの操作の結果か (`ask::Action::kind`)。
     /// 古いサイドカーには無いので既定は空文字

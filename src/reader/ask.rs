@@ -82,6 +82,24 @@ pub fn postprocess(stdout: &str) -> Option<String> {
     Some(trimmed.chars().take(ANSWER_MAX_CHARS).collect())
 }
 
+/// 注釈タブの行に出す問答の見出し。`action` は `find(&qa.kind)` の結果。
+///
+/// - 質問を打たせる操作 → その質問文
+/// - 質問を打たせない操作 → 操作の `label`
+/// - 知らない `kind` (将来のサイドカーを古いバイナリで開いた) → `kind` をそのまま
+/// - `kind` も空 (古いサイドカー) → 質問文があればそれ、無ければ「(不明)」
+///
+/// 知らない `kind` でもパニックしない
+pub fn qa_heading(qa: &LlmQa, action: Option<&Action>) -> String {
+    match action {
+        Some(a) if a.needs_question => qa.q.clone(),
+        Some(a) => a.label.to_string(),
+        None if qa.kind.is_empty() && qa.q.is_empty() => "（不明）".to_string(),
+        None if qa.kind.is_empty() => qa.q.clone(),
+        None => qa.kind.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +207,45 @@ mod tests {
     #[test]
     fn history_cap_is_10() {
         assert_eq!(HISTORY_MAX, 10);
+    }
+
+    /// 質問を打たせる操作 (`needs_question == true`) は、その質問文を見出しにする
+    #[test]
+    fn a_question_action_headings_with_the_question_text() {
+        let q = qa("ask", "この一節の主題は?", "これ");
+        assert_eq!(qa_heading(&q, find("ask")), "この一節の主題は?");
+    }
+
+    /// 質問を打たせない操作 (例: 将来の「翻訳」) は、操作名を見出しにする。
+    /// `find` にはまだ無いので、テスト用の操作を直接渡して確かめる
+    #[test]
+    fn an_action_without_a_question_headings_with_its_label() {
+        let translate = Action {
+            kind: "translate",
+            label: "翻訳",
+            needs_question: false,
+            prompt: |_, _, _| String::new(),
+        };
+        assert_eq!(qa_heading(&qa("translate", "", "Bonjour"), Some(&translate)), "翻訳");
+    }
+
+    /// 知らない kind (将来のサイドカーを古いバイナリで開いた) は kind をそのまま出す。
+    /// パニックせずに読めることが大事
+    #[test]
+    fn an_unknown_kind_is_shown_as_is() {
+        assert_eq!(qa_heading(&qa("translate", "", "x"), None), "translate");
+        assert_eq!(qa_heading(&qa("ask-future", "質問", "x"), None), "ask-future");
+    }
+
+    /// kind が無い古いサイドカーでも、質問文が残っていればそれを見出しにする
+    #[test]
+    fn an_old_sidecar_without_kind_uses_the_question_text() {
+        assert_eq!(qa_heading(&qa("", "なに?", "これ"), None), "なに?");
+    }
+
+    /// kind も質問文も無い (最古の形式) は「(不明)」— 空行を出さない
+    #[test]
+    fn an_old_sidecar_without_kind_nor_question_is_unknown() {
+        assert_eq!(qa_heading(&qa("", "", "これ"), None), "（不明）");
     }
 }
