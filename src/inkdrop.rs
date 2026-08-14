@@ -199,6 +199,72 @@ pub fn request(
     });
 }
 
+/// curl の stdout から (本文, ステータス) を取り出す。
+/// 末尾行が `-w "\n%{http_code}"` の出力で、本文はそれ以前 (本文に改行があっても末尾行は純粋な数字)
+fn split_status(stdout: &str) -> (String, u16) {
+    let (body, status_line) = stdout.rsplit_once('\n').unwrap_or((stdout, "0"));
+    let status = status_line.trim().parse::<u16>().unwrap_or(0);
+    (body.to_string(), status)
+}
+
+/// GET して (HTTP ステータス, 本文) を返す。**404 をエラーにしない** —
+/// 書き出しの更新フロー (GET /notes/<id> が 404 なら新規作成に切り替える) に要る。
+/// 既存の `request` は `-f` 付きで 4xx/5xx を `curl exit 22` に潰してしまうため使えない。
+/// ここは `-f` を付けない (4xx/5xx でも curl は exit 0 のまま) + `-w` (ステータスを末尾行に) で拾う。
+/// curl 自体が死んだとき (接続不可・タイムアウト) だけ `Err`
+pub fn get_status(
+    cfg: &InkdropConfig,
+    path_and_query: &str,
+    on_done: impl FnOnce(Result<(u16, String), RequestError>) + 'static,
+) {
+    let url = format!("http://127.0.0.1:{}{}", cfg.port, path_and_query);
+    let auth = format!("{}:{}", cfg.username, cfg.password);
+    let argv_owned: Vec<String> = vec![
+        "curl".into(),
+        "-s".into(),
+        "-m".into(),
+        "10".into(),
+        "-u".into(),
+        auth,
+        "-X".into(),
+        "GET".into(),
+        "-w".into(),
+        "\n%{http_code}".into(),
+        url,
+    ];
+    let argv: Vec<&std::ffi::OsStr> = argv_owned.iter().map(|s| s.as_ref()).collect();
+
+    let subprocess = match gio::Subprocess::newv(
+        &argv,
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            on_done(Err(RequestError {
+                curl_exit: None,
+                detail: err.to_string(),
+            }));
+            return;
+        }
+    };
+    let sp = subprocess.clone();
+    subprocess.communicate_utf8_async(None, gio::Cancellable::NONE, move |result| match result {
+        Ok((stdout, _stderr)) if sp.is_successful() => {
+            let stdout = stdout.as_deref().unwrap_or("");
+            let (body, status) = split_status(stdout);
+            on_done(Ok((status, body)));
+        }
+        Ok((_, _)) => on_done(Err(RequestError {
+            curl_exit: Some(sp.exit_status()),
+            detail: format!("curl exit {}", sp.exit_status()),
+        })),
+        Err(err) => on_done(Err(RequestError {
+            curl_exit: None,
+            detail: err.to_string(),
+        })),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +457,76 @@ mod tests {
             Some(22),
             "-f の HTTP エラーは curl exit 22: {err:?}"
         );
+    }
+
+    /// 起動中のポートに対して get_status を呼ぶテスト用ヘルパ
+    fn run_get_status_against(port: u16, path: &str) -> Result<(u16, String), RequestError> {
+        let _lock = crate::test_sync::lock();
+        let cfg = cfg(&format!(
+            "username = \"u\"\npassword = \"p\"\nbook = \"Inbox\"\nport = {port}\n"
+        ));
+        let ctx = glib::MainContext::default();
+        let _guard = ctx.acquire().unwrap();
+        let ml = glib::MainLoop::new(None, false);
+        let result: Rc<RefCell<Option<Result<(u16, String), RequestError>>>> =
+            Rc::new(RefCell::new(None));
+        let (ml_c, result_c) = (ml.clone(), result.clone());
+        get_status(&cfg, path, move |r| {
+            *result_c.borrow_mut() = Some(r);
+            ml_c.quit();
+        });
+        ml.run();
+        result.borrow_mut().take().expect("on_done が呼ばれていない")
+    }
+
+    #[test]
+    fn get_status_returns_the_status_and_body() {
+        let port = spawn_stub("200 OK", r#"{"_id":"note:x","_rev":"1-a"}"#);
+        let (status, body) = run_get_status_against(port, "/notes/note:x").expect("成功");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"_rev\":\"1-a\""), "本文が届く: {body}");
+    }
+
+    #[test]
+    fn get_status_keeps_a_404_as_an_ok_with_the_status() {
+        // 更新フローは 404 を「ノートが消えた → 新規作成」と解釈するので、
+        // エラーにせず (404, 本文) で返す
+        let port = spawn_stub("404 Not Found", r#"{"error":"not_found"}"#);
+        let (status, body) = run_get_status_against(port, "/notes/nope").expect("404 は Ok");
+        assert_eq!(status, 404);
+        assert!(body.contains("not_found"));
+    }
+
+    #[test]
+    fn get_status_of_a_dead_server_is_err() {
+        // 何も待っていないポート (起動直後の拾いポート) へ投げると curl exit 7
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe); // 誰も listen していない
+        let err = run_get_status_against(port, "/notes/x").expect_err("接続不可は Err");
+        assert!(err.curl_exit.is_some(), "curl の exit が入る: {err:?}");
+    }
+
+    #[test]
+    fn split_status_takes_the_last_line_as_the_status() {
+        // 本文 (markdown の JSON) に改行が入っても、末尾行が %{http_code} の出力
+        let (body, status) = split_status("line1\nline2\n200");
+        assert_eq!(body, "line1\nline2");
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn split_status_without_newline_is_status_zero() {
+        let (body, status) = split_status("body");
+        assert_eq!(body, "body");
+        assert_eq!(status, 0, "末尾行が取れなければ 0 (防御的フォールバック)");
+    }
+
+    #[test]
+    fn split_status_with_garbage_status_line_is_zero() {
+        let (body, status) = split_status("body\nnot-a-number");
+        assert_eq!(body, "body");
+        assert_eq!(status, 0, "数字でなければ 0 (防御的フォールバック)");
     }
 
     #[test]

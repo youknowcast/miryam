@@ -95,6 +95,35 @@ pub fn load_llm() -> Option<crate::llm::LlmConfig> {
     }
 }
 
+/// reader 側で使う Inkdrop 設定を読む。
+/// **読み込みに失敗しても PDF は開けなければならない**ので、失敗時は None に落とす
+/// (理由は stderr に出す)。None なら「Inkdrop に送る」ボタンが出ない
+pub fn load_inkdrop() -> Option<crate::inkdrop::InkdropConfig> {
+    match crate::phrases::PhraseBook::load() {
+        Ok(book) => book.inkdrop().cloned(),
+        Err(e) => {
+            eprintln!("miryam-reader: 設定を読めないため Inkdrop 連携を無効にします: {e:#}");
+            None
+        }
+    }
+}
+
+/// 書き出し先ノートブック名。`[reader] book` → 無ければ `[inkdrop] book`。
+/// どちらも無ければ既定の "Inbox" (InkdropConfig::book の既定と同じ)
+pub fn load_book_name() -> String {
+    match crate::phrases::PhraseBook::load() {
+        Ok(book) => {
+            let reader_book = book.reader().and_then(|c| c.book.clone());
+            let inkdrop_book = book.inkdrop().map(|c| c.book.clone());
+            reader_book.or(inkdrop_book).unwrap_or_else(|| "Inbox".to_string())
+        }
+        Err(e) => {
+            eprintln!("miryam-reader: 設定を読めないため既定のノートブックを使います: {e:#}");
+            "Inbox".to_string()
+        }
+    }
+}
+
 /// 色名 → RGB (0.0〜1.0)
 pub fn color_rgb(name: &str) -> (f64, f64, f64) {
     match name {

@@ -1,5 +1,7 @@
 pub mod ask;
 pub mod config;
+pub mod digest;
+pub mod export;
 pub mod geom;
 pub mod library;
 pub mod outline;

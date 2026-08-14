@@ -53,6 +53,9 @@ pub struct ReaderState {
     /// `[llm]` が読めない・無ければ None。None なら LLM 操作はメニューに出ない
     /// (フェーズ 2 の `config::load_colors` と同じ考え方: 辞書の問題で本が読めなくならないこと)
     pub llm: Option<crate::llm::LlmConfig>,
+    /// `[inkdrop]` が読めない・無ければ None。None なら「Inkdrop に送る」ボタンが出ない
+    /// (load_colors / load_llm と同じ考え方: 辞書の問題で本が読めなくならないこと)
+    pub inkdrop: Option<crate::inkdrop::InkdropConfig>,
     /// 注釈ごとの「投げてまだ返っていない」件数。1 つの注釈に複数投げられる
     pending: HashMap<String, usize>,
     /// 在庫の進行中 LLM リクエスト。`track_request` で加え、返ってきたら
@@ -68,6 +71,7 @@ impl ReaderState {
         colors: Vec<String>,
         read_only: bool,
         llm: Option<crate::llm::LlmConfig>,
+        inkdrop: Option<crate::inkdrop::InkdropConfig>,
     ) -> Self {
         Self {
             pdf_path,
@@ -78,6 +82,7 @@ impl ReaderState {
             save_error: None,
             warn_bar: None,
             llm,
+            inkdrop,
             pending: HashMap::new(),
             requests: HashMap::new(),
             next_request_id: 0,
@@ -89,18 +94,19 @@ impl ReaderState {
         pdf_path: PathBuf,
         colors: Vec<String>,
         llm: Option<crate::llm::LlmConfig>,
+        inkdrop: Option<crate::inkdrop::InkdropConfig>,
     ) -> anyhow::Result<(Self, Option<String>)> {
         match Sidecar::load(&pdf_path) {
-            Ok(Some(sc)) => Ok((Self::build(pdf_path, sc, colors, false, llm), None)),
+            Ok(Some(sc)) => Ok((Self::build(pdf_path, sc, colors, false, llm, inkdrop), None)),
             Ok(None) => {
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((Self::build(pdf_path, sc, colors, false, llm), None))
+                Ok((Self::build(pdf_path, sc, colors, false, llm, inkdrop), None))
             }
             Err(e) => {
                 let warn = format!("{e:#}");
                 eprintln!("miryam-reader: {warn}");
                 let sc = Sidecar::new(&pdf_path)?;
-                Ok((Self::build(pdf_path, sc, colors, true, llm), Some(warn)))
+                Ok((Self::build(pdf_path, sc, colors, true, llm, inkdrop), Some(warn)))
             }
         }
     }
@@ -236,6 +242,13 @@ impl ReaderState {
         h.llm.push(qa);
         self.save();
         true
+    }
+
+    /// 抄訳と感想台詞をサイドカーに保存する。**上書き** (1 PDF = 1 ノート)。
+    /// 積んだら即保存 (`set_memo` と同じ流儀。`save()` は `read_only` のとき早期 return する)
+    pub fn save_digest(&mut self, digest: store::DigestData) {
+        self.sidecar.digest = Some(digest);
+        self.save();
     }
 
     /// その注釈で「投げてまだ返っていない」件数
@@ -580,8 +593,14 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
 
     let colors = crate::reader::config::load_colors();
     let llm = crate::reader::config::load_llm();
-    let (state, warning) = ReaderState::open(path.clone(), colors, llm)?;
+    let inkdrop = crate::reader::config::load_inkdrop();
+    let (state, warning) = ReaderState::open(path.clone(), colors, llm, inkdrop)?;
     let state = Rc::new(RefCell::new(state));
+
+    // 窓が閉じたかどうかの共有フラグ。書き出しが GET /books や curl の途中で閉じられた
+    // とき、在庫はまだ空で cancel_all_requests が効かないため、後から走るコールバックが
+    // LLM を spawn したりサイドカーに書き込んだりしないよう、このフラグで止める
+    let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     // サイドバーはページより後に作るので、あとから差し込む
     let sidebar_slot: Rc<RefCell<Option<Rc<sidebar::Sidebar>>>> = Rc::new(RefCell::new(None));
@@ -720,6 +739,65 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     // ジャンプする前に総ページ数でクランプし、範囲外は「飛べない」扱いにする
     let total_pages = usize::try_from(doc.n_pages()).unwrap_or(0);
     let outline_items = clamp_outline(crate::reader::outline::read(&doc), total_pages);
+
+    // 「Inkdrop に送る」: [llm] と [inkdrop] があり、書き込める (読み取り専用でない) ときだけ。
+    // 満たさなければボタン自体を足さない (読み取り専用で「できたように見えて送れない」を
+    // 作らない — フェーズ 1〜3 の操作メニューと同じゲート)。ツールバー末尾 (search_entry の
+    // 後ろ) に追加する。ここに置くのは、次の行で outline_items が Sidebar::new にムーブ
+    // されるため、書き出し用の clone を先に取れるのはこの位置だけだから
+    let export_button = {
+        let st = state.borrow();
+        (st.llm.is_some() && st.inkdrop.is_some() && !st.read_only)
+            .then(|| gtk::Button::with_label("Inkdrop に送る"))
+    };
+    if let Some(button) = &export_button {
+        button.set_tooltip_text(Some("注釈を抄訳つきで Inkdrop に送ります"));
+        toolbar.append(button);
+    }
+
+    if let Some(button) = export_button {
+        let state = state.clone();
+        let closed = closed.clone();
+        // outline_items は次の行で Sidebar::new に渡す (ムーブ済み)。ここでは clone を使う
+        let outline = Rc::new(outline_items.clone());
+        let doc_title = doc.title().map(|t| t.to_string());
+        let book_name = crate::reader::config::load_book_name();
+        // 実行中は二重に押せないようにする。返ってきたら on_done が解除する
+        let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let on_done = {
+            let busy = busy.clone();
+            // button → クロージャ → on_done → button の循環になるので、button は弱参照で持つ
+            let button = button.downgrade();
+            Rc::new(move || {
+                busy.set(false);
+                if let Some(b) = button.upgrade() {
+                    b.set_sensitive(true);
+                }
+            })
+        };
+        // クリックのクロージャも button を強参照で掴むと button → クロージャ → button の
+        // 循環になる。同じ理由で弱参照で持ち、取れなければ何もしない
+        let button_weak = button.downgrade();
+        button.connect_clicked(move |_| {
+            let Some(button) = button_weak.upgrade() else {
+                return;
+            };
+            if busy.get() {
+                return; // 実行中は押せない
+            }
+            busy.set(true);
+            button.set_sensitive(false);
+            run_export(
+                &state,
+                &outline,
+                doc_title.clone(),
+                book_name.clone(),
+                closed.clone(),
+                on_done.clone(),
+            );
+        });
+    }
+
     let sidebar = sidebar::Sidebar::new(state.clone(), on_jump, redraw, outline_items);
     *sidebar_slot.borrow_mut() = Some(sidebar.clone());
     install_search(&doc, sidebar.search(), &view);
@@ -871,7 +949,11 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         let state = state.clone();
         let view = view.clone();
         let scrolled = scrolled.clone();
+        let closed = closed.clone();
         window.connect_close_request(move |_| {
+            // 閉じ済みであることを共有フラグに刻む。書き出しのコールバックがこのあとに
+            // 走る場合 (GET /books の間の閉窓など) に、LLM の spawn を止めるための合図
+            closed.set(true);
             let offsets = geom::page_offsets(&view.scaled_heights(), PAGE_GAP);
             let adj = scrolled.vadjustment();
             // 末尾ではクランプにより value が offsets の最終ページ開始点まで届かないので、
@@ -911,6 +993,307 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// 書き出し先ノートブックの ID を解決して cont に渡す。失敗・名前不一致は cont(None)。
+/// 解決は `[reader] book` → 無ければ `[inkdrop] book` (仕様書・config.rs の doc コメント参照)
+fn resolve_book_id(
+    cfg: crate::inkdrop::InkdropConfig,
+    book_name: String,
+    cont: impl FnOnce(Option<String>) + 'static,
+) {
+    crate::inkdrop::request(&cfg, "GET", "/books", None, move |res| match res {
+        Ok(json) => cont(crate::inkdrop::find_book_id(&json, &book_name).map(|(id, _)| id)),
+        Err(_) => cont(None),
+    });
+}
+
+/// 「Inkdrop に送る」の実行。流れ (仕様書「抄訳と思い出し発話」の 1〜2):
+///
+/// 1. 材料 (プロンプト・ハイライト Markdown・設定・note_id) を借りて写し取る
+/// 2. ノートブック ID を解決 (GET /books) — **先に解決する**。Inkdrop に届かないのに
+///    LLM の利用量を消費しないため
+/// 3. 抄訳を LLM に 1 回だけ頼む (`llm::request_text`、在庫に積んで窓を閉じたらキャンセル)
+/// 4. `digest::split` で (抄訳, 感想台詞) に分け、Markdown ノートを組み立てる
+/// 5. note_id があれば GET /notes/<id> → _rev を取って PUT で更新。404 なら新規作成
+///    (Task 1 の get_status)。無ければ POST /notes で新規作成
+/// 6. 成功したら `save_digest` して吹き出しで知らせる。失敗は知らせるだけで何も保存しない
+///    (サイドカーの内容はそのまま残り、再実行できる — 仕様書「エラー処理」)
+///
+/// 窓を閉じたときのキャンセル: LLM のリクエストは `track_request` に載るので、
+/// `connect_close_request` (フェーズ 3 で配線済み) の `cancel_all_requests` でまとめて
+/// キャンセルされる。ただし GET /books の間 (在庫がまだ空) に閉じた場合はそれでは
+/// 止まらないため、`closed` フラグをコールバックで確認して、LLM の spawn と
+/// サイドカー書き込み・通知を止める。Inkdrop の curl はキャンセルできないが
+/// 10 秒タイムアウト付きで、窓の破棄後にコールバックが触るのは state のファイル書き込みと
+/// 通知だけ (GTK ウィジェットは `show_save_error` の `warn_bar` のみ — 破棄済みなら
+/// GTK が no-op で扱う)
+fn run_export(
+    state: &Rc<RefCell<ReaderState>>,
+    outline: &Rc<Vec<crate::reader::outline::OutlineItem>>,
+    doc_title: Option<String>,
+    book_name: String,
+    closed: Rc<Cell<bool>>,
+    on_done: Rc<dyn Fn()>,
+) {
+    // 材料 (借用はこのブロックの中だけ)。プロンプトと Markdown は純粋関数なので
+    // 借りたまま組み立ててよい (借用が重なることはない)
+    let material = {
+        let st = state.borrow();
+        let (llm, inkdrop) = (st.llm.clone(), st.inkdrop.clone());
+        let note_id = st.sidecar.digest.as_ref().and_then(|d| d.note_id.clone());
+        let sections = crate::reader::export::sections(outline);
+        let prompt = crate::reader::digest::build_prompt(&sections, &st.sidecar.highlights);
+        let highlights_md =
+            crate::reader::export::highlights_markdown(&st.sidecar.highlights, &sections);
+        let name = st
+            .pdf_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match (llm, inkdrop) {
+            (Some(llm), Some(inkdrop)) => {
+                Some((llm, inkdrop, note_id, prompt, highlights_md, name))
+            }
+            _ => None,
+        }
+    };
+    let Some((llm, inkdrop, note_id, prompt, highlights_md, name)) = material else {
+        ReaderState::show_notice(state, "Inkdrop の設定か、LLM の設定が見つかりません");
+        on_done();
+        return;
+    };
+
+    // この先のコールバックは全て 'static を要求されるので、state はここで写し取る
+    // (pages::run_action と同じ流儀)。コールバックの中の borrow_mut はすべて単独の文にする
+    let state = state.clone();
+
+    // 2. ノートブック ID を解決。失敗なら LLM を呼ばずに諦める
+    // 在庫の識別子はリクエストを作ったあとにしか分からないが、コールバックが走るのは
+    // 必ずメインループの次のターン以降 (spawn 失敗も idle 経由) なので、ここで置き場だけ
+    // 先に作って共有する (フェーズ 3 の pages::run_action と同じトークン方式)
+    let token: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+    resolve_book_id(inkdrop.clone(), book_name, move |book_id| {
+        // 窓を閉じたあとの続行を止める。GET /books の間に閉じた場合、在庫はまだ空で
+        // cancel_all_requests が何もしないため、ここで LLM を spawn する前に確認する
+        if closed.get() {
+            on_done();
+            return;
+        }
+        let Some(book_id) = book_id else {
+            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
+            on_done();
+            return;
+        };
+
+        // 3. 抄訳を LLM に 1 回だけ頼む
+        let state_for_llm = state.clone();
+        let token_for_cb = token.clone();
+        let closed_for_llm = closed.clone();
+        let req = crate::llm::request_text(&llm, &prompt, move |raw| {
+            // 返ってきたら在庫から外す (単独文。cancel_all_requests が終了済みの
+            // プロセスに cancel/force_exit をかけないため — フェーズ 3 の run_action と同じ)
+            if let Some(t) = token_for_cb.get() {
+                state_for_llm.borrow_mut().untrack_request(t);
+            }
+            let Some(raw) = raw else {
+                notify_miryam(&format!("『{name}』の抄訳を作れませんでした"));
+                on_done();
+                return;
+            };
+            let Some((digest_body, remarks)) = crate::reader::digest::split(&raw) else {
+                notify_miryam(&format!("『{name}』の抄訳を作れませんでした"));
+                on_done();
+                return;
+            };
+            let title = crate::reader::export::title_for(doc_title.as_deref(), &name);
+            let body = crate::reader::export::compose_body(&digest_body, &highlights_md);
+            let _ = finish_export(
+                &state_for_llm,
+                inkdrop.clone(),
+                book_id.clone(),
+                note_id.clone(),
+                title,
+                body,
+                digest_body,
+                remarks,
+                name,
+                closed_for_llm,
+                on_done,
+            );
+        });
+        // 単独文 (窓を閉じたら cancel_all_requests でキャンセルされる — run_export の doc 参照)。
+        // 識別子はコールバックの先頭で untrack_request に使うため、ここで共有しておく
+        let t = state.borrow_mut().track_request(req);
+        token.set(Some(t));
+    });
+}
+
+/// 5〜6: Inkdrop への作成/更新とサイドカー保存。
+/// 返り値は「成功して保存できた新しい note_id」か None (実用はしない — 通知は内側でやる)
+#[allow(clippy::too_many_arguments)]
+fn finish_export(
+    state: &Rc<RefCell<ReaderState>>,
+    cfg: crate::inkdrop::InkdropConfig,
+    book_id: String,
+    note_id: Option<String>,
+    title: String,
+    body: String,
+    digest_body: String,
+    remarks: Vec<String>,
+    name: String,
+    closed: Rc<Cell<bool>>,
+    on_done: Rc<dyn Fn()>,
+) -> Option<String> {
+    match note_id {
+        Some(id) => update_note(
+            state, cfg, book_id, id, title, body, digest_body, remarks, name, closed, on_done,
+        ),
+        None => create_note(
+            state, cfg, book_id, title, body, digest_body, remarks, name, closed, on_done,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_note(
+    state: &Rc<RefCell<ReaderState>>,
+    cfg: crate::inkdrop::InkdropConfig,
+    book_id: String,
+    id: String,
+    title: String,
+    body: String,
+    digest_body: String,
+    remarks: Vec<String>,
+    name: String,
+    closed: Rc<Cell<bool>>,
+    on_done: Rc<dyn Fn()>,
+) -> Option<String> {
+    // コールバック (全て 'static) に掴ませるためにここで写し取る。以後の state はこれを使う
+    let state = state.clone();
+    let path = format!("/notes/{id}");
+    // cfg は get_status の呼び出しで借りたまま、コールバック (404 → 新規作成の切り替え) には
+    // ムーブで入れられないので、コールバック用の clone を先に作っておく。path も同じ理由で
+    // PUT の URL 用の clone を取る
+    let cfg_for_rev = cfg.clone();
+    let path_for_put = path.clone();
+    crate::inkdrop::get_status(&cfg, &path, move |res| match res {
+        Ok((200, json)) => {
+            let Some(rev) = crate::reader::export::rev_from(&json) else {
+                notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
+                on_done();
+                return;
+            };
+            let payload =
+                crate::reader::export::update_payload(&book_id, &id, &rev, &title, &body);
+            let closed_for_put = closed.clone();
+            crate::inkdrop::request(&cfg_for_rev, "PUT", &path_for_put, Some(payload), move |res| {
+                let ok = res.is_ok();
+                if !ok {
+                    notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
+                    on_done();
+                    return;
+                }
+                save_digest_and_notify(
+                    &state,
+                    id,
+                    digest_body,
+                    remarks,
+                    name,
+                    closed_for_put,
+                    on_done,
+                );
+            });
+        }
+        Ok((404, _)) => {
+            // ノートが消えている。新規作成に切り替える (仕様書)
+            let _ = create_note(
+                &state,
+                cfg_for_rev,
+                book_id,
+                title,
+                body,
+                digest_body,
+                remarks,
+                name,
+                closed,
+                on_done,
+            );
+        }
+        Ok((status, _)) => {
+            eprintln!("miryam-reader: GET /notes/{id} が {status} を返しました");
+            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
+            on_done();
+        }
+        Err(_) => {
+            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
+            on_done();
+        }
+    });
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_note(
+    state: &Rc<RefCell<ReaderState>>,
+    cfg: crate::inkdrop::InkdropConfig,
+    book_id: String,
+    title: String,
+    body: String,
+    digest_body: String,
+    remarks: Vec<String>,
+    name: String,
+    closed: Rc<Cell<bool>>,
+    on_done: Rc<dyn Fn()>,
+) -> Option<String> {
+    let state = state.clone();
+    let payload = crate::reader::export::create_payload(&book_id, &title, &body);
+    crate::inkdrop::request(&cfg, "POST", "/notes", Some(payload), move |res| {
+        let json = match res {
+            Ok(json) => json,
+            Err(_) => {
+                notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
+                on_done();
+                return;
+            }
+        };
+        let Some(id) = crate::reader::export::id_from(&json) else {
+            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
+            on_done();
+            return;
+        };
+        save_digest_and_notify(&state, id, digest_body, remarks, name, closed, on_done);
+    });
+    None
+}
+
+/// 成功: サイドカーに digest を保存し、保存失敗は警告バーで、成功は吹き出しで知らせる
+fn save_digest_and_notify(
+    state: &Rc<RefCell<ReaderState>>,
+    note_id: String,
+    digest_body: String,
+    remarks: Vec<String>,
+    name: String,
+    closed: Rc<Cell<bool>>,
+    on_done: Rc<dyn Fn()>,
+) {
+    // 窓を閉じたあとで完了した場合は何もしない。書き出し自体 (Inkdrop への curl) は
+    // 途中で止められないが、閉じた窓に向けて「送りました」と知らせたり、サイドカーを
+    // 書き換えたりはしない
+    if closed.get() {
+        on_done();
+        return;
+    }
+    state.borrow_mut().save_digest(crate::reader::store::DigestData {
+        body: digest_body,
+        remarks,
+        made_at: chrono::Local::now(),
+        note_id: Some(note_id),
+    });
+    // 保存の失敗を黙って捨てない (state を借りていない状態で呼ぶ)
+    ReaderState::show_save_error(state);
+    notify_miryam(&format!("『{name}』を Inkdrop に送りました"));
+    on_done();
 }
 
 /// GVariant テキスト形式の文字列リテラル用にエスケープする
@@ -980,8 +1363,8 @@ mod tests {
 
     /// 開いてハイライトを 1 件足した状態にする (この時点で sidecar は保存済み)
     fn opened_with_one(pdf: &std::path::Path) -> (ReaderState, String) {
-        let (mut state, warning) =
-            ReaderState::open(pdf.to_path_buf(), vec!["yellow".into()], None).expect("開けること");
+        let (mut state, warning) = ReaderState::open(pdf.to_path_buf(), vec!["yellow".into()], None, None)
+            .expect("開けること");
         assert!(warning.is_none(), "新規なら警告は出ない");
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
         (state, id)
@@ -1132,6 +1515,62 @@ mod tests {
     }
 
     #[test]
+    fn save_digest_writes_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        state.save_digest(store::DigestData {
+            body: "抄訳本文".into(),
+            remarks: vec!["面白かった".into()],
+            made_at: chrono::Local::now(),
+            note_id: Some("note:abc".into()),
+        });
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        let digest = loaded.digest.expect("digest が書かれている");
+        assert_eq!(digest.body, "抄訳本文");
+        assert_eq!(digest.remarks, vec!["面白かった"]);
+        assert_eq!(digest.note_id.as_deref(), Some("note:abc"));
+    }
+
+    #[test]
+    fn save_digest_overwrites_the_previous_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let (mut state, _id) = opened_with_one(&pdf);
+
+        state.save_digest(store::DigestData {
+            body: "1 回目".into(), remarks: vec![], made_at: chrono::Local::now(), note_id: None,
+        });
+        state.save_digest(store::DigestData {
+            body: "2 回目".into(), remarks: vec![], made_at: chrono::Local::now(), note_id: Some("note:z".into()),
+        });
+
+        let loaded = store::Sidecar::load(&pdf).expect("読めること").expect("存在する");
+        assert_eq!(loaded.digest.as_ref().expect("ある").body, "2 回目", "1 PDF = 1 ノートの更新");
+        assert_eq!(loaded.digest.as_ref().expect("ある").note_id.as_deref(), Some("note:z"));
+    }
+
+    #[test]
+    fn save_digest_in_read_only_mode_changes_nothing_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = fixture(dir.path());
+        let before = put_broken_sidecar(&pdf);
+
+        let (mut state, _warning) = ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None)
+            .expect("開けること");
+        assert!(state.read_only, "前提: 読み取り専用");
+
+        state.save_digest(store::DigestData {
+            body: "x".into(), remarks: vec![], made_at: chrono::Local::now(), note_id: None,
+        });
+
+        let after = std::fs::read(store::sidecar_path(&pdf)).expect("読めること");
+        assert_eq!(after, before, "壊れたファイルはバイト単位で変わらない");
+    }
+
+    #[test]
     fn pending_counts_are_per_highlight() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pdf = fixture(dir.path());
@@ -1228,7 +1667,7 @@ mod tests {
         put_broken_sidecar(&pdf);
 
         let (state, warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None).expect("開けること");
 
         assert!(state.read_only, "壊れていたら読み取り専用");
         let warning = warning.expect("警告文が返る");
@@ -1242,7 +1681,7 @@ mod tests {
         let before = put_broken_sidecar(&pdf);
 
         let (mut state, _warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None).expect("開けること");
         assert!(state.read_only, "前提: 読み取り専用");
 
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
@@ -1262,7 +1701,7 @@ mod tests {
         let before = put_broken_sidecar(&pdf);
 
         let (mut state, _warning) =
-            ReaderState::open(pdf.clone(), vec!["yellow".into()], None).expect("開けること");
+            ReaderState::open(pdf.clone(), vec!["yellow".into()], None, None).expect("開けること");
         assert!(state.read_only, "前提: 読み取り専用");
 
         let id = state.add_highlight(0, "yellow", vec![[0.1, 0.1, 0.2, 0.2]], "引用".into());
