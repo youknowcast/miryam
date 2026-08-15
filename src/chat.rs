@@ -10,8 +10,9 @@ const ENGLISH_PERSONA: &str = "あなたはデスクトップに常駐する小�
 /// 吹き出し表示される組み込みモード名 (これ以外のモードは常に会話窓)
 pub const CASUAL_MODE_NAME: &str = "雑談";
 
-/// 会話窓モードでペルソナ直後に挿入する選択肢マーカー指示
-const CHOICES_INSTRUCTION: &str = "返答の本文の後に、ユーザーが次に選びそうな一手を「>> 候補」の形式で 1 行 1 候補、最大 3 行出力してください。候補が思いつかなければ出力しなくて構いません。";
+/// 会話窓モードで最後のユーザー発言の直前に挿入する選択肢マーカー指示。
+/// 生成位置に近い方が指示が効くため、ペルソナ直後ではなく履歴の後ろに置く
+const CHOICES_INSTRUCTION: &str = "返答の本文の後に、ユーザーが次に送りそうな発言の候補を「>> 候補」の形式で 1 行 1 候補、最大 3 行出力してください。各候補は今の返答の内容を踏まえた具体的なものとし、ユーザーがそのまま送れる 30 文字程度までの短い発言文にしてください。「もっと詳しく」など汎用的な候補は避け、自然な候補がなければ何も出力しないでください。";
 
 /// プロンプトに含める履歴の上限 (発言数 = 10 往復)。ノート保存用の全履歴には影響しない
 pub const PROMPT_HISTORY_MAX: usize = 20;
@@ -104,7 +105,7 @@ pub fn chat_note(
     (title, body)
 }
 
-/// ペルソナ + (選択肢指示) + 状況行 + 直近履歴 + 新しい発言
+/// ペルソナ + 状況行 + 直近履歴 + (選択肢指示) + 新しい発言
 fn assemble_prompt(
     persona: &str,
     with_choices: bool,
@@ -113,10 +114,6 @@ fn assemble_prompt(
     now: &Snapshot,
 ) -> String {
     let mut out = format!("{persona}\n");
-    if with_choices {
-        out.push_str(CHOICES_INSTRUCTION);
-        out.push('\n');
-    }
     out.push_str(&crate::llm::situation_line(now));
     out.push('\n');
     let recent = &turns[turns.len().saturating_sub(PROMPT_HISTORY_MAX)..];
@@ -125,6 +122,10 @@ fn assemble_prompt(
         for t in recent {
             out.push_str(&format!("{}: {}\n", speaker_name(t.role), t.text));
         }
+    }
+    if with_choices {
+        out.push_str(CHOICES_INSTRUCTION);
+        out.push('\n');
     }
     out.push_str(&format!("ユーザー: {user_input}\nmiryam:"));
     out
@@ -165,12 +166,25 @@ pub fn postprocess_chat(stdout: &str) -> Option<String> {
 const CHOICE_MARKER: &str = ">>";
 /// 1 返答あたりの選択肢ボタン上限
 pub const CHOICES_MAX: usize = 3;
+/// 選択肢 1 件の文字数上限。超過分は末尾を「…」で切る
+/// (横並びボタンが窓を広げすぎないためのガード)
+const CHOICE_LABEL_MAX_CHARS: usize = 40;
+
+/// 選択肢を表示・送信用に整える。上限超過は末尾 1 文字を「…」にして上限に収める
+fn cap_choice(text: &str) -> String {
+    if text.chars().count() <= CHOICE_LABEL_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut s: String = text.chars().take(CHOICE_LABEL_MAX_CHARS - 1).collect();
+    s.push('…');
+    s
+}
 /// 会話窓モード返答のハードキャップ (文字数)。吹き出しの REPLY_MAX_CHARS とは別
 pub const WINDOW_REPLY_MAX_CHARS: usize = 2000;
 
 /// 返答を本文と選択肢に分離する。行頭 (trim 後) が ">>" の行を選択肢として抽出し、
-/// 最大 CHOICES_MAX 個まで採用する。マーカーが 1 つもなければ全文が本文 —
-/// 形式が崩れても本文は失わない
+/// 最大 CHOICES_MAX 個まで採用する。各選択肢は CHOICE_LABEL_MAX_CHARS で切り詰める。
+/// マーカーが 1 つもなければ全文が本文 — 形式が崩れても本文は失わない
 pub fn split_choices(text: &str) -> (String, Vec<String>) {
     let mut body_lines: Vec<&str> = Vec::new();
     let mut choices: Vec<String> = Vec::new();
@@ -179,7 +193,7 @@ pub fn split_choices(text: &str) -> (String, Vec<String>) {
             Some(rest) => {
                 let choice = rest.trim();
                 if !choice.is_empty() && choices.len() < CHOICES_MAX {
-                    choices.push(choice.to_string());
+                    choices.push(cap_choice(choice));
                 }
             }
             None => body_lines.push(line),
@@ -188,13 +202,18 @@ pub fn split_choices(text: &str) -> (String, Vec<String>) {
     (body_lines.join("\n").trim().to_string(), choices)
 }
 
-/// 会話窓モードの返答後処理: 全体 trim → 2000 字キャップ → 空なら None
-pub fn postprocess_window(stdout: &str) -> Option<String> {
+/// 会話窓モードの返答処理: trim → 選択肢分離 → 本文だけ 2000 字キャップ。
+/// 選択肢の分離をキャップより先に行う (末尾の候補がキャップで欠けるのを防ぐため)。
+/// 空出力は None。本文が空 (選択肢のみ) のときは Some(("", choices)) を返し、
+/// 呼び出し側で失敗扱いにする
+pub fn process_window_reply(stdout: &str) -> Option<(String, Vec<String>)> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.chars().take(WINDOW_REPLY_MAX_CHARS).collect())
+    let (body, choices) = split_choices(trimmed);
+    let body: String = body.chars().take(WINDOW_REPLY_MAX_CHARS).collect();
+    Some((body, choices))
 }
 
 /// 返答の長さに応じた吹き出し表示秒数: 6 + 文字数/10 (上限 20)
@@ -546,23 +565,49 @@ mod tests {
     }
 
     #[test]
-    fn postprocess_window_keeps_multiline_and_trims() {
+    fn split_choices_caps_overlong_choice_with_ellipsis() {
+        let long = "あ".repeat(60);
+        let text = format!("本文。\n>> {long}");
+        let (_, choices) = split_choices(&text);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].chars().count(), CHOICE_LABEL_MAX_CHARS);
+        assert!(choices[0].ends_with('…'), "省略記号で切ったことが分かる");
+
+        let exact = "あ".repeat(CHOICE_LABEL_MAX_CHARS);
+        let text = format!(">> {exact}");
+        let (_, choices) = split_choices(&text);
+        assert_eq!(choices[0], exact, "上限ちょうどはそのまま");
+    }
+
+    #[test]
+    fn process_window_reply_splits_choices_before_capping_body() {
+        // 旧実装は全体キャップが先で、末尾の選択肢が途中で切れてボタン化していた
+        let long_body = "あ".repeat(WINDOW_REPLY_MAX_CHARS + 100);
+        let text = format!("{long_body}\n>> 候補A\n>> 候補B");
+        let (body, choices) = process_window_reply(&text).unwrap();
+        assert_eq!(body.chars().count(), WINDOW_REPLY_MAX_CHARS);
         assert_eq!(
-            postprocess_window("  一行目\n\n二行目  \n").as_deref(),
-            Some("一行目\n\n二行目")
+            choices,
+            vec!["候補A", "候補B"],
+            "選択肢は本文キャップの影響を受けず欠けない"
         );
     }
 
     #[test]
-    fn postprocess_window_caps_at_2000_chars() {
-        let long = "あ".repeat(2500);
-        assert_eq!(postprocess_window(&long).unwrap().chars().count(), 2000);
+    fn process_window_reply_trims_and_returns_none_on_empty() {
+        assert!(process_window_reply("").is_none());
+        assert!(process_window_reply("  \n \n").is_none());
+        let (body, choices) = process_window_reply("  一行目\n\n二行目  \n").unwrap();
+        assert_eq!(body, "一行目\n\n二行目");
+        assert!(choices.is_empty());
     }
 
     #[test]
-    fn postprocess_window_empty_is_none() {
-        assert!(postprocess_window("").is_none());
-        assert!(postprocess_window("  \n \n").is_none());
+    fn process_window_reply_choices_only_gives_empty_body() {
+        // 本文なしは呼び出し側で失敗扱いにするため Some(("", ...)) で返す
+        let (body, choices) = process_window_reply(">> A\n>> B").unwrap();
+        assert_eq!(body, "");
+        assert_eq!(choices, vec!["A", "B"]);
     }
 
     #[test]
@@ -669,9 +714,46 @@ mod tests {
         assert!(p.ends_with("ユーザー: マイクロサービス分割の是非\nmiryam:"));
         let instr_pos = p.find(">> 候補").unwrap();
         let situation_pos = p.find("状況: ").unwrap();
+        let last_user_pos = p.rfind("ユーザー: マイクロサービス分割の是非").unwrap();
         assert!(
-            instr_pos < situation_pos,
-            "指示はペルソナ直後・状況行より前"
+            situation_pos < instr_pos && instr_pos < last_user_pos,
+            "指示は状況行より後・最後のユーザー発言の直前 (生成位置に近い方が効くため)"
+        );
+    }
+
+    #[test]
+    fn choices_instruction_demands_grounded_short_utterances() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        let design = cfg
+            .modes()
+            .into_iter()
+            .find(|m| m.name == "設計議論")
+            .unwrap();
+        let p = build_mode_prompt(&design, &[], "テスト", &test_snapshot());
+        assert!(
+            p.contains("今の返答の内容を踏まえた具体的なもの"),
+            "返答への具体性を要求する"
+        );
+        assert!(p.contains("30 文字"), "短い発言文であることを要求する");
+        assert!(p.contains("汎用的な候補は避け"), "汎用候補を禁止する");
+    }
+
+    #[test]
+    fn build_mode_prompt_places_choices_instruction_after_history() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        let design = cfg
+            .modes()
+            .into_iter()
+            .find(|m| m.name == "設計議論")
+            .unwrap();
+        let turns = vec![turn(Role::User, "昔の発言"), turn(Role::Mascot, "昔の返答")];
+        let p = build_mode_prompt(&design, &turns, "今の発言", &test_snapshot());
+        let history_pos = p.find("これまでの会話:").unwrap();
+        let instr_pos = p.find(">> 候補").unwrap();
+        let last_user_pos = p.rfind("ユーザー: 今の発言").unwrap();
+        assert!(
+            history_pos < instr_pos && instr_pos < last_user_pos,
+            "指示は履歴の直後に来る"
         );
     }
 

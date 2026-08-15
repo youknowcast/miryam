@@ -529,9 +529,23 @@ pub fn build_chat_window(
     }
 }
 
+/// 会話窓の発言ラベル用マークアップ: 話者名を太字+役割色にして本文と視覚的に分ける。
+/// 本文はユーザー入力・LLM 出力どちらも来るため必ずエスケープする
+fn turn_markup(role: crate::chat::Role, body: &str) -> String {
+    let (name, color) = match role {
+        crate::chat::Role::User => ("あなた", "#a6e3a1"), // green
+        crate::chat::Role::Mascot => ("miryam", "#cba6f7"), // mauve
+    };
+    format!(
+        "<b><span foreground=\"{color}\">{name}</span></b>: {}",
+        glib::markup_escape_text(body)
+    )
+}
+
 impl ChatWindow {
-    fn append_line(&self, text: &str) -> gtk::Label {
-        let label = gtk::Label::new(Some(text));
+    fn append_markup(&self, markup: &str) -> gtk::Label {
+        let label = gtk::Label::new(None);
+        label.set_markup(markup);
         label.set_wrap(true);
         label.set_selectable(true);
         label.set_xalign(0.0);
@@ -547,11 +561,11 @@ impl ChatWindow {
     }
 
     pub fn push_user(&self, text: &str) {
-        self.append_line(&format!("あなた: {text}"));
+        self.append_markup(&turn_markup(crate::chat::Role::User, text));
     }
 
     pub fn begin_reply(&self) {
-        let label = self.append_line("miryam: ……");
+        let label = self.append_markup(&turn_markup(crate::chat::Role::Mascot, "……"));
         *self.pending.borrow_mut() = Some(label);
     }
 
@@ -560,7 +574,7 @@ impl ChatWindow {
             return;
         };
         match text {
-            Some(t) => label.set_text(&format!("miryam: {t}")),
+            Some(t) => label.set_markup(&turn_markup(crate::chat::Role::Mascot, t)),
             None => label.set_text("(応答が得られませんでした)"),
         }
         self.scroll_to_bottom();
@@ -843,6 +857,27 @@ fn setup_drag(window: &gtk::ApplicationWindow, picture: &gtk::Picture) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_markup_marks_up_speaker_with_role_color() {
+        assert_eq!(
+            turn_markup(crate::chat::Role::User, "本文"),
+            "<b><span foreground=\"#a6e3a1\">あなた</span></b>: 本文"
+        );
+        assert_eq!(
+            turn_markup(crate::chat::Role::Mascot, "本文"),
+            "<b><span foreground=\"#cba6f7\">miryam</span></b>: 本文"
+        );
+    }
+
+    #[test]
+    fn turn_markup_escapes_body() {
+        let out = turn_markup(crate::chat::Role::User, "a < b & \"c\"");
+        assert!(
+            out.contains("a &lt; b &amp; &quot;c&quot;"),
+            "本文中のマークアップ特殊文字はエスケープする: {out}"
+        );
+    }
 
     #[test]
     fn skin_path_layout() {

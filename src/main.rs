@@ -890,14 +890,13 @@ fn send_window_message(ctx: &ChatCtx, raw_input: String) {
         }
         reset_chat_idle_timer(&ctx_c); // 返答受信も「操作」扱い
         let raw_was_some = raw.is_some();
-        let processed = raw.as_deref().and_then(chat::postprocess_window);
+        let processed = raw.as_deref().and_then(chat::process_window_reply);
         let win_ref = ctx_c.chat_window.borrow();
         let Some(win) = win_ref.as_ref() else {
             return; // 窓が先に閉じた (close は request をキャンセル済みのはずだが念のため)
         };
         match processed {
-            Some(reply) => {
-                let (body, choices) = chat::split_choices(&reply);
+            Some((body, choices)) => {
                 if body.is_empty() {
                     // 選択肢だけの返答は失敗扱い (本文なしでは履歴に積めない)
                     win.finish_reply(None);
