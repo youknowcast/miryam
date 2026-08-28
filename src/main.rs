@@ -107,15 +107,17 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     );
 
     if book.news().is_some() {
-        schedule_news(
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            news_digest.clone(),
-            Duration::from_secs(NEWS_FIRST_DELAY_SECS),
-        );
+        let news_ctx = NewsCtx {
+            app: app.clone(),
+            book: book.clone(),
+            ui: ui.clone(),
+            timers: timers.clone(),
+            muted: muted.clone(),
+            quitting: quitting.clone(),
+            digest: news_digest.clone(),
+            popup_slot: Rc::new(RefCell::new(None)),
+        };
+        schedule_news(news_ctx, Duration::from_secs(NEWS_FIRST_DELAY_SECS));
     }
 
     if book.inkdrop().is_some_and(|c| c.inbox_threshold > 0) {
@@ -537,58 +539,43 @@ fn run_inbox_check(
     });
 }
 
-/// ニュースサイクル: 固定間隔で feeds を取得し LLM でダイジェスト化して知らせる
-fn schedule_news(
+/// ニュース機能の状態束 (schedule_news / run_news_cycle / summarize_news が共有する)
+#[derive(Clone)]
+struct NewsCtx {
+    app: gtk::Application,
     book: Rc<phrases::PhraseBook>,
     ui: Rc<ui::MascotUi>,
     timers: Rc<RefCell<Timers>>,
     muted: Rc<Cell<bool>>,
     quitting: Rc<Cell<bool>>,
     digest: Rc<RefCell<Option<news::Digest>>>,
-    delay: Duration,
-) {
+    /// ニュースポップの slot (同時 1 枚)
+    popup_slot: Rc<RefCell<Option<gtk::Window>>>,
+}
+
+/// ニュースサイクル: 固定間隔で feeds を取得し LLM でダイジェスト化して知らせる
+fn schedule_news(ctx: NewsCtx, delay: Duration) {
     glib::timeout_add_local_once(delay, move || {
-        if quitting.get() {
+        if ctx.quitting.get() {
             return;
         }
-        run_news_cycle(
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            digest.clone(),
-        );
-        let interval = book
+        run_news_cycle(ctx.clone());
+        let interval = ctx
+            .book
             .news()
             .expect("ニュースは [news] 有効時のみ")
             .interval_mins;
-        schedule_news(
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            digest.clone(),
-            Duration::from_secs(interval * 60),
-        );
+        schedule_news(ctx, Duration::from_secs(interval * 60));
     });
 }
 
 /// 取得結果 (feeds と同順、None = 失敗または空)。fetch コールバック間で共有する
 type NewsFetchResults = Rc<RefCell<Vec<Option<(String, String)>>>>;
 
-/// 1 サイクル: 全 feed 並行取得 → 整形連結 → LLM → 一言 + ダイジェスト保持。
-/// 途中でミュート/会話が始まっても取得と保持は続け、発話だけ落とす
-fn run_news_cycle(
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
-    digest: Rc<RefCell<Option<news::Digest>>>,
-) {
-    let cfg = book.news().expect("ニュースは [news] 有効時のみ");
+/// 1 サイクル: 全 feed 並行取得 → 整形連結 → LLM → ポップ + ダイジェスト保持。
+/// 途中でミュート/会話が始まっても取得と保持は続け、ポップだけ落とす
+fn run_news_cycle(ctx: NewsCtx) {
+    let cfg = ctx.book.news().expect("ニュースは [news] 有効時のみ");
     let urls = cfg.feeds.clone();
     let max_bytes = (cfg.max_kb_per_feed as usize) * 1024;
     let total = urls.len();
@@ -596,16 +583,7 @@ fn run_news_cycle(
     let remaining = Rc::new(Cell::new(total));
 
     for (i, url) in urls.into_iter().enumerate() {
-        let (book, ui, timers, muted, quitting, digest, results, remaining) = (
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            digest.clone(),
-            results.clone(),
-            remaining.clone(),
-        );
+        let (ctx, results, remaining) = (ctx.clone(), results.clone(), remaining.clone());
         let url_c = url.clone();
         news::fetch(&url, move |res| {
             match res {
@@ -625,58 +603,61 @@ fn run_news_cycle(
             }
             remaining.set(remaining.get() - 1);
             if remaining.get() == 0 {
-                summarize_news(book, ui, timers, muted, quitting, digest, results);
+                summarize_news(&ctx, results);
             }
         });
     }
 }
 
-/// 取得結果を LLM に渡し、一言発話とダイジェスト更新を行う
-fn summarize_news(
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
-    digest: Rc<RefCell<Option<news::Digest>>>,
-    results: NewsFetchResults,
-) {
-    if quitting.get() {
+/// 取得結果を LLM に渡し、キャラ上部へのポップ表示とダイジェスト更新を行う
+fn summarize_news(ctx: &NewsCtx, results: NewsFetchResults) {
+    if ctx.quitting.get() {
         return;
     }
     let sources: Vec<(String, String)> = results.borrow_mut().drain(..).flatten().collect();
     if sources.is_empty() {
-        news_speak_failure(&ui, &timers, &muted, &quitting);
+        news_speak_failure(&ctx.ui, &ctx.timers, &ctx.muted, &ctx.quitting);
         return;
     }
-    let cfg = book.news().expect("ニュースは [news] 有効時のみ");
-    let llm_cfg = book
+    let cfg = ctx.book.news().expect("ニュースは [news] 有効時のみ");
+    let llm_cfg = ctx
+        .book
         .llm()
         .expect("[news] には [llm] が必須 (validate 済み)");
     let prompt = news::build_news_prompt(cfg, &sources);
-    if let Some(req) = timers.borrow_mut().news_request.take() {
+    if let Some(req) = ctx.timers.borrow_mut().news_request.take() {
         req.cancel(); // 前サイクルの要約が生きていたら破棄 (遅い LLM の追い越し防止)
     }
-    let timers_c = timers.clone();
+    let ctx_c = ctx.clone();
     let req = llm::request_text(llm_cfg, &prompt, move |raw| {
-        timers_c.borrow_mut().news_request = None;
+        ctx_c.timers.borrow_mut().news_request = None;
         match raw.as_deref().and_then(news::postprocess_news) {
             Some((bubble, body)) => {
-                *digest.borrow_mut() = Some(news::Digest {
-                    body,
+                *ctx_c.digest.borrow_mut() = Some(news::Digest {
+                    body: body.clone(),
                     made_at: chrono::Local::now(),
                 });
-                if !quitting.get() && !muted.get() && timers_c.borrow().chat_session.is_none() {
-                    automatic_speak(&ui, &timers_c, &bubble);
+                if !ctx_c.quitting.get()
+                    && !ctx_c.muted.get()
+                    && ctx_c.timers.borrow().chat_session.is_none()
+                {
+                    ui::show_news_popup(
+                        &ctx_c.app,
+                        &ctx_c.popup_slot,
+                        &ctx_c.ui,
+                        &bubble,
+                        &body,
+                        ui::NEWS_POPUP_VISIBLE_SECS,
+                    );
                 }
             }
             None => {
                 eprintln!("miryam: ニュース要約に失敗しました (LLM 失敗または空出力)");
-                news_speak_failure(&ui, &timers_c, &muted, &quitting);
+                news_speak_failure(&ctx_c.ui, &ctx_c.timers, &ctx_c.muted, &ctx_c.quitting);
             }
         }
     });
-    timers.borrow_mut().news_request = Some(req);
+    ctx.timers.borrow_mut().news_request = Some(req);
 }
 
 /// 失敗一言 (ミュート/会話中/終了中は黙る)
