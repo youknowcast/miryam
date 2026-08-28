@@ -2,6 +2,7 @@ use anyhow::Context;
 use gtk::{gdk, gdk_pixbuf, gio, glib, prelude::*};
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use std::time::Duration;
 
 const DEFAULT_CHARACTER_PNG: &[u8] = include_bytes!("../assets/character.png");
 const WINDOW_MARGIN: i32 = 24;
@@ -17,6 +18,19 @@ window { background: transparent; }
   border-radius: 12px;
   padding: 8px 12px;
   font-size: 16px;
+}
+.news-popup {
+  background: rgba(30, 30, 46, 0.94);
+  color: #cdd6f4;
+  border-radius: 12px;
+}
+.news-popup-header {
+  font-size: 15px;
+  font-weight: bold;
+  color: #a6e3a1;
+}
+.news-popup-body {
+  font-size: 14px;
 }
 .chat-entry {
   background: rgba(30, 30, 46, 0.92);
@@ -350,6 +364,130 @@ pub fn show_news_window(
     });
 
     *slot.borrow_mut() = Some(window.clone());
+    window.present();
+}
+
+/// ニュースポップの表示時間 (秒)。自動クローズに使う
+pub const NEWS_POPUP_VISIBLE_SECS: u64 = 45;
+
+/// ニュースポップの希望高さ (px)
+const NEWS_POPUP_PREFERRED_HEIGHT: i32 = 420;
+/// 画面に収まらないとき、本体窓上部を覆ってよい最大量 (px)
+const NEWS_POPUP_MAX_OVERLAP: i32 = 240;
+
+/// ニュースポップの (ボトムマージン, 高さ) を計算する。
+/// ポップは本体窓 (キャラ) の直上に置くのが理想だが、モニタ上端との間に margin を
+/// 保てない分は本体窓上部を最大 max_overlap 覆うことで高さを確保する。
+/// monitor_height が 0 (モニタ不明) のときは直上配置で固定する
+fn news_popup_geometry(
+    main_bottom: i32,
+    main_height: i32,
+    monitor_height: i32,
+    preferred: i32,
+    margin: i32,
+    max_overlap: i32,
+) -> (i32, i32) {
+    if monitor_height <= 0 {
+        return (main_bottom + main_height, preferred);
+    }
+    let above = monitor_height - main_bottom - main_height - margin;
+    let height = preferred.min((above + max_overlap).max(0));
+    let bottom = monitor_height - margin - height;
+    (bottom, height)
+}
+
+/// ニュース更新時の自動ポップ (layer-shell 窓)。本体窓 (キャラ) の直上に表示し、
+/// 画面に収まらない分は本体窓上部を覆う。secs 秒で自動クローズし、クリックでも閉じる。
+/// slot で同時 1 枚を保証する: 開き直しは前の窓を閉じてから
+pub fn show_news_popup(
+    app: &gtk::Application,
+    slot: &std::rc::Rc<std::cell::RefCell<Option<gtk::Window>>>,
+    mascot: &MascotUi,
+    title: &str,
+    body: &str,
+    secs: u64,
+) {
+    // 借りを先に手放す (理由は show_news_window と同じ)
+    let previous = slot.borrow_mut().take();
+    if let Some(prev) = previous {
+        prev.close();
+    }
+    // 本体窓の現在位置 (ドラッグ後も追従する) とモニタ高さからポップ位置を決める
+    let monitor_height = gdk::Display::default()
+        .and_then(|d| {
+            let surface = mascot.window.surface()?;
+            d.monitor_at_surface(&surface)
+        })
+        .map(|m| m.geometry().height())
+        .unwrap_or(0);
+    let (bottom, height) = news_popup_geometry(
+        mascot.window.margin(Edge::Bottom),
+        mascot.window.height(),
+        monitor_height,
+        NEWS_POPUP_PREFERRED_HEIGHT,
+        WINDOW_MARGIN,
+        NEWS_POPUP_MAX_OVERLAP,
+    );
+
+    let header = gtk::Label::new(Some(title));
+    header.add_css_class("news-popup-header");
+    header.set_wrap(true);
+    header.set_xalign(0.0);
+    header.set_margin_top(12);
+    header.set_margin_start(16);
+    header.set_margin_end(16);
+
+    let body_label = gtk::Label::new(Some(body));
+    body_label.add_css_class("news-popup-body");
+    body_label.set_wrap(true);
+    body_label.set_xalign(0.0);
+    body_label.set_valign(gtk::Align::Start);
+    body_label.set_margin_top(8);
+    body_label.set_margin_bottom(12);
+    body_label.set_margin_start(16);
+    body_label.set_margin_end(16);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.set_child(Some(&body_label));
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("news-popup");
+    root.set_size_request(CONTENT_WIDTH, height);
+    root.append(&header);
+    root.append(&scrolled);
+
+    let window = gtk::ApplicationWindow::new(app);
+    window.init_layer_shell();
+    window.set_layer(Layer::Top);
+    window.set_anchor(Edge::Right, true);
+    window.set_anchor(Edge::Bottom, true);
+    window.set_margin(Edge::Right, mascot.window.margin(Edge::Right));
+    window.set_margin(Edge::Bottom, bottom);
+    window.set_namespace(Some("miryam"));
+    window.set_keyboard_mode(KeyboardMode::None);
+    window.set_child(Some(&root));
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_PRIMARY);
+    let win_for_click = window.clone();
+    click.connect_pressed(move |_, _, _, _| win_for_click.close());
+    window.add_controller(click);
+
+    let win_for_close = window.clone();
+    glib::timeout_add_local_once(Duration::from_secs(secs), move || {
+        win_for_close.close();
+    });
+
+    // 閉じられたら slot を空に (自動クローズ・クリック双方この経路を通る)
+    let slot_c = slot.clone();
+    window.connect_close_request(move |_| {
+        slot_c.borrow_mut().take();
+        glib::Propagation::Proceed
+    });
+
+    *slot.borrow_mut() = Some(window.clone().upcast());
     window.present();
 }
 
@@ -972,5 +1110,44 @@ mod tests {
         }
         assert_eq!(reentered, Some(true), "借りを先に手放せば再入できる");
         assert!(slot.borrow().is_none(), "close ハンドラが slot を空にできている");
+    }
+
+    #[test]
+    fn popup_geometry_fits_above_when_roomy() {
+        // モニタ 1440、本体窓: ボトム 24・高さ 948 → 上に 444px の余裕 (margin 24)
+        let (bottom, height) = news_popup_geometry(24, 948, 1440, 420, 24, 240);
+        assert_eq!(height, 420, "希望高さでそのまま表示");
+        assert_eq!(bottom, 1440 - 24 - 420, "上端が margin 24 に一致");
+    }
+
+    #[test]
+    fn popup_geometry_overlaps_character_when_tight() {
+        // モニタ 1080、本体窓: ボトム 24・高さ 948 → 上には 84px しかない
+        let (bottom, height) = news_popup_geometry(24, 948, 1080, 420, 24, 240);
+        assert_eq!(height, 84 + 240, "足りない分を本体窓上部の重なりで補う");
+        assert_eq!(bottom, 1080 - 24 - 324);
+    }
+
+    #[test]
+    fn popup_geometry_clamps_to_available_space() {
+        // モニタ 800 (本体窓が画面より高い): 上も重なりも使い切っても 44px
+        let (bottom, height) = news_popup_geometry(24, 948, 800, 420, 24, 240);
+        assert_eq!(height, 44);
+        assert_eq!(bottom, 800 - 24 - 44);
+    }
+
+    #[test]
+    fn popup_geometry_follows_dragged_position() {
+        // キャラを上へドラッグした状態 (ボトム 400)
+        let (bottom, height) = news_popup_geometry(400, 948, 1440, 420, 24, 240);
+        assert_eq!(height, 68 + 240);
+        assert_eq!(bottom, 1440 - 24 - 308);
+    }
+
+    #[test]
+    fn popup_geometry_unknown_monitor_falls_back_to_stack() {
+        let (bottom, height) = news_popup_geometry(24, 948, 0, 420, 24, 240);
+        assert_eq!(bottom, 24 + 948, "モニタ不明時は直上配置");
+        assert_eq!(height, 420);
     }
 }
