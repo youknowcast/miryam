@@ -92,6 +92,17 @@ impl LlmRequest {
     }
 }
 
+/// 非ゼロ終了時の警告用に、stderr → stdout の順で最初の非空行を返す。
+/// エラー本文を stderr に出さず stdout に出す CLI があるため (例: claude のセッション上限)
+fn failure_head(stderr: Option<&str>, stdout: Option<&str>) -> String {
+    [stderr, stdout]
+        .into_iter()
+        .filter_map(|s| s)
+        .find_map(|s| s.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("")
+        .to_string()
+}
+
 fn warn_once(detail: &str) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
@@ -167,13 +178,11 @@ pub fn request_raw(
             Ok((stdout, _stderr)) if subprocess_c.is_successful() => {
                 on_done(Some(stdout.as_deref().unwrap_or("").to_string()));
             }
-            Ok((_, stderr)) => {
-                let head = stderr
-                    .as_deref()
-                    .and_then(|s| s.lines().next())
-                    .unwrap_or("")
-                    .to_string();
-                warn_once(&format!("CLI が失敗しました: {head}"));
+            Ok((stdout, stderr)) => {
+                warn_once(&format!(
+                    "CLI が失敗しました: {}",
+                    failure_head(stderr.as_deref(), stdout.as_deref())
+                ));
                 on_done(None);
             }
             Err(err) => {
@@ -329,6 +338,30 @@ mod tests {
     fn postprocess_empty_is_none() {
         assert!(postprocess("").is_none());
         assert!(postprocess("  \n \n").is_none());
+    }
+
+    #[test]
+    fn failure_head_prefers_stderr() {
+        assert_eq!(
+            failure_head(Some("error line\nmore"), Some("stdout line")),
+            "error line"
+        );
+    }
+
+    #[test]
+    fn failure_head_falls_back_to_stdout_when_stderr_empty() {
+        // claude のセッション上限は stdout に出すため、stderr が空なら stdout を使う
+        assert_eq!(
+            failure_head(Some("  \n"), Some("You've hit your session limit")),
+            "You've hit your session limit"
+        );
+        assert_eq!(failure_head(None, Some("stdout line")), "stdout line");
+    }
+
+    #[test]
+    fn failure_head_empty_when_both_empty() {
+        assert_eq!(failure_head(None, None), "");
+        assert_eq!(failure_head(Some("  "), Some("")), "");
     }
 
     fn run_request(config_toml: &str, prompt: &str) -> Option<String> {
