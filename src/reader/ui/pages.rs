@@ -8,6 +8,11 @@ use crate::reader::geom;
 use crate::reader::search::Hit;
 use crate::reader::store;
 use crate::reader::ui::ReaderState;
+use crate::reader::ui::render_cache::PageRenderCache;
+
+/// キャッシュに置けるページ数。可視ページ数 + 前後のスクロール分があれば十分で、
+/// 置きすぎると画像が重い PDF でメモリを圧迫する
+const CACHE_MAX_PAGES: usize = 12;
 
 /// ページを縦に並べたビュー。各ページ 1 枚の DrawingArea を持つ
 pub struct PageView {
@@ -19,6 +24,9 @@ pub struct PageView {
     /// ページごとの検索ヒット (正規化矩形)。`areas` と同じ並び。
     /// 各要素は対応するページの draw クロージャと共有する
     search_hits: Vec<Rc<RefCell<Vec<[f64; 4]>>>>,
+    /// レンダー済みページのキャッシュ。draw のたびに poppler のレンダーを
+    /// やり直さず、ズームが変わったときだけ作り直す
+    render_cache: Rc<RefCell<PageRenderCache>>,
 }
 
 impl PageView {
@@ -34,6 +42,7 @@ impl PageView {
         container.set_margin_bottom(geom::MARGIN as i32);
 
         let zoom = Rc::new(Cell::new(1.0_f64));
+        let render_cache = Rc::new(RefCell::new(PageRenderCache::new(CACHE_MAX_PAGES)));
         let mut areas = Vec::new();
         let mut sizes = Vec::new();
         let mut search_hits = Vec::new();
@@ -74,6 +83,7 @@ impl PageView {
             let has_text_for_draw = has_text.clone();
             let live_selection_for_draw = live_selection.clone();
             let page_hits_for_draw = page_hits.clone();
+            let cache_for_draw = render_cache.clone();
             // 強参照だと overlay → area → draw クロージャ → overlay の循環になる
             let overlay_for_draw = overlay.downgrade();
             area.set_draw_func(move |_area, cr, _w, _h| {
@@ -88,14 +98,26 @@ impl PageView {
                     }
                 }
                 let z = zoom_for_draw.get();
-                // 紙の白
-                cr.set_source_rgb(1.0, 1.0, 1.0);
+                // レンダー済みページを blit する。キャッシュに無ければ 1 回だけレンダーする
+                let cached = {
+                    let mut cache = cache_for_draw.borrow_mut();
+                    match cache.get(index, z) {
+                        Some(s) => s.clone(),
+                        None => {
+                            let s = render_page(&page_for_draw, z);
+                            cache.insert(index, z, s.clone());
+                            s
+                        }
+                    }
+                };
+                cr.set_source_surface(&cached, 0.0, 0.0)
+                    .expect("キャッシュ済みページをソースにできること");
                 let _ = cr.paint();
+
+                // 保存済みハイライト・選択下書き・検索ヒットはレンダー結果の上に重ねる。
+                // キャッシュには含めない (注釈の増減でレンダーし直さなくて済むように)
                 let _ = cr.save();
                 cr.scale(z, z);
-                page_for_draw.render(cr);
-
-                // 保存済みハイライトを半透明で重ねる
                 {
                     let st = state_for_draw.borrow();
                     for h in st.sidecar.highlights.iter().filter(|h| h.page == index) {
@@ -193,11 +215,11 @@ impl PageView {
                     let (x1, y1) = ((sx + dx) / z, (sy + dy) / z);
                     // 実測 (数百語/ページの本文で ~20〜50µs、ページ内最初の 1 回でも ~1ms) は
                     // 動きイベントの予算 (目安 8ms) を大きく下回るので compute_selection 自体は
-                    // 間引かない。だが本当のコストは選択計算ではなく毎回のページ全再描画
-                    // (DrawingArea に部分再描画は無く、draw_func は毎回 render(cr) からやり直す)
-                    // なので、再描画は選択矩形が実際に変わった (ポインタがグリフ境界をまたいだ)
-                    // ときだけに絞る。これで単語の中をゆっくり動かす間の再描画も、しきい値未満の
-                    // 微動を伴う単なるクリックの再描画も消える
+                    // 間引かない。だが再描画は DrawingArea に部分再描画が無くページ全体の
+                    // blit からやり直すので、再描画は選択矩形が実際に変わった
+                    // (ポインタがグリフ境界をまたいだ) ときだけに絞る。これで単語の中を
+                    // ゆっくり動かす間の再描画も、しきい値未満の微動を伴う単なるクリックの
+                    // 再描画も消える
                     let rects = compute_selection(&page, x0, y0, x1, y1).map(|(_, rects)| rects);
                     let changed = {
                         let current = live_selection.borrow();
@@ -314,7 +336,14 @@ impl PageView {
             search_hits.push(page_hits);
         }
 
-        Ok(Self { container, areas, sizes, zoom, search_hits })
+        Ok(Self {
+            container,
+            areas,
+            sizes,
+            zoom,
+            search_hits,
+            render_cache,
+        })
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -341,7 +370,7 @@ impl PageView {
     /// 走査は少しずつ進むので、これは 1 チャンクごとに「そこまでに見つかった全部」で
     /// 呼ばれる。毎回全ページを描き直すと重いので、**矩形集合が実際に変わった
     /// ページだけ** `queue_draw` する (DrawingArea に部分再描画は無く、描き直しは
-    /// `render(cr)` からのやり直しになるため。`geom::rects_changed` の用途は
+    /// ページ全体の blit からやり直すため。`geom::rects_changed` の用途は
     /// ドラッグ選択の抑制と同じ)
     pub fn set_search_hits(&self, hits: Vec<Hit>) {
         let mut next: Vec<Vec<[f64; 4]>> = vec![Vec::new(); self.areas.len()];
@@ -368,6 +397,8 @@ impl PageView {
     pub fn set_zoom(&self, z: f64) {
         let z = geom::clamp_zoom(z);
         self.zoom.set(z);
+        // 倍率が変わればキャッシュは全て古い。次の draw で作り直させる
+        self.render_cache.borrow_mut().clear();
         for (area, (w, h)) in self.areas.iter().zip(&self.sizes) {
             area.set_content_width((w * z) as i32);
             area.set_content_height((h * z) as i32);
@@ -381,6 +412,26 @@ impl PageView {
         let z = self.zoom.get();
         self.sizes.iter().map(|(_, h)| (h * z).trunc()).collect()
     }
+}
+
+/// ページを 1 回だけレンダーして surface に残す。`draw_func` はこれを blit するだけにし、
+/// スクロールや再描画のたびに poppler のレンダー (画像が重い PDF では 1 ページ数百 ms)
+/// をやり直さないための単位
+fn render_page(page: &poppler::Page, zoom: f64) -> cairo::ImageSurface {
+    let (w, h) = page.size();
+    let surface = cairo::ImageSurface::create(
+        cairo::Format::Rgb24,
+        (w * zoom).ceil() as i32,
+        (h * zoom).ceil() as i32,
+    )
+    .expect("surface を作れること");
+    let cr = cairo::Context::new(&surface).expect("context を作れること");
+    // poppler の render は透明な背景に描くので、まず紙の白で塗る
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    let _ = cr.paint();
+    cr.scale(zoom, zoom);
+    page.render(&cr);
+    surface
 }
 
 /// ページ座標の矩形 (2 点、順不同) から、選択された引用文と正規化済みの選択矩形群を得る。
@@ -1049,5 +1100,29 @@ mod tests {
         let page = doc.page(0).expect("1 ページ目");
 
         assert!(find_hits(&page, "").is_empty());
+    }
+
+    /// キャッシュ用の surface はページ寸法をズーム倍率で拡大したサイズで作られること
+    #[test]
+    fn render_page_scales_the_surface_to_the_zoom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        let s = render_page(&page, 2.0);
+        assert_eq!((s.width(), s.height()), (600, 400));
+    }
+
+    /// キャッシュ用の surface はまず紙の白で塗られること
+    #[test]
+    fn render_page_paints_white_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        let mut s = render_page(&page, 1.0);
+        let data = s.data().expect("ピクセルを読めること");
+        // Rgb24 はリトルエンディアンで B,G,R の順。1 ピクセル目 (0,0) が白なら全部 255
+        assert_eq!(&data[0..3], &[255, 255, 255], "紙の白で塗られていること");
     }
 }
