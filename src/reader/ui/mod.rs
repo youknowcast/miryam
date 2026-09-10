@@ -625,6 +625,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     scrolled.set_hexpand(true);
     scrolled.set_vexpand(true);
     scrolled.set_child(Some(view.widget()));
+    // レンダー依頼を可視ページ付近に絞るためのスクロール位置
+    view.set_viewport(&scrolled.vadjustment());
 
     let page_label = gtk::Label::new(Some(&format!("p.1/{}", doc.n_pages())));
     let zoom_label = gtk::Label::new(Some("100%"));

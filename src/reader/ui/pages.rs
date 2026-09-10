@@ -33,6 +33,9 @@ pub struct PageView {
     worker_gen: Rc<Cell<u64>>,
     /// 依頼済み (ページ, ズーム) の集合。レンダーが返るまで同じ依頼を二重に送らない
     pending: Rc<RefCell<HashSet<(usize, u64)>>>,
+    /// スクロール位置。レンダー依頼を可視ページ付近に絞るために使う。
+    /// `set_viewport` が build_window から渡す
+    vadj: Rc<RefCell<Option<gtk::Adjustment>>>,
     /// 最初の幅合わせが決まるまでレンダー依頼を出さない (等倍での無駄な初回
     /// レンダーを避ける。開いた直後は fit-width の idle が set_zoom を呼ぶ)
     zoom_committed: Rc<Cell<bool>>,
@@ -54,8 +57,10 @@ impl PageView {
         let render_cache = Rc::new(RefCell::new(PageRenderCache::new(CACHE_MAX_PAGES)));
         let worker_gen = Rc::new(Cell::new(0u64));
         let pending: Rc<RefCell<HashSet<(usize, u64)>>> = Rc::new(RefCell::new(HashSet::new()));
+        let vadj: Rc<RefCell<Option<gtk::Adjustment>>> = Rc::new(RefCell::new(None));
         let zoom_committed = Rc::new(Cell::new(false));
         let (job_tx, done_rx) = render_worker::start(&state.borrow().pdf_path);
+        let sizes_for_draw: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
         let mut areas = Vec::new();
         let mut sizes = Vec::new();
         let mut search_hits = Vec::new();
@@ -68,6 +73,7 @@ impl PageView {
                 .ok_or_else(|| anyhow::anyhow!("{} ページ目が読めません", i + 1))?;
             let (page_w, page_h) = page.size();
             sizes.push((page_w, page_h));
+            sizes_for_draw.borrow_mut().push((page_w, page_h));
 
             let area = gtk::DrawingArea::new();
             area.set_content_width((page_w * zoom.get()) as i32);
@@ -101,6 +107,9 @@ impl PageView {
             let gen_for_draw = worker_gen.clone();
             let pending_for_draw = pending.clone();
             let zoom_committed_for_draw = zoom_committed.clone();
+            let vadj_for_draw = vadj.clone();
+            let sizes_for_draw = sizes_for_draw.clone();
+            let gap_for_draw = gap;
             // 強参照だと overlay → area → draw クロージャ → overlay の循環になる
             let overlay_for_draw = overlay.downgrade();
             area.set_draw_func(move |_area, cr, _w, _h| {
@@ -122,13 +131,28 @@ impl PageView {
                     if let Some(s) = cache.get(index, z) {
                         Some((s.clone(), 1.0))
                     } else if zoom_committed_for_draw.get() {
-                        let mut pending = pending_for_draw.borrow_mut();
-                        if pending.insert((index, z.to_bits())) {
-                            let _ = job_tx_for_draw.send(RenderJob {
-                                page: index,
-                                zoom: z,
-                                generation: gen_for_draw.get(),
-                            });
+                        // 可視ページ付近だけレンダーを依頼する (GTK はスクロール外の
+                        // ページまで描画するため、絞らないと全ページ分の依頼が積まれる)
+                        let near = match vadj_for_draw.borrow().as_ref() {
+                            Some(adj) => near_viewport(
+                                index,
+                                z,
+                                &sizes_for_draw.borrow(),
+                                gap_for_draw,
+                                adj.value(),
+                                adj.page_size(),
+                            ),
+                            None => true,
+                        };
+                        if near {
+                            let mut pending = pending_for_draw.borrow_mut();
+                            if pending.insert((index, z.to_bits())) {
+                                let _ = job_tx_for_draw.send(RenderJob {
+                                    page: index,
+                                    zoom: z,
+                                    generation: gen_for_draw.get(),
+                                });
+                            }
                         }
                         cache.get_any(index).map(|s| {
                             // 旧ズームの surface を引き伸ばして仮表示する倍率
@@ -422,6 +446,7 @@ impl PageView {
             search_hits,
             worker_gen,
             pending,
+            vadj,
             zoom_committed,
         })
     }
@@ -436,6 +461,11 @@ impl PageView {
 
     pub fn zoom(&self) -> f64 {
         self.zoom.get()
+    }
+
+    /// スクロール位置を渡す。以後、レンダー依頼は可視ページ付近に絞られる
+    pub fn set_viewport(&self, adj: &gtk::Adjustment) {
+        *self.vadj.borrow_mut() = Some(adj.clone());
     }
 
     /// 全ページを描き直す。どのページの注釈が変わったか分からないとき (サイドバーからの削除) 用
@@ -496,6 +526,24 @@ impl PageView {
         let z = self.zoom.get();
         self.sizes.iter().map(|(_, h)| (h * z).trunc()).collect()
     }
+}
+
+/// スクロール位置とビューポート高さから、レンダー依頼を出してもよいページ範囲か
+/// (可視ページ ±1 ページ) を判定する。GTK はスクロール外のページまで描画するため、
+/// ここで絞らないと画像が重い PDF で開いた瞬間に全ページ分のレンダー依頼が積まれる
+fn near_viewport(
+    index: usize,
+    zoom: f64,
+    sizes: &[(f64, f64)],
+    gap: f64,
+    scroll_y: f64,
+    viewport_h: f64,
+) -> bool {
+    let heights: Vec<f64> = sizes.iter().map(|(_, h)| (h * zoom).trunc()).collect();
+    let offsets = geom::page_offsets(&heights, gap);
+    let first = geom::visible_page(scroll_y - geom::MARGIN, &offsets);
+    let last = geom::visible_page(scroll_y + viewport_h, &offsets);
+    index + 1 >= first && index <= last + 1
 }
 
 /// ページ座標の矩形 (2 点、順不同) から、選択された引用文と正規化済みの選択矩形群を得る。
@@ -1089,6 +1137,37 @@ mod tests {
         std::fs::File::create(&path).expect("作成できること").write_all(&buf).expect("書けること");
         poppler::Document::from_file(&format!("file://{}", path.display()), None)
             .expect("最小 PDF を開けること")
+    }
+
+    #[test]
+    fn near_viewport_covers_the_visible_pages_plus_a_margin() {
+        // 200pt のページが 10 枚。ページ 0 の開始 y=0、以後 212 ずつ (gap 12)
+        let sizes = [(300.0, 200.0); 10];
+        assert!(near_viewport(0, 1.0, &sizes, 12.0, 0.0, 500.0));
+        assert!(near_viewport(1, 1.0, &sizes, 12.0, 0.0, 500.0));
+        assert!(near_viewport(2, 1.0, &sizes, 12.0, 0.0, 500.0));
+        assert!(near_viewport(3, 1.0, &sizes, 12.0, 0.0, 500.0), "可視範囲の ±1 ページは余裕を持つ");
+        assert!(!near_viewport(5, 1.0, &sizes, 12.0, 0.0, 500.0));
+    }
+
+    #[test]
+    fn near_viewport_tracks_the_scroll_position() {
+        let sizes = [(300.0, 200.0); 10];
+        // スクロール 636 でページ 3 の上端が見え始める (636 = 212 * 3)
+        assert!(near_viewport(3, 1.0, &sizes, 12.0, 636.0, 500.0));
+        assert!(near_viewport(5, 1.0, &sizes, 12.0, 636.0, 500.0));
+        assert!(!near_viewport(0, 1.0, &sizes, 12.0, 636.0, 500.0));
+    }
+
+    #[test]
+    fn near_viewport_scales_with_the_zoom() {
+        let sizes = [(300.0, 200.0); 10];
+        // z=2 では 1 ページが 400pt になり、500 のビューポートに見えるのは 2 ページ目まで。
+        // ±1 ページの余裕でページ 2 までが「近い」扱いになる
+        assert!(near_viewport(0, 2.0, &sizes, 12.0, 0.0, 500.0));
+        assert!(near_viewport(1, 2.0, &sizes, 12.0, 0.0, 500.0));
+        assert!(near_viewport(2, 2.0, &sizes, 12.0, 0.0, 500.0));
+        assert!(!near_viewport(3, 2.0, &sizes, 12.0, 0.0, 500.0));
     }
 
     /// 抑制 (queue_draw を選択が実際に変わったときだけ呼ぶ) の前提になっている性質。
