@@ -1,11 +1,7 @@
-use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::time::Duration;
 
 use crate::reader::ask;
 use crate::reader::geom;
@@ -13,7 +9,6 @@ use crate::reader::search::Hit;
 use crate::reader::store;
 use crate::reader::ui::ReaderState;
 use crate::reader::ui::render_cache::PageRenderCache;
-use crate::reader::ui::render_worker::{self, RenderJob};
 
 /// キャッシュに置けるページ数。可視ページ数 + 前後のスクロール分があれば十分で、
 /// 置きすぎると画像が重い PDF でメモリを圧迫する
@@ -29,13 +24,9 @@ pub struct PageView {
     /// ページごとの検索ヒット (正規化矩形)。`areas` と同じ並び。
     /// 各要素は対応するページの draw クロージャと共有する
     search_hits: Vec<Rc<RefCell<Vec<[f64; 4]>>>>,
-    /// ズームの世代。ズームが変わるたびに進み、古い世代のレンダー結果は捨てられる
-    worker_gen: Rc<Cell<u64>>,
-    /// 依頼済み (ページ, ズーム) の集合。レンダーが返るまで同じ依頼を二重に送らない
-    pending: Rc<RefCell<HashSet<(usize, u64)>>>,
-    /// 最初の幅合わせが決まるまでレンダー依頼を出さない (等倍での無駄な初回
-    /// レンダーを避ける。開いた直後は fit-width の idle が set_zoom を呼ぶ)
-    zoom_committed: Rc<Cell<bool>>,
+    /// レンダー済みページのキャッシュ。draw のたびに poppler のレンダーを
+    /// やり直さず、ズームが変わったときだけ作り直す
+    render_cache: Rc<RefCell<PageRenderCache>>,
 }
 
 impl PageView {
@@ -52,10 +43,6 @@ impl PageView {
 
         let zoom = Rc::new(Cell::new(1.0_f64));
         let render_cache = Rc::new(RefCell::new(PageRenderCache::new(CACHE_MAX_PAGES)));
-        let worker_gen = Rc::new(Cell::new(0u64));
-        let pending: Rc<RefCell<HashSet<(usize, u64)>>> = Rc::new(RefCell::new(HashSet::new()));
-        let zoom_committed = Rc::new(Cell::new(false));
-        let (job_tx, done_rx) = render_worker::start(&state.borrow().pdf_path);
         let mut areas = Vec::new();
         let mut sizes = Vec::new();
         let mut search_hits = Vec::new();
@@ -97,10 +84,6 @@ impl PageView {
             let live_selection_for_draw = live_selection.clone();
             let page_hits_for_draw = page_hits.clone();
             let cache_for_draw = render_cache.clone();
-            let job_tx_for_draw = job_tx.clone();
-            let gen_for_draw = worker_gen.clone();
-            let pending_for_draw = pending.clone();
-            let zoom_committed_for_draw = zoom_committed.clone();
             // 強参照だと overlay → area → draw クロージャ → overlay の循環になる
             let overlay_for_draw = overlay.downgrade();
             area.set_draw_func(move |_area, cr, _w, _h| {
@@ -115,49 +98,21 @@ impl PageView {
                     }
                 }
                 let z = zoom_for_draw.get();
-                // キャッシュがあれば blit する。無ければ白か旧ズームの引き伸ばしを仮表示し、
-                // レンダーをワーカーへ依頼する (メインスレッドではレンダーしない)
-                let draw = {
+                // レンダー済みページを blit する。キャッシュに無ければ 1 回だけレンダーする
+                let cached = {
                     let mut cache = cache_for_draw.borrow_mut();
-                    if let Some(s) = cache.get(index, z) {
-                        Some((s.clone(), 1.0))
-                    } else if zoom_committed_for_draw.get() {
-                        let mut pending = pending_for_draw.borrow_mut();
-                        if pending.insert((index, z.to_bits())) {
-                            let _ = job_tx_for_draw.send(RenderJob {
-                                page: index,
-                                zoom: z,
-                                generation: gen_for_draw.get(),
-                            });
+                    match cache.get(index, z) {
+                        Some(s) => s.clone(),
+                        None => {
+                            let s = render_page(&page_for_draw, z);
+                            cache.insert(index, z, s.clone());
+                            s
                         }
-                        cache.get_any(index).map(|s| {
-                            // 旧ズームの surface を引き伸ばして仮表示する倍率
-                            (s.clone(), z / (s.width() as f64 / page_w))
-                        })
-                    } else {
-                        None
                     }
                 };
-                match draw {
-                    Some((surface, scale)) => {
-                        if scale != 1.0 {
-                            let _ = cr.save();
-                            cr.scale(scale, scale);
-                        }
-                        cr.set_source_surface(&surface, 0.0, 0.0)
-                            .expect("キャッシュ済みページをソースにできること");
-                        let _ = cr.paint();
-                        if scale != 1.0 {
-                            let _ = cr.restore();
-                        }
-                    }
-                    None => {
-                        // 幅合わせが決まるまでの最初の数フレームは紙の白のまま。
-                        // fit-width の idle が set_zoom を呼んで再描画を起こす
-                        cr.set_source_rgb(1.0, 1.0, 1.0);
-                        let _ = cr.paint();
-                    }
-                }
+                cr.set_source_surface(&cached, 0.0, 0.0)
+                    .expect("キャッシュ済みページをソースにできること");
+                let _ = cr.paint();
 
                 // 保存済みハイライト・選択下書き・検索ヒットはレンダー結果の上に重ねる。
                 // キャッシュには含めない (注釈の増減でレンダーし直さなくて済むように)
@@ -381,48 +336,13 @@ impl PageView {
             search_hits.push(page_hits);
         }
 
-        // ワーカーの結果をメインループに取り込む。16ms ごとにポーリングし、
-        // 結果が届いたページだけ再描画する。送信側が全滅していたら終了する
-        {
-            let render_cache = render_cache.clone();
-            let worker_gen = worker_gen.clone();
-            let pending = pending.clone();
-            let areas = areas.clone();
-            glib::timeout_add_local(Duration::from_millis(16), move || {
-                loop {
-                    match done_rx.try_recv() {
-                        Ok(done) => {
-                            pending
-                                .borrow_mut()
-                                .remove(&(done.page, done.zoom.to_bits()));
-                            if done.generation != worker_gen.get() {
-                                continue;
-                            }
-                            render_cache.borrow_mut().insert(
-                                done.page,
-                                done.zoom,
-                                done.data.into_inner(),
-                            );
-                            if let Some(area) = areas.get(done.page) {
-                                area.queue_draw();
-                            }
-                        }
-                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                        Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
-                    }
-                }
-            });
-        }
-
         Ok(Self {
             container,
             areas,
             sizes,
             zoom,
             search_hits,
-            worker_gen,
-            pending,
-            zoom_committed,
+            render_cache,
         })
     }
 
@@ -477,12 +397,8 @@ impl PageView {
     pub fn set_zoom(&self, z: f64) {
         let z = geom::clamp_zoom(z);
         self.zoom.set(z);
-        self.zoom_committed.set(true);
-        // 世代を進めて在庫の古いズームのレンダー結果を無効にし、依頼中リストを
-        // リセットする。キャッシュ自体は残し、新ズームのレンダーが届くまでの
-        // 仮表示 (旧ズームの引き伸ばし) に使う
-        self.worker_gen.set(self.worker_gen.get().wrapping_add(1));
-        self.pending.borrow_mut().clear();
+        // 倍率が変わればキャッシュは全て古い。次の draw で作り直させる
+        self.render_cache.borrow_mut().clear();
         for (area, (w, h)) in self.areas.iter().zip(&self.sizes) {
             area.set_content_width((w * z) as i32);
             area.set_content_height((h * z) as i32);
@@ -496,6 +412,26 @@ impl PageView {
         let z = self.zoom.get();
         self.sizes.iter().map(|(_, h)| (h * z).trunc()).collect()
     }
+}
+
+/// ページを 1 回だけレンダーして surface に残す。`draw_func` はこれを blit するだけにし、
+/// スクロールや再描画のたびに poppler のレンダー (画像が重い PDF では 1 ページ数百 ms)
+/// をやり直さないための単位
+fn render_page(page: &poppler::Page, zoom: f64) -> cairo::ImageSurface {
+    let (w, h) = page.size();
+    let surface = cairo::ImageSurface::create(
+        cairo::Format::Rgb24,
+        (w * zoom).ceil() as i32,
+        (h * zoom).ceil() as i32,
+    )
+    .expect("surface を作れること");
+    let cr = cairo::Context::new(&surface).expect("context を作れること");
+    // poppler の render は透明な背景に描くので、まず紙の白で塗る
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    let _ = cr.paint();
+    cr.scale(zoom, zoom);
+    page.render(&cr);
+    surface
 }
 
 /// ページ座標の矩形 (2 点、順不同) から、選択された引用文と正規化済みの選択矩形群を得る。
@@ -1164,5 +1100,29 @@ mod tests {
         let page = doc.page(0).expect("1 ページ目");
 
         assert!(find_hits(&page, "").is_empty());
+    }
+
+    /// キャッシュ用の surface はページ寸法をズーム倍率で拡大したサイズで作られること
+    #[test]
+    fn render_page_scales_the_surface_to_the_zoom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        let s = render_page(&page, 2.0);
+        assert_eq!((s.width(), s.height()), (600, 400));
+    }
+
+    /// キャッシュ用の surface はまず紙の白で塗られること
+    #[test]
+    fn render_page_paints_white_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doc = text_fixture(dir.path());
+        let page = doc.page(0).expect("1 ページ目");
+
+        let mut s = render_page(&page, 1.0);
+        let data = s.data().expect("ピクセルを読めること");
+        // Rgb24 はリトルエンディアンで B,G,R の順。1 ピクセル目 (0,0) が白なら全部 255
+        assert_eq!(&data[0..3], &[255, 255, 255], "紙の白で塗られていること");
     }
 }
