@@ -1,4 +1,5 @@
 pub mod pages;
+pub mod render_cache;
 pub mod sidebar;
 
 use gtk::prelude::*;
