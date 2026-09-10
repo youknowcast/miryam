@@ -25,6 +25,16 @@ impl PageRenderCache {
         Some(&self.entries.last().expect("入れたばかりの要素").2)
     }
 
+    /// ページ番号だけで引く。ズームが変わって別の倍率の surface しか無いときに
+    /// 仮表示 (プレースホルダ) として使う。最後に入れたものが返る
+    pub fn get_any(&self, index: usize) -> Option<&ImageSurface> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|(i, _, _)| *i == index)
+            .map(|(_, _, s)| s)
+    }
+
     pub fn insert(&mut self, index: usize, zoom: f64, surface: ImageSurface) {
         if let Some(pos) = self
             .entries
@@ -77,6 +87,24 @@ mod tests {
         c.insert(0, 1.0, surface(10, 10));
         assert!(c.get(0, 1.5).is_none(), "同じページでも倍率が違えば別物");
         assert!(c.get(1, 1.0).is_none(), "同じ倍率でもページが違えば別物");
+    }
+
+    #[test]
+    fn get_any_finds_a_page_regardless_of_zoom() {
+        let mut c = PageRenderCache::new(2);
+        c.insert(0, 1.0, surface(10, 10));
+        c.insert(1, 2.0, surface(20, 20));
+        assert_eq!(dims(c.get_any(0).expect("あるはず")), (10, 10));
+        assert_eq!(dims(c.get_any(1).expect("あるはず")), (20, 20));
+        assert!(c.get_any(2).is_none());
+    }
+
+    #[test]
+    fn get_any_returns_the_latest_entry_of_the_page() {
+        let mut c = PageRenderCache::new(2);
+        c.insert(0, 1.0, surface(10, 10));
+        c.insert(0, 1.5, surface(30, 30));
+        assert_eq!(dims(c.get_any(0).expect("あるはず")), (30, 30));
     }
 
     #[test]
