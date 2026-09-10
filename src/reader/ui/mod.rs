@@ -683,7 +683,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         });
     }
 
-    // スクロールに合わせてページ番号を更新する
+// スクロールに合わせてページ番号を更新し、可視ページ付近のレンダーを依頼する。
+    // スクロールではページの draw が再発火しないため、依頼はここから出す
     {
         let view = view.clone();
         let page_label = page_label.clone();
@@ -694,6 +695,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
             // container の set_margin_top(MARGIN) 分、ページ 0 の上端はスクロール座標 MARGIN にある
             let n = geom::visible_page(adj.value() - geom::MARGIN, &offsets);
             page_label.set_text(&format!("p.{}/{}", n + 1, total));
+            view.ensure_visible();
         });
     }
 
