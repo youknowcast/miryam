@@ -148,17 +148,13 @@ pub fn postprocess_news(stdout: &str) -> Option<(String, String)> {
     Some((bubble, body))
 }
 
-/// curl 実行の失敗。detail に exit code を含む (6/7=名前解決・接続不可, 22=HTTP エラー, 28=タイムアウト, 63=サイズ超過)
-#[derive(Debug)]
-pub struct FetchError {
-    pub detail: String,
-}
+/// curl 実行の失敗 (詳細は [`crate::curl::CurlError`])。
+/// detail に exit code を含む (6/7=名前解決・接続不可, 22=HTTP エラー, 28=タイムアウト, 63=サイズ超過)
+pub use crate::curl::CurlError as FetchError;
 
 /// 外部 URL を curl で取得する (argv 固定、シェル不経由)。完了時 on_done がメインループ上で呼ばれる。
 /// キャンセル機構は持たない (間隔が長く、結果は quitting ガードで捨てられるため)
 pub fn fetch(url: &str, on_done: impl FnOnce(Result<String, FetchError>) + 'static) {
-    use gtk::gio;
-    use gtk4 as gtk;
     let argv_owned: Vec<String> = vec![
         "curl".into(),
         "-sf".into(),
@@ -171,33 +167,7 @@ pub fn fetch(url: &str, on_done: impl FnOnce(Result<String, FetchError>) + 'stat
         "miryam/0.1 (desktop mascot)".into(),
         url.into(),
     ];
-    let argv: Vec<&std::ffi::OsStr> = argv_owned.iter().map(|s| s.as_ref()).collect();
-    let subprocess = match gio::Subprocess::newv(
-        &argv,
-        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
-    ) {
-        Ok(p) => p,
-        Err(err) => {
-            on_done(Err(FetchError {
-                detail: err.to_string(),
-            }));
-            return;
-        }
-    };
-    let sp = subprocess.clone();
-    subprocess.communicate_utf8_async(None, gio::Cancellable::NONE, move |result| match result {
-        Ok((stdout, _stderr)) if sp.is_successful() => {
-            on_done(Ok(stdout.as_deref().unwrap_or("").to_string()));
-        }
-        Ok((_, _)) => {
-            on_done(Err(FetchError {
-                detail: format!("curl exit {}", sp.exit_status()),
-            }));
-        }
-        Err(err) => on_done(Err(FetchError {
-            detail: err.to_string(),
-        })),
-    });
+    crate::curl::run(argv_owned, None, on_done);
 }
 
 #[cfg(test)]

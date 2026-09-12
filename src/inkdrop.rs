@@ -1,6 +1,4 @@
 use anyhow::bail;
-use gtk::gio;
-use gtk4 as gtk;
 use serde::Deserialize;
 
 fn default_port() -> u16 {
@@ -86,6 +84,15 @@ pub fn note_payload(book_id: &str, title: &str, body: &str) -> String {
     .to_string()
 }
 
+/// JSON 文字列からトップレベルの文字列フィールドを取り出す。無ければ None
+pub fn json_str_field(json: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// GET /books 応答から名前完全一致の _id を返す。bool は「同名が複数あった」
 pub fn find_book_id(books_json: &str, name: &str) -> Option<(String, bool)> {
     let v: serde_json::Value = serde_json::from_str(books_json).ok()?;
@@ -129,12 +136,8 @@ pub fn format_count(n: usize, limit: usize) -> String {
     }
 }
 
-/// curl 実行の失敗。curl_exit: 7=接続不可, 22=HTTP エラー, 28=タイムアウト
-#[derive(Debug)]
-pub struct RequestError {
-    pub curl_exit: Option<i32>,
-    pub detail: String,
-}
+/// curl 実行の失敗 (詳細は [`crate::curl::CurlError`])
+pub use crate::curl::CurlError as RequestError;
 
 /// Inkdrop Local Server へ curl でリクエストする (argv 固定、シェル不経由)。
 /// 完了時 on_done がメインループ上で呼ばれる。キャンセル機構は持たない (短時間・冪等)
@@ -164,39 +167,7 @@ pub fn request(
         argv_owned.push("@-".into());
     }
     argv_owned.push(url);
-    let argv: Vec<&std::ffi::OsStr> = argv_owned.iter().map(|s| s.as_ref()).collect();
-
-    let mut flags = gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE;
-    if body.is_some() {
-        flags |= gio::SubprocessFlags::STDIN_PIPE;
-    }
-    let subprocess = match gio::Subprocess::newv(&argv, flags) {
-        Ok(p) => p,
-        Err(err) => {
-            on_done(Err(RequestError {
-                curl_exit: None,
-                detail: err.to_string(),
-            }));
-            return;
-        }
-    };
-    let sp = subprocess.clone();
-    subprocess.communicate_utf8_async(body, gio::Cancellable::NONE, move |result| match result {
-        Ok((stdout, _stderr)) if sp.is_successful() => {
-            on_done(Ok(stdout.as_deref().unwrap_or("").to_string()));
-        }
-        Ok((_, _)) => {
-            let code = sp.exit_status();
-            on_done(Err(RequestError {
-                curl_exit: Some(code),
-                detail: format!("curl exit {code}"),
-            }));
-        }
-        Err(err) => on_done(Err(RequestError {
-            curl_exit: None,
-            detail: err.to_string(),
-        })),
-    });
+    crate::curl::run(argv_owned, body, on_done);
 }
 
 /// curl の stdout から (本文, ステータス) を取り出す。
@@ -232,36 +203,11 @@ pub fn get_status(
         "\n%{http_code}".into(),
         url,
     ];
-    let argv: Vec<&std::ffi::OsStr> = argv_owned.iter().map(|s| s.as_ref()).collect();
-
-    let subprocess = match gio::Subprocess::newv(
-        &argv,
-        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
-    ) {
-        Ok(p) => p,
-        Err(err) => {
-            on_done(Err(RequestError {
-                curl_exit: None,
-                detail: err.to_string(),
-            }));
-            return;
-        }
-    };
-    let sp = subprocess.clone();
-    subprocess.communicate_utf8_async(None, gio::Cancellable::NONE, move |result| match result {
-        Ok((stdout, _stderr)) if sp.is_successful() => {
-            let stdout = stdout.as_deref().unwrap_or("");
-            let (body, status) = split_status(stdout);
-            on_done(Ok((status, body)));
-        }
-        Ok((_, _)) => on_done(Err(RequestError {
-            curl_exit: Some(sp.exit_status()),
-            detail: format!("curl exit {}", sp.exit_status()),
-        })),
-        Err(err) => on_done(Err(RequestError {
-            curl_exit: None,
-            detail: err.to_string(),
-        })),
+    crate::curl::run(argv_owned, None, move |res| {
+        on_done(res.map(|stdout| {
+            let (body, status) = split_status(&stdout);
+            (status, body)
+        }));
     });
 }
 
@@ -445,18 +391,14 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         let err = run_request_against(port).unwrap_err();
-        assert_eq!(err.curl_exit, Some(7), "接続拒否は curl exit 7: {err:?}");
+        assert_eq!(err.exit, Some(7), "接続拒否は curl exit 7: {err:?}");
     }
 
     #[test]
     fn request_reports_http_error() {
         let port = spawn_stub("401 Unauthorized", "Invalid credentials");
         let err = run_request_against(port).unwrap_err();
-        assert_eq!(
-            err.curl_exit,
-            Some(22),
-            "-f の HTTP エラーは curl exit 22: {err:?}"
-        );
+        assert_eq!(err.exit, Some(22), "-f の HTTP エラーは curl exit 22: {err:?}");
     }
 
     /// 起動中のポートに対して get_status を呼ぶテスト用ヘルパ
@@ -504,7 +446,7 @@ mod tests {
         let port = probe.local_addr().expect("addr").port();
         drop(probe); // 誰も listen していない
         let err = run_get_status_against(port, "/notes/x").expect_err("接続不可は Err");
-        assert!(err.curl_exit.is_some(), "curl の exit が入る: {err:?}");
+        assert!(err.exit.is_some(), "curl の exit が入る: {err:?}");
     }
 
     #[test]
