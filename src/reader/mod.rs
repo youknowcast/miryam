@@ -5,6 +5,7 @@ pub mod export;
 pub mod geom;
 pub mod library;
 pub mod outline;
+pub mod present;
 pub mod search;
 pub mod store;
 pub mod ui;

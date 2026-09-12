@@ -47,6 +47,9 @@ struct AppCtx {
     ui: Rc<ui::MascotUi>,
     timers: Rc<RefCell<Timers>>,
     muted: Rc<Cell<bool>>,
+    /// 発表モード中は自動発話 (定期発話・時報・見守り・ニュースポップ) を止める。
+    /// ミュート (`muted`) とは別フラグで、発表の開始/終了で上書きしない
+    presenting: Rc<Cell<bool>>,
     quitting: Rc<Cell<bool>>,
     recalls: Rc<RefCell<Vec<String>>>,
     started_at: Instant,
@@ -163,6 +166,7 @@ impl AppCtx {
                 ctx.timers.borrow_mut().next_speech = None;
                 if !ctx.quitting.get()
                     && !ctx.muted.get()
+                    && !ctx.presenting.get()
                     && ctx.timers.borrow().chat_session.is_none()
                 {
                     ctx.scheduled_speak();
@@ -182,6 +186,7 @@ impl AppCtx {
         glib::timeout_add_local_once(wait, move || {
             if !ctx.quitting.get()
                 && !ctx.muted.get()
+                && !ctx.presenting.get()
                 && ctx.timers.borrow().chat_session.is_none()
             {
                 ctx.speak_event(phrases::EventKind::Chime);
@@ -232,6 +237,7 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
         ui,
         timers,
         muted,
+        presenting: Rc::new(Cell::new(false)),
         quitting,
         recalls,
         started_at,
@@ -445,7 +451,7 @@ fn schedule_inbox_check(
 ) {
     glib::timeout_add_local_once(Duration::from_secs(delay_secs), move || {
         let enabled = ctx.book.inkdrop().is_some_and(|c| c.inbox_threshold > 0);
-        if enabled && !ctx.quitting.get() && !ctx.muted.get() {
+        if enabled && !ctx.quitting.get() && !ctx.muted.get() && !ctx.presenting.get() {
             run_inbox_check(ctx.clone(), cache.clone(), last_notified.clone());
         }
         schedule_inbox_check(ctx.clone(), cache.clone(), last_notified.clone(), INBOX_CHECK_INTERVAL_SECS);
@@ -485,6 +491,7 @@ fn run_inbox_check(
         inkdrop::request(&cfg, "GET", &path, None, move |res| {
             if ctx.quitting.get()
                 || ctx.muted.get()
+                || ctx.presenting.get()
                 || ctx.timers.borrow().chat_session.is_some()
             {
                 return; // 発行後にミュート/終了/会話中になった場合は発話もマーカーもなし
@@ -612,6 +619,7 @@ fn summarize_news(ctx: &NewsCtx, results: NewsFetchResults) {
                 });
                 if !ctx_c.core.quitting.get()
                     && !ctx_c.core.muted.get()
+                    && !ctx_c.core.presenting.get()
                     && ctx_c.core.timers.borrow().chat_session.is_none()
                 {
                     ui::show_news_popup(
@@ -635,7 +643,11 @@ fn summarize_news(ctx: &NewsCtx, results: NewsFetchResults) {
 
 /// 失敗一言 (ミュート/会話中/終了中は黙る)
 fn news_speak_failure(ctx: &AppCtx) {
-    if ctx.quitting.get() || ctx.muted.get() || ctx.timers.borrow().chat_session.is_some() {
+    if ctx.quitting.get()
+        || ctx.muted.get()
+        || ctx.presenting.get()
+        || ctx.timers.borrow().chat_session.is_some()
+    {
         return;
     }
     ctx.automatic_speak("ニュースが取れませんでした");
@@ -963,6 +975,53 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
     true
 }
 
+/// 発表モードを開始する。reader を `--present` 付きで起動し、終了までマスコットを
+/// 隠して自動発話を止める。二重起動は running で防ぐ
+fn open_presenter(core: &AppCtx, running: &Rc<Cell<bool>>, path: String) {
+    if running.get() {
+        show_text(&core.ui, &core.timers, "すでに発表モードです");
+        return;
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| "miryam".into());
+    let reader = ui::reader_exe_path(&exe);
+    let argv = [
+        reader.as_os_str(),
+        "--present".as_ref(),
+        std::ffi::OsStr::new(&path),
+    ];
+    match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
+        Ok(proc) => {
+            running.set(true);
+            set_presenting(core, true, true);
+            let (core, running) = (core.clone(), running.clone());
+            proc.wait_async(None::<&gio::Cancellable>, move |_| {
+                running.set(false);
+                set_presenting(&core, false, false);
+            });
+        }
+        Err(e) => {
+            eprintln!(
+                "miryam: presenter を起動できません (miryam-reader が無ければ `cargo build` で作成してください): {e}"
+            );
+            show_text(&core.ui, &core.timers, "発表モードを起動できませんでした");
+        }
+    }
+}
+
+/// 発表モードの入/切。`on` ならマスコットを隠して自動発話を止め、`off` で戻す。
+/// `active` は発表ウィンドウが生きているか。発表中に出すときだけ Overlay へ上げて
+/// 全画面より手前に見せる。ミュート (`muted`) とは別フラグなので壊さない
+fn set_presenting(core: &AppCtx, on: bool, active: bool) {
+    core.ui.set_layer_above_presentation(active && !on);
+    core.ui.set_mascot_visible(!on);
+    let changed = core.presenting.replace(on) != on;
+    if changed && on {
+        // 発表を始める前に飛んでいた LLM 台詞が後から出ないよう切る (キャンセル規則)
+        core.cancel_pending_llm();
+        core.ui.hide_bubble();
+    }
+}
+
 fn register_actions(
     app: &gtk::Application,
     core: AppCtx,
@@ -1000,6 +1059,38 @@ fn register_actions(
         });
     }
     app.add_action(&mute);
+
+    // 発表モード: マスコットを隠して自動発話を止め、reader を --present で起動する。
+    // 外部 (miryam-ctl present) と本棚の「発表」ボタンの両方から使う
+    let present_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let spawn_present: Rc<dyn Fn(String)> = {
+        let core = core.clone();
+        let running = present_running.clone();
+        Rc::new(move |path: String| open_presenter(&core, &running, path))
+    };
+    let present = gio::SimpleAction::new("present", Some(glib::VariantTy::STRING));
+    {
+        let spawn = spawn_present.clone();
+        present.connect_activate(move |_, param| {
+            if let Some(path) = param.and_then(|v| v.get::<String>()) {
+                spawn(path);
+            }
+        });
+    }
+    app.add_action(&present);
+
+    // 発表モード中に presentation が `m` を押したときに呼ぶ。
+    // true = マスコット表示 (自動発話も再開)、false = 非表示 + 自動発話停止
+    let set_mascot = gio::SimpleAction::new("set-mascot-visible", Some(glib::VariantTy::BOOLEAN));
+    {
+        let core = core.clone();
+        let present_running = present_running.clone();
+        set_mascot.connect_activate(move |_, param| {
+            let visible = param.and_then(|v| v.get::<bool>()).unwrap_or(true);
+            set_presenting(&core, !visible, present_running.get());
+        });
+    }
+    app.add_action(&set_mascot);
 
     let quit_request = gio::SimpleAction::new("quit-request", None);
     {
@@ -1172,20 +1263,26 @@ fn register_actions(
     }
     app.add_action(&news_show);
 
-    // 本棚: メニュー「本棚」。[reader] が無ければアクション自体を登録しない
-    // (走査対象フォルダが無いため news-show のような無条件登録はしない)
+    // 本棚/発表 PDF 選択: メニュー「本棚」「PDF を発表する…」。
+    // [reader] 未設定でも使えるよう、サンプル PDF 入りの既定フォルダへフォールバックする
     let library_slot: Rc<RefCell<Option<gtk::Window>>> = Rc::new(RefCell::new(None));
-    if let Some(cfg) = core.book.reader() {
-        let dir = cfg.dir_path();
-        let recursive = cfg.recursive;
-        let recall_probability = cfg.recall_probability;
-        let library_show = gio::SimpleAction::new("library-show", None);
+    {
+        let (dir, recursive, recall_probability) = match core.book.reader() {
+            Some(cfg) => (cfg.dir_path(), cfg.recursive, cfg.recall_probability),
+            None => (
+                miryam::reader::config::prepare_default_library(),
+                false,
+                0.0,
+            ),
+        };
         let slot = library_slot.clone();
         let library_core = core.clone();
         let app_for_library = app.clone();
         let running: Rc<RefCell<std::collections::HashSet<std::path::PathBuf>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
-        library_show.connect_activate(move |_, _| {
+        // 「本棚」と「PDF を発表する…」は同じ一覧 (同じ [reader] dir) を使う。
+        // 目的 (読む / 発表) だけを差し替えて同じウィンドウを作る
+        let open_library: Rc<dyn Fn(ui::LibraryPurpose)> = Rc::new(move |purpose| {
             let entries = match miryam::reader::library::scan(&dir, recursive) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1214,6 +1311,7 @@ fn register_actions(
                 .collect();
             let running = running.clone();
             let open_core = library_core.clone();
+            let present_for_open = spawn_present.clone();
             ui::show_library_window(
                 &app_for_library,
                 &slot,
@@ -1250,9 +1348,23 @@ fn register_actions(
                         }
                     }
                 },
+                move |path| present_for_open(path.to_string_lossy().into_owned()),
+                purpose,
             );
         });
+        let library_show = gio::SimpleAction::new("library-show", None);
+        {
+            let open = open_library.clone();
+            library_show.connect_activate(move |_, _| open(ui::LibraryPurpose::Read));
+        }
         app.add_action(&library_show);
+
+        let present_pick = gio::SimpleAction::new("present-pick", None);
+        {
+            let open = open_library.clone();
+            present_pick.connect_activate(move |_, _| open(ui::LibraryPurpose::Present));
+        }
+        app.add_action(&present_pick);
     }
 
     // リンク集: リンクを既定ブラウザで開く (gtk::show_uri は 4.10 deprecated のため gio 経由)
@@ -1376,7 +1488,6 @@ fn register_actions(
                 .map(|c| c.modes().iter().map(|m| m.name.clone()).collect())
                 .unwrap_or_default(),
             core.book.news().is_some(),
-            core.book.reader().is_some(),
             move || match links::load(&links::links_path()) {
                 Ok(list) => links::build_submenu(&list),
                 Err(e) => {
