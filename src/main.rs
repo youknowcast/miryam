@@ -38,6 +38,149 @@ struct Timers {
     chat_session: Option<chat::ChatSession>,
 }
 
+/// 実行時状態の共有束。各関数が同じ 7 個のハンドル
+/// (book/ui/timers/muted/quitting/recalls/started_at) を引き回すのを避ける。
+/// クロージャへは clone して渡す (全て Rc / Copy なので安い)。
+#[derive(Clone)]
+struct AppCtx {
+    book: Rc<phrases::PhraseBook>,
+    ui: Rc<ui::MascotUi>,
+    timers: Rc<RefCell<Timers>>,
+    muted: Rc<Cell<bool>>,
+    quitting: Rc<Cell<bool>>,
+    recalls: Rc<RefCell<Vec<String>>>,
+    started_at: Instant,
+}
+
+impl AppCtx {
+    /// 飛行中の LLM リクエストがあれば破棄する (発話前のキャンセル規則)
+    fn cancel_pending_llm(&self) {
+        if let Some(req) = self.timers.borrow_mut().llm_request.take() {
+            req.cancel();
+        }
+    }
+
+    /// 辞書から台詞を選んで表示する
+    fn speak(&self) {
+        self.cancel_pending_llm();
+        let now = phrases::Snapshot::current(self.started_at);
+        let (text, face) = self.book.pick(&now);
+        let text = phrases::substitute_placeholders(text, &now);
+        show_text(&self.ui, &self.timers, &text);
+        self.ui.set_face(face);
+    }
+
+    /// 外部由来テキストの発話: LLM キャンセル + 表示 + 次回定期発話の張り直し。
+    /// ミュート中でも表示する (自動発話でなく明示的な外部要求のため)
+    fn external_speak(&self, text: &str) {
+        self.cancel_pending_llm();
+        show_text(&self.ui, &self.timers, text);
+        self.schedule_next_speech();
+    }
+
+    /// 自動発話 (見守り用): LLM キャンセル + 表示のみ。定期発話は張り直さない
+    fn automatic_speak(&self, text: &str) {
+        self.cancel_pending_llm();
+        show_text(&self.ui, &self.timers, text);
+    }
+
+    /// イベント台詞を選んで表示する。プールが空なら何もせず false
+    fn speak_event(&self, event: phrases::EventKind) -> bool {
+        let now = phrases::Snapshot::current(self.started_at);
+        let Some((text, face)) = self.book.pick_event(event, &now) else {
+            return false;
+        };
+        let text = phrases::substitute_placeholders(text, &now);
+        self.cancel_pending_llm();
+        show_text(&self.ui, &self.timers, &text);
+        self.ui.set_face(face);
+        true
+    }
+
+    /// 定期発話: まず思い出し台詞の抽選 (当たれば即座に発話)、外れたら [llm] 有効かつ
+    /// 確率に当選かつ in-flight なし なら LLM、それ以外は辞書
+    fn scheduled_speak(&self) {
+        use rand::RngExt;
+        let remark = {
+            let probability = self.book.reader().map(|c| c.recall_probability).unwrap_or(0.0);
+            let remarks = self.recalls.borrow();
+            scheduler::pick_recall(
+                &remarks,
+                probability,
+                rand::rng().random_range(0.0..1.0),
+                rand::rng().random_range(0..usize::MAX),
+            )
+        };
+        if let Some(remark) = remark {
+            // 思い出し発話も既存のキャンセル規則に従う: 発話前に in-flight の LLM を cancel
+            // しないと、返ってきた LLM 台詞がこの吹き出しを数秒後に上書きしてしまう
+            self.cancel_pending_llm();
+            show_text(&self.ui, &self.timers, &remark);
+            return;
+        }
+        let use_llm = self.book.llm().is_some_and(|cfg| {
+            self.timers.borrow().llm_request.is_none()
+                && rand::rng().random_range(0.0..1.0) < cfg.probability
+        });
+        if !use_llm {
+            self.speak();
+            return;
+        }
+        let cfg = self.book.llm().expect("use_llm なら Some");
+        let prompt = llm::build_prompt(cfg, &phrases::Snapshot::current(self.started_at));
+        let ctx = self.clone();
+        let req = llm::request_phrase(cfg, &prompt, move |result| {
+            ctx.timers.borrow_mut().llm_request = None;
+            match result {
+                Some(text) => show_text(&ctx.ui, &ctx.timers, &text),
+                None => ctx.speak(),
+            }
+        });
+        self.timers.borrow_mut().llm_request = Some(req);
+    }
+
+    /// [speech] の間隔設定 (既定 30〜90 秒) に従って次回発話をスケジュールする。
+    /// 既存の予約はキャンセルする
+    fn schedule_next_speech(&self) {
+        if let Some(id) = self.timers.borrow_mut().next_speech.take() {
+            id.remove();
+        }
+        let ctx = self.clone();
+        let (min_secs, max_secs) = self.book.speech_interval();
+        let id = glib::timeout_add_local_once(
+            scheduler::next_speech_interval(min_secs, max_secs),
+            move || {
+                ctx.timers.borrow_mut().next_speech = None;
+                if !ctx.quitting.get()
+                    && !ctx.muted.get()
+                    && ctx.timers.borrow().chat_session.is_none()
+                {
+                    ctx.scheduled_speak();
+                }
+                ctx.schedule_next_speech();
+            },
+        );
+        self.timers.borrow_mut().next_speech = Some(id);
+    }
+
+    /// 次の毎時 0 分に時報を予約する。発火後は再帰的に再予約 (毎回現在時刻から再計算)
+    fn schedule_chime(&self) {
+        use chrono::Timelike;
+        let local = chrono::Local::now();
+        let wait = scheduler::duration_until_next_hour(local.minute(), local.second());
+        let ctx = self.clone();
+        glib::timeout_add_local_once(wait, move || {
+            if !ctx.quitting.get()
+                && !ctx.muted.get()
+                && ctx.timers.borrow().chat_session.is_none()
+            {
+                ctx.speak_event(phrases::EventKind::Chime);
+            }
+            ctx.schedule_chime();
+        });
+    }
+}
+
 fn activate(app: &gtk::Application) -> anyhow::Result<()> {
     if app.active_window().is_some() {
         return Ok(());
@@ -74,59 +217,40 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
         }
     }
 
+    let core = AppCtx {
+        book,
+        ui,
+        timers,
+        muted,
+        quitting,
+        recalls,
+        started_at,
+    };
+
     register_actions(
         app,
-        &book,
-        &ui,
-        &timers,
-        &muted,
-        &quitting,
+        core.clone(),
         &book_id_cache,
         &chat_book_id_cache,
         &news_digest,
-        &recalls,
-        started_at,
     );
 
-    schedule_next_speech(
-        book.clone(),
-        ui.clone(),
-        timers.clone(),
-        muted.clone(),
-        quitting.clone(),
-        recalls.clone(),
-        started_at,
-    );
-    schedule_chime(
-        book.clone(),
-        ui.clone(),
-        timers.clone(),
-        muted.clone(),
-        quitting.clone(),
-        started_at,
-    );
+    core.schedule_next_speech();
+    core.schedule_chime();
 
-    if book.news().is_some() {
+    if core.book.news().is_some() {
         let news_ctx = NewsCtx {
             app: app.clone(),
-            book: book.clone(),
-            ui: ui.clone(),
-            timers: timers.clone(),
-            muted: muted.clone(),
-            quitting: quitting.clone(),
+            core: core.clone(),
             digest: news_digest.clone(),
             popup_slot: Rc::new(RefCell::new(None)),
         };
         schedule_news(news_ctx, Duration::from_secs(NEWS_FIRST_DELAY_SECS));
     }
 
-    if book.inkdrop().is_some_and(|c| c.inbox_threshold > 0) {
+    if core.book.inkdrop().is_some_and(|c| c.inbox_threshold > 0) {
         schedule_inbox_check(
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
+            core.clone(),
             book_id_cache.clone(),
             inbox_last_notified.clone(),
             INBOX_CHECK_FIRST_DELAY_SECS,
@@ -135,38 +259,24 @@ fn activate(app: &gtk::Application) -> anyhow::Result<()> {
 
     // 起動挨拶 (1 秒後)
     {
-        let (book, ui, timers, quitting) =
-            (book.clone(), ui.clone(), timers.clone(), quitting.clone());
+        let core = core.clone();
         glib::timeout_add_local_once(Duration::from_secs(1), move || {
-            if !quitting.get() {
-                speak_event(&book, &ui, &timers, phrases::EventKind::Boot, started_at);
+            if !core.quitting.get() {
+                core.speak_event(phrases::EventKind::Boot);
             }
         });
     }
 
-    let (book_c, ui_c, timers_c, muted_c, quitting_c, recalls_c) = (
-        book.clone(),
-        ui.clone(),
-        timers.clone(),
-        muted.clone(),
-        quitting.clone(),
-        recalls.clone(),
-    );
-    ui.connect_character_clicked(move || {
-        if quitting_c.get() || timers_c.borrow().chat_session.is_some() {
-            return;
-        }
-        speak(&book_c, &ui_c, &timers_c, started_at);
-        schedule_next_speech(
-            book_c.clone(),
-            ui_c.clone(),
-            timers_c.clone(),
-            muted_c.clone(),
-            quitting_c.clone(),
-            recalls_c.clone(),
-            started_at,
-        );
-    });
+    {
+        let ctx = core.clone();
+        core.ui.connect_character_clicked(move || {
+            if ctx.quitting.get() || ctx.timers.borrow().chat_session.is_some() {
+                return;
+            }
+            ctx.speak();
+            ctx.schedule_next_speech();
+        });
+    }
 
     Ok(())
 }
@@ -201,53 +311,6 @@ fn show_text_persistent(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, tex
     }
     ui.set_face(None);
     ui.show_bubble(text);
-}
-
-/// 辞書から台詞を選んで表示する。進行中の LLM リクエストはキャンセルする (キャンセル規則)
-fn speak(
-    book: &Rc<phrases::PhraseBook>,
-    ui: &Rc<ui::MascotUi>,
-    timers: &Rc<RefCell<Timers>>,
-    started_at: Instant,
-) {
-    let pending = timers.borrow_mut().llm_request.take();
-    if let Some(req) = pending {
-        req.cancel();
-    }
-    let now = phrases::Snapshot::current(started_at);
-    let (text, face) = book.pick(&now);
-    let text = phrases::substitute_placeholders(text, &now);
-    show_text(ui, timers, &text);
-    ui.set_face(face);
-}
-
-/// 外部由来テキストの発話 (postprocess 済み前提): LLM キャンセル + 表示 + 次回定期発話の張り直し
-/// ミュート中でも表示する (自動発話でなく明示的な外部要求のため — mute チェックを足さないこと)
-#[allow(clippy::too_many_arguments)]
-fn external_speak(
-    book: &Rc<phrases::PhraseBook>,
-    ui: &Rc<ui::MascotUi>,
-    timers: &Rc<RefCell<Timers>>,
-    muted: &Rc<Cell<bool>>,
-    quitting: &Rc<Cell<bool>>,
-    recalls: &Rc<RefCell<Vec<String>>>,
-    started_at: Instant,
-    text: &str,
-) {
-    let pending = timers.borrow_mut().llm_request.take();
-    if let Some(req) = pending {
-        req.cancel();
-    }
-    show_text(ui, timers, text);
-    schedule_next_speech(
-        book.clone(),
-        ui.clone(),
-        timers.clone(),
-        muted.clone(),
-        quitting.clone(),
-        recalls.clone(),
-        started_at,
-    );
 }
 
 /// resolve_book_id の失敗理由
@@ -294,49 +357,24 @@ fn resolve_book_id(
 }
 
 /// memo: book 解決 → POST /notes → 確認発話 (エラーは毎回 stderr)
-fn capture_to_inkdrop(
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
-    recalls: Rc<RefCell<Vec<String>>>,
-    cache: Rc<RefCell<Option<String>>>,
-    started_at: Instant,
-    text: String,
-) {
-    let cfg_book_name = book
+fn capture_to_inkdrop(ctx: &AppCtx, cache: Rc<RefCell<Option<String>>>, text: String) {
+    let cfg_book_name = ctx
+        .book
         .inkdrop()
         .expect("memo は inkdrop 有効時のみ")
         .book
         .clone();
-    let (book_r, ui_r, timers_r, muted_r, quitting_r, recalls_r) = (
-        book.clone(),
-        ui.clone(),
-        timers.clone(),
-        muted.clone(),
-        quitting.clone(),
-        recalls.clone(),
-    );
     let name_c = cfg_book_name.clone();
-    resolve_book_id(book.clone(), cache, cfg_book_name, move |resolved| {
-        if quitting_r.get() {
+    let ctx = ctx.clone();
+    resolve_book_id(ctx.book.clone(), cache, cfg_book_name, move |resolved| {
+        if ctx.quitting.get() {
             return;
         }
         let book_id = match resolved {
             Ok(id) => id,
             Err(ResolveError::NotFound) => {
                 eprintln!("miryam: ノートブック \"{name_c}\" が見つかりません");
-                external_speak(
-                    &book_r,
-                    &ui_r,
-                    &timers_r,
-                    &muted_r,
-                    &quitting_r,
-                    &recalls_r,
-                    started_at,
-                    &format!("ノートブック \"{name_c}\" が見つかりません"),
-                );
+                ctx.external_speak(&format!("ノートブック \"{name_c}\" が見つかりません"));
                 return;
             }
             Err(ResolveError::Request(err)) => {
@@ -344,74 +382,31 @@ fn capture_to_inkdrop(
                     "miryam: Inkdrop への接続に失敗しました (curl exit {:?}): {}",
                     err.curl_exit, err.detail
                 );
-                external_speak(
-                    &book_r,
-                    &ui_r,
-                    &timers_r,
-                    &muted_r,
-                    &quitting_r,
-                    &recalls_r,
-                    started_at,
-                    "Inkdrop に届きませんでした",
-                );
+                ctx.external_speak("Inkdrop に届きませんでした");
                 return;
             }
         };
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let (title, body_text) = inkdrop::capture_note(&text, &date);
         let payload = inkdrop::note_payload(&book_id, &title, &body_text);
-        let cfg = book_r.inkdrop().expect("memo は inkdrop 有効時のみ");
-        let (book_c, ui_c, timers_c, muted_c, quitting_c, recalls_c) = (
-            book_r.clone(),
-            ui_r.clone(),
-            timers_r.clone(),
-            muted_r.clone(),
-            quitting_r.clone(),
-            recalls_r.clone(),
-        );
+        let cfg = ctx.book.inkdrop().expect("memo は inkdrop 有効時のみ");
+        let ctx_c = ctx.clone();
         inkdrop::request(cfg, "POST", "/notes", Some(payload), move |res| {
-            if quitting_c.get() {
+            if ctx_c.quitting.get() {
                 return;
             }
             match res {
-                Ok(_) => external_speak(
-                    &book_c,
-                    &ui_c,
-                    &timers_c,
-                    &muted_c,
-                    &quitting_c,
-                    &recalls_c,
-                    started_at,
-                    "メモを預かりました",
-                ),
+                Ok(_) => ctx_c.external_speak("メモを預かりました"),
                 Err(err) => {
                     eprintln!(
                         "miryam: Inkdrop への保存に失敗しました (curl exit {:?}): {}",
                         err.curl_exit, err.detail
                     );
-                    external_speak(
-                        &book_c,
-                        &ui_c,
-                        &timers_c,
-                        &muted_c,
-                        &quitting_c,
-                        &recalls_c,
-                        started_at,
-                        "Inkdrop に届きませんでした",
-                    );
+                    ctx_c.external_speak("Inkdrop に届きませんでした");
                 }
             }
         });
     });
-}
-
-/// 自動発話 (見守り用): LLM キャンセル + 表示のみ。定期発話は張り直さない
-fn automatic_speak(ui: &Rc<ui::MascotUi>, timers: &Rc<RefCell<Timers>>, text: &str) {
-    let pending = timers.borrow_mut().llm_request.take();
-    if let Some(req) = pending {
-        req.cancel();
-    }
-    show_text(ui, timers, text);
 }
 
 fn warn_inbox_once(detail: &str) {
@@ -433,63 +428,32 @@ fn warn_chat_once(detail: &str) {
 
 /// Inbox 見守り: 固定間隔で件数を確認し、しきい値超過を 1 日 1 回だけ知らせる
 fn schedule_inbox_check(
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
+    ctx: AppCtx,
     cache: Rc<RefCell<Option<String>>>,
     last_notified: Rc<RefCell<Option<chrono::NaiveDate>>>,
     delay_secs: u64,
 ) {
     glib::timeout_add_local_once(Duration::from_secs(delay_secs), move || {
-        let enabled = book.inkdrop().is_some_and(|c| c.inbox_threshold > 0);
-        if enabled && !quitting.get() && !muted.get() {
-            run_inbox_check(
-                book.clone(),
-                ui.clone(),
-                timers.clone(),
-                muted.clone(),
-                quitting.clone(),
-                cache.clone(),
-                last_notified.clone(),
-            );
+        let enabled = ctx.book.inkdrop().is_some_and(|c| c.inbox_threshold > 0);
+        if enabled && !ctx.quitting.get() && !ctx.muted.get() {
+            run_inbox_check(ctx.clone(), cache.clone(), last_notified.clone());
         }
-        schedule_inbox_check(
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            cache.clone(),
-            last_notified.clone(),
-            INBOX_CHECK_INTERVAL_SECS,
-        );
+        schedule_inbox_check(ctx.clone(), cache.clone(), last_notified.clone(), INBOX_CHECK_INTERVAL_SECS);
     });
 }
 
 fn run_inbox_check(
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
+    ctx: AppCtx,
     cache: Rc<RefCell<Option<String>>>,
     last_notified: Rc<RefCell<Option<chrono::NaiveDate>>>,
 ) {
-    let (book_r, ui_r, timers_r, muted_r, quitting_r) = (
-        book.clone(),
-        ui.clone(),
-        timers.clone(),
-        muted.clone(),
-        quitting.clone(),
-    );
-    let name = book
+    let name = ctx
+        .book
         .inkdrop()
         .expect("見守りは inkdrop 有効時のみ")
         .book
         .clone();
-    resolve_book_id(book.clone(), cache, name, move |resolved| {
+    resolve_book_id(ctx.book.clone(), cache, name, move |resolved| {
         let book_id = match resolved {
             Ok(id) => id,
             Err(ResolveError::NotFound) => {
@@ -501,15 +465,18 @@ fn run_inbox_check(
                 return;
             }
         };
-        let cfg = book_r.inkdrop().expect("見守りは inkdrop 有効時のみ");
+        let cfg = ctx.book.inkdrop().expect("見守りは inkdrop 有効時のみ").clone();
         let path = format!(
             "/notes?keyword=bookId:{}&limit={}",
             inkdrop::strip_book_prefix(&book_id),
             inkdrop::NOTES_QUERY_LIMIT
         );
         let threshold = cfg.inbox_threshold;
-        inkdrop::request(cfg, "GET", &path, None, move |res| {
-            if quitting_r.get() || muted_r.get() || timers_r.borrow().chat_session.is_some() {
+        inkdrop::request(&cfg, "GET", &path, None, move |res| {
+            if ctx.quitting.get()
+                || ctx.muted.get()
+                || ctx.timers.borrow().chat_session.is_some()
+            {
                 return; // 発行後にミュート/終了/会話中になった場合は発話もマーカーもなし
             }
             let count = match res {
@@ -528,11 +495,9 @@ fn run_inbox_check(
             let today = chrono::Local::now().date_naive();
             if inkdrop::should_notify(count, threshold, *last_notified.borrow(), today) {
                 let n = inkdrop::format_count(count, inkdrop::NOTES_QUERY_LIMIT);
-                automatic_speak(
-                    &ui_r,
-                    &timers_r,
-                    &format!("Inbox に {n} 件たまっています。そろそろ整理しませんか"),
-                );
+                ctx.automatic_speak(&format!(
+                    "Inbox に {n} 件たまっています。そろそろ整理しませんか"
+                ));
                 *last_notified.borrow_mut() = Some(today);
             }
         });
@@ -543,11 +508,7 @@ fn run_inbox_check(
 #[derive(Clone)]
 struct NewsCtx {
     app: gtk::Application,
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
+    core: AppCtx,
     digest: Rc<RefCell<Option<news::Digest>>>,
     /// ニュースポップの slot (同時 1 枚)
     popup_slot: Rc<RefCell<Option<gtk::Window>>>,
@@ -556,11 +517,12 @@ struct NewsCtx {
 /// ニュースサイクル: 固定間隔で feeds を取得し LLM でダイジェスト化して知らせる
 fn schedule_news(ctx: NewsCtx, delay: Duration) {
     glib::timeout_add_local_once(delay, move || {
-        if ctx.quitting.get() {
+        if ctx.core.quitting.get() {
             return;
         }
         run_news_cycle(ctx.clone());
         let interval = ctx
+            .core
             .book
             .news()
             .expect("ニュースは [news] 有効時のみ")
@@ -575,7 +537,7 @@ type NewsFetchResults = Rc<RefCell<Vec<Option<(String, String)>>>>;
 /// 1 サイクル: 全 feed 並行取得 → 整形連結 → LLM → ポップ + ダイジェスト保持。
 /// 途中でミュート/会話が始まっても取得と保持は続け、ポップだけ落とす
 fn run_news_cycle(ctx: NewsCtx) {
-    let cfg = ctx.book.news().expect("ニュースは [news] 有効時のみ");
+    let cfg = ctx.core.book.news().expect("ニュースは [news] 有効時のみ");
     let urls = cfg.feeds.clone();
     let max_bytes = (cfg.max_kb_per_feed as usize) * 1024;
     let total = urls.len();
@@ -611,40 +573,41 @@ fn run_news_cycle(ctx: NewsCtx) {
 
 /// 取得結果を LLM に渡し、キャラ上部へのポップ表示とダイジェスト更新を行う
 fn summarize_news(ctx: &NewsCtx, results: NewsFetchResults) {
-    if ctx.quitting.get() {
+    if ctx.core.quitting.get() {
         return;
     }
     let sources: Vec<(String, String)> = results.borrow_mut().drain(..).flatten().collect();
     if sources.is_empty() {
-        news_speak_failure(&ctx.ui, &ctx.timers, &ctx.muted, &ctx.quitting);
+        news_speak_failure(&ctx.core);
         return;
     }
-    let cfg = ctx.book.news().expect("ニュースは [news] 有効時のみ");
+    let cfg = ctx.core.book.news().expect("ニュースは [news] 有効時のみ");
     let llm_cfg = ctx
+        .core
         .book
         .llm()
         .expect("[news] には [llm] が必須 (validate 済み)");
     let prompt = news::build_news_prompt(cfg, &sources);
-    if let Some(req) = ctx.timers.borrow_mut().news_request.take() {
+    if let Some(req) = ctx.core.timers.borrow_mut().news_request.take() {
         req.cancel(); // 前サイクルの要約が生きていたら破棄 (遅い LLM の追い越し防止)
     }
     let ctx_c = ctx.clone();
     let req = llm::request_text(llm_cfg, &prompt, move |raw| {
-        ctx_c.timers.borrow_mut().news_request = None;
+        ctx_c.core.timers.borrow_mut().news_request = None;
         match raw.as_deref().and_then(news::postprocess_news) {
             Some((bubble, body)) => {
                 *ctx_c.digest.borrow_mut() = Some(news::Digest {
                     body: body.clone(),
                     made_at: chrono::Local::now(),
                 });
-                if !ctx_c.quitting.get()
-                    && !ctx_c.muted.get()
-                    && ctx_c.timers.borrow().chat_session.is_none()
+                if !ctx_c.core.quitting.get()
+                    && !ctx_c.core.muted.get()
+                    && ctx_c.core.timers.borrow().chat_session.is_none()
                 {
                     ui::show_news_popup(
                         &ctx_c.app,
                         &ctx_c.popup_slot,
-                        &ctx_c.ui,
+                        &ctx_c.core.ui,
                         &bubble,
                         &body,
                         ui::NEWS_POPUP_VISIBLE_SECS,
@@ -653,80 +616,66 @@ fn summarize_news(ctx: &NewsCtx, results: NewsFetchResults) {
             }
             None => {
                 eprintln!("miryam: ニュース要約に失敗しました (LLM 失敗または空出力)");
-                news_speak_failure(&ctx_c.ui, &ctx_c.timers, &ctx_c.muted, &ctx_c.quitting);
+                news_speak_failure(&ctx_c.core);
             }
         }
     });
-    ctx.timers.borrow_mut().news_request = Some(req);
+    ctx.core.timers.borrow_mut().news_request = Some(req);
 }
 
 /// 失敗一言 (ミュート/会話中/終了中は黙る)
-fn news_speak_failure(
-    ui: &Rc<ui::MascotUi>,
-    timers: &Rc<RefCell<Timers>>,
-    muted: &Rc<Cell<bool>>,
-    quitting: &Rc<Cell<bool>>,
-) {
-    if quitting.get() || muted.get() || timers.borrow().chat_session.is_some() {
+fn news_speak_failure(ctx: &AppCtx) {
+    if ctx.quitting.get() || ctx.muted.get() || ctx.timers.borrow().chat_session.is_some() {
         return;
     }
-    automatic_speak(ui, timers, "ニュースが取れませんでした");
+    ctx.automatic_speak("ニュースが取れませんでした");
 }
 
 /// チャット関連関数が共有する状態の束 (既存のタプル引き回しの肥大化を避ける)
 #[derive(Clone)]
 struct ChatCtx {
     app: gtk::Application,
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
+    core: AppCtx,
     chat_book_cache: Rc<RefCell<Option<String>>>,
     /// 会話ウィンドウの slot (同時 1 枚)。Some ⇒ chat_session も Some (mode 付き)
     chat_window: Rc<RefCell<Option<ui::ChatWindow>>>,
-    recalls: Rc<RefCell<Vec<String>>>,
-    started_at: Instant,
 }
 
 /// メニュー「話しかける」: 未開始なら開始、セッション中なら閉じる (トグル)
 fn open_or_toggle_chat(ctx: &ChatCtx) {
-    if ctx.quitting.get() {
+    if ctx.core.quitting.get() {
         return;
     }
-    if ctx.timers.borrow().chat_session.is_some() {
+    if ctx.core.timers.borrow().chat_session.is_some() {
         close_chat_session(ctx);
         return;
     }
     // 定期発話の LLM リクエストが飛行中なら破棄する (キャンセル規則: speak/speak_event と同様)
-    let pending = ctx.timers.borrow_mut().llm_request.take();
-    if let Some(req) = pending {
-        req.cancel();
-    }
-    ctx.timers.borrow_mut().chat_session = Some(chat::ChatSession::new(chrono::Local::now()));
-    ctx.ui.open_chat();
+    ctx.core.cancel_pending_llm();
+    ctx.core.timers.borrow_mut().chat_session = Some(chat::ChatSession::new(chrono::Local::now()));
+    ctx.core.ui.open_chat();
     reset_chat_idle_timer(ctx);
 }
 
 /// 無操作タイマーの張り直し (開始・送信・返答受信で呼ぶ)
 fn reset_chat_idle_timer(ctx: &ChatCtx) {
-    if let Some(id) = ctx.timers.borrow_mut().chat_idle.take() {
+    if let Some(id) = ctx.core.timers.borrow_mut().chat_idle.take() {
         id.remove();
     }
-    let Some(cfg) = ctx.book.chat() else { return };
+    let Some(cfg) = ctx.core.book.chat() else { return };
     let ctx_c = ctx.clone();
     let id = glib::timeout_add_local_once(Duration::from_secs(cfg.idle_close_secs), move || {
-        ctx_c.timers.borrow_mut().chat_idle = None;
+        ctx_c.core.timers.borrow_mut().chat_idle = None;
         close_chat_session(&ctx_c);
     });
-    ctx.timers.borrow_mut().chat_idle = Some(id);
+    ctx.core.timers.borrow_mut().chat_idle = Some(id);
 }
 
 /// クローズ経路の集約: キャンセル → UI 復帰 → 保存。戻り値は「保存を開始したか」。
 /// Esc・メニュートグル・無操作タイムアウト・終了のすべてがここを通る
 fn close_chat_session(ctx: &ChatCtx) -> bool {
     let (session, in_flight, idle) = {
-        let mut t = ctx.timers.borrow_mut();
+        let mut t = ctx.core.timers.borrow_mut();
         (
             t.chat_session.take(),
             t.chat_request.take(),
@@ -747,13 +696,13 @@ fn close_chat_session(ctx: &ChatCtx) -> bool {
     if let Some(win) = window {
         win.close();
     }
-    ctx.ui.close_chat();
+    ctx.core.ui.close_chat();
     if was_thinking {
         // 「……」が出たままにしない
-        if let Some(id) = ctx.timers.borrow_mut().hide_bubble.take() {
+        if let Some(id) = ctx.core.timers.borrow_mut().hide_bubble.take() {
             id.remove();
         }
-        ctx.ui.hide_bubble();
+        ctx.core.ui.hide_bubble();
     }
     if session.turns.is_empty() {
         return false;
@@ -763,7 +712,7 @@ fn close_chat_session(ctx: &ChatCtx) -> bool {
 
 /// 送信: 進行中キャンセル → 「……」表示 → request_raw → 返答表示 + 履歴確定
 fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
-    if ctx.quitting.get() {
+    if ctx.core.quitting.get() {
         return;
     }
     let text = raw_input.trim().to_string();
@@ -771,45 +720,46 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
         return;
     }
     let cfg = ctx
+        .core
         .book
         .chat()
         .expect("チャット UI は [chat] 有効時のみ配線される");
     // セッション不在なら以降の副作用 (idle タイマー起動など) を一切起こさない。
     // 「chat_idle が Some ⇒ chat_session も Some」という不変条件をここで担保する
-    if ctx.timers.borrow().chat_session.is_none() {
+    if ctx.core.timers.borrow().chat_session.is_none() {
         return;
     }
     // 再送信: 前のリクエストをキャンセル (前の pending はクロージャごと破棄)
-    if let Some(req) = ctx.timers.borrow_mut().chat_request.take() {
+    if let Some(req) = ctx.core.timers.borrow_mut().chat_request.take() {
         req.cancel();
     }
     reset_chat_idle_timer(ctx);
-    let now = phrases::Snapshot::current(ctx.started_at);
+    let now = phrases::Snapshot::current(ctx.core.started_at);
     let prompt = {
-        let timers = ctx.timers.borrow();
+        let timers = ctx.core.timers.borrow();
         let session = timers
             .chat_session
             .as_ref()
             .expect("直前にセッション存在を確認済み");
         chat::build_chat_prompt(cfg, &session.turns, &text, &now)
     };
-    show_text_persistent(&ctx.ui, &ctx.timers, "……");
+    show_text_persistent(&ctx.core.ui, &ctx.core.timers, "……");
     let ctx_c = ctx.clone();
     let user_text = text;
     let req = llm::request_raw(&cfg.command, cfg.timeout_secs, &prompt, move |raw| {
-        ctx_c.timers.borrow_mut().chat_request = None;
-        if ctx_c.quitting.get() {
+        ctx_c.core.timers.borrow_mut().chat_request = None;
+        if ctx_c.core.quitting.get() {
             return;
         }
         reset_chat_idle_timer(&ctx_c); // 返答受信も「操作」扱い
         let raw_was_some = raw.is_some();
         match raw.as_deref().and_then(chat::postprocess_chat) {
             Some(reply) => {
-                if let Some(session) = ctx_c.timers.borrow_mut().chat_session.as_mut() {
+                if let Some(session) = ctx_c.core.timers.borrow_mut().chat_session.as_mut() {
                     session.push_exchange(user_text, reply.clone());
                 }
                 let secs = chat::bubble_secs(&reply);
-                show_text_for(&ctx_c.ui, &ctx_c.timers, &reply, secs);
+                show_text_for(&ctx_c.core.ui, &ctx_c.core.timers, &reply, secs);
             }
             None => {
                 // CLI 自体の失敗 (raw None) は llm.rs 側で警告済みなのでここでは二重警告しない。
@@ -818,17 +768,17 @@ fn send_chat_message(ctx: &ChatCtx, raw_input: String) {
                     warn_chat_once("出力が空でした");
                 }
                 // 失敗ターン: pending (user_text) はここで捨てられ、履歴に残らない
-                show_text(&ctx_c.ui, &ctx_c.timers, "うまく言葉が出てきません");
+                show_text(&ctx_c.core.ui, &ctx_c.core.timers, "うまく言葉が出てきません");
             }
         }
     });
-    ctx.timers.borrow_mut().chat_request = Some(req);
+    ctx.core.timers.borrow_mut().chat_request = Some(req);
 }
 
 /// 会話窓モードの送信: 送信中は UI 側で入力不可のため多重送信は起きない。
 /// 返答は本文と選択肢に分離し、本文のみ履歴に積む
 fn send_window_message(ctx: &ChatCtx, raw_input: String) {
-    if ctx.quitting.get() {
+    if ctx.core.quitting.get() {
         return;
     }
     let text = raw_input.trim().to_string();
@@ -836,15 +786,16 @@ fn send_window_message(ctx: &ChatCtx, raw_input: String) {
         return;
     }
     let cfg = ctx
+        .core
         .book
         .chat()
         .expect("会話窓は [chat] 有効時のみ配線される");
-    if ctx.timers.borrow().chat_request.is_some() {
+    if ctx.core.timers.borrow().chat_request.is_some() {
         return; // set_busy 中のはずだが念のため (多重送信防止)
     }
-    let now = phrases::Snapshot::current(ctx.started_at);
+    let now = phrases::Snapshot::current(ctx.core.started_at);
     let prompt = {
-        let timers = ctx.timers.borrow();
+        let timers = ctx.core.timers.borrow();
         let Some(session) = timers.chat_session.as_ref() else {
             return;
         };
@@ -865,8 +816,8 @@ fn send_window_message(ctx: &ChatCtx, raw_input: String) {
     let ctx_c = ctx.clone();
     let user_text = text;
     let req = llm::request_raw(&cfg.command, cfg.timeout_secs, &prompt, move |raw| {
-        ctx_c.timers.borrow_mut().chat_request = None;
-        if ctx_c.quitting.get() {
+        ctx_c.core.timers.borrow_mut().chat_request = None;
+        if ctx_c.core.quitting.get() {
             return;
         }
         reset_chat_idle_timer(&ctx_c); // 返答受信も「操作」扱い
@@ -882,7 +833,7 @@ fn send_window_message(ctx: &ChatCtx, raw_input: String) {
                     // 選択肢だけの返答は失敗扱い (本文なしでは履歴に積めない)
                     win.finish_reply(None);
                 } else {
-                    if let Some(session) = ctx_c.timers.borrow_mut().chat_session.as_mut() {
+                    if let Some(session) = ctx_c.core.timers.borrow_mut().chat_session.as_mut() {
                         session.push_exchange(user_text, body.clone());
                     }
                     win.finish_reply(Some(&body));
@@ -899,24 +850,21 @@ fn send_window_message(ctx: &ChatCtx, raw_input: String) {
         }
         win.set_busy(false);
     });
-    ctx.timers.borrow_mut().chat_request = Some(req);
+    ctx.core.timers.borrow_mut().chat_request = Some(req);
 }
 
 /// 議論系モードの会話窓を開く。既存セッション (吹き出し・別窓) は閉じて保存してから
 fn open_window_chat(ctx: &ChatCtx, mode: chat::ChatMode) {
-    if ctx.quitting.get() {
+    if ctx.core.quitting.get() {
         return;
     }
     close_chat_session(ctx);
     // 定期発話の LLM リクエストが飛行中なら破棄する (キャンセル規則: open_or_toggle_chat と同様)
-    let pending = ctx.timers.borrow_mut().llm_request.take();
-    if let Some(req) = pending {
-        req.cancel();
-    }
+    ctx.core.cancel_pending_llm();
     let win = ui::build_chat_window(
         &ctx.app,
         &format!("{} — miryam", mode.name),
-        &ctx.ui.backdrop_texture(),
+        &ctx.core.ui.backdrop_texture(),
     );
     {
         let ctx_c = ctx.clone();
@@ -942,7 +890,7 @@ fn open_window_chat(ctx: &ChatCtx, mode: chat::ChatMode) {
             }
         });
     }
-    ctx.timers.borrow_mut().chat_session =
+    ctx.core.timers.borrow_mut().chat_session =
         Some(chat::ChatSession::with_mode(chrono::Local::now(), mode));
     *ctx.chat_window.borrow_mut() = Some(win);
     reset_chat_idle_timer(ctx);
@@ -951,7 +899,7 @@ fn open_window_chat(ctx: &ChatCtx, mode: chat::ChatMode) {
 /// セッションを Inkdrop に保存する。開始できたら true。
 /// 成功時は発話しない (会話の締めに毎回喋るのはノイズ)。失敗は stderr + 発話 (終了中を除く)
 fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
-    let Some(cfg) = ctx.book.inkdrop() else {
+    let Some(cfg) = ctx.core.book.inkdrop() else {
         return false; // 起動時に「保存されません」を警告済み
     };
     let name = cfg.chat_book_name().to_string();
@@ -960,7 +908,7 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
     let ctx_c = ctx.clone();
     let name_c = name.clone();
     resolve_book_id(
-        ctx.book.clone(),
+        ctx.core.book.clone(),
         ctx.chat_book_cache.clone(),
         name,
         move |resolved| {
@@ -968,17 +916,10 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                 Ok(id) => id,
                 Err(ResolveError::NotFound) => {
                     eprintln!("miryam: ノートブック \"{name_c}\" が見つかりません");
-                    if !ctx_c.quitting.get() {
-                        external_speak(
-                            &ctx_c.book,
-                            &ctx_c.ui,
-                            &ctx_c.timers,
-                            &ctx_c.muted,
-                            &ctx_c.quitting,
-                            &ctx_c.recalls,
-                            ctx_c.started_at,
-                            &format!("ノートブック \"{name_c}\" が見つかりません"),
-                        );
+                    if !ctx_c.core.quitting.get() {
+                        ctx_c
+                            .core
+                            .external_speak(&format!("ノートブック \"{name_c}\" が見つかりません"));
                     }
                     return;
                 }
@@ -987,23 +928,14 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                         "miryam: 会話ログの保存に失敗しました (curl exit {:?}): {}",
                         err.curl_exit, err.detail
                     );
-                    if !ctx_c.quitting.get() {
-                        external_speak(
-                            &ctx_c.book,
-                            &ctx_c.ui,
-                            &ctx_c.timers,
-                            &ctx_c.muted,
-                            &ctx_c.quitting,
-                            &ctx_c.recalls,
-                            ctx_c.started_at,
-                            "会話ログを Inkdrop に残せませんでした",
-                        );
+                    if !ctx_c.core.quitting.get() {
+                        ctx_c.core.external_speak("会話ログを Inkdrop に残せませんでした");
                     }
                     return;
                 }
             };
             let payload = inkdrop::note_payload(&book_id, &title, &body);
-            let cfg = ctx_c.book.inkdrop().expect("保存は inkdrop 有効時のみ");
+            let cfg = ctx_c.core.book.inkdrop().expect("保存は inkdrop 有効時のみ");
             let ctx_d = ctx_c.clone();
             inkdrop::request(cfg, "POST", "/notes", Some(payload), move |res| {
                 if let Err(err) = res {
@@ -1011,17 +943,8 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                         "miryam: 会話ログの保存に失敗しました (curl exit {:?}): {}",
                         err.curl_exit, err.detail
                     );
-                    if !ctx_d.quitting.get() {
-                        external_speak(
-                            &ctx_d.book,
-                            &ctx_d.ui,
-                            &ctx_d.timers,
-                            &ctx_d.muted,
-                            &ctx_d.quitting,
-                            &ctx_d.recalls,
-                            ctx_d.started_at,
-                            "会話ログを Inkdrop に残せませんでした",
-                        );
+                    if !ctx_d.core.quitting.get() {
+                        ctx_d.core.external_speak("会話ログを Inkdrop に残せませんでした");
                     }
                 }
             });
@@ -1030,201 +953,36 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
     true
 }
 
-/// イベント台詞を選んで表示する。プールが空なら何もせず false
-fn speak_event(
-    book: &Rc<phrases::PhraseBook>,
-    ui: &Rc<ui::MascotUi>,
-    timers: &Rc<RefCell<Timers>>,
-    event: phrases::EventKind,
-    started_at: Instant,
-) -> bool {
-    let now = phrases::Snapshot::current(started_at);
-    let Some((text, face)) = book.pick_event(event, &now) else {
-        return false;
-    };
-    let text = phrases::substitute_placeholders(text, &now);
-    let pending = timers.borrow_mut().llm_request.take();
-    if let Some(req) = pending {
-        req.cancel();
-    }
-    show_text(ui, timers, &text);
-    ui.set_face(face);
-    true
-}
-
-/// 定期発話: まず思い出し台詞の抽選 (当たれば即座に発話)、外れたら [llm] 有効かつ
-/// 確率に当選かつ in-flight なし なら LLM、それ以外は辞書
-fn scheduled_speak(
-    book: &Rc<phrases::PhraseBook>,
-    ui: &Rc<ui::MascotUi>,
-    timers: &Rc<RefCell<Timers>>,
-    started_at: Instant,
-    recalls: &Rc<RefCell<Vec<String>>>,
-) {
-    // 思い出し台詞: 作り置き (サイドカーの digest.remarks) からの抽選。
-    // LLM 呼び出しは発生しないので即座に喋れる。外れたら [llm] の抽選へ進む (仕様書)
-    use rand::RngExt;
-    let remark = {
-        let probability = book.reader().map(|c| c.recall_probability).unwrap_or(0.0);
-        let remarks = recalls.borrow();
-        scheduler::pick_recall(
-            &remarks,
-            probability,
-            rand::rng().random_range(0.0..1.0),
-            rand::rng().random_range(0..usize::MAX),
-        )
-    };
-    if let Some(remark) = remark {
-        // 思い出し発話も既存のキャンセル規則に従う: 発話前に in-flight の LLM を cancel
-        // しないと、返ってきた LLM 台詞がこの吹き出しを数秒後に上書きしてしまう
-        let pending = timers.borrow_mut().llm_request.take();
-        if let Some(req) = pending {
-            req.cancel();
-        }
-        show_text(ui, timers, &remark);
-        return;
-    }
-    let use_llm = book.llm().is_some_and(|cfg| {
-        timers.borrow().llm_request.is_none()
-            && rand::rng().random_range(0.0..1.0) < cfg.probability
-    });
-    if !use_llm {
-        speak(book, ui, timers, started_at);
-        return;
-    }
-    let cfg = book.llm().expect("use_llm なら Some");
-    let prompt = llm::build_prompt(cfg, &phrases::Snapshot::current(started_at));
-    let (book_c, ui_c, timers_c) = (book.clone(), ui.clone(), timers.clone());
-    let req = llm::request_phrase(cfg, &prompt, move |result| {
-        timers_c.borrow_mut().llm_request = None;
-        match result {
-            Some(text) => show_text(&ui_c, &timers_c, &text),
-            None => speak(&book_c, &ui_c, &timers_c, started_at),
-        }
-    });
-    timers.borrow_mut().llm_request = Some(req);
-}
-
-/// [speech] の間隔設定 (既定 30〜90 秒) に従って次回発話をスケジュールする。既存の予約はキャンセルする
-fn schedule_next_speech(
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
-    recalls: Rc<RefCell<Vec<String>>>,
-    started_at: Instant,
-) {
-    if let Some(id) = timers.borrow_mut().next_speech.take() {
-        id.remove();
-    }
-    let timers_c = timers.clone();
-    let (min_secs, max_secs) = book.speech_interval();
-    let id = glib::timeout_add_local_once(
-        scheduler::next_speech_interval(min_secs, max_secs),
-        move || {
-            timers_c.borrow_mut().next_speech = None;
-            if !quitting.get() && !muted.get() && timers_c.borrow().chat_session.is_none() {
-                scheduled_speak(&book, &ui, &timers_c, started_at, &recalls);
-            }
-            schedule_next_speech(
-                book.clone(),
-                ui.clone(),
-                timers_c.clone(),
-                muted.clone(),
-                quitting.clone(),
-                recalls.clone(),
-                started_at,
-            );
-        },
-    );
-    timers.borrow_mut().next_speech = Some(id);
-}
-
-/// 次の毎時 0 分に時報を予約する。発火後は再帰的に再予約 (毎回現在時刻から再計算)
-fn schedule_chime(
-    book: Rc<phrases::PhraseBook>,
-    ui: Rc<ui::MascotUi>,
-    timers: Rc<RefCell<Timers>>,
-    muted: Rc<Cell<bool>>,
-    quitting: Rc<Cell<bool>>,
-    started_at: Instant,
-) {
-    use chrono::Timelike;
-    let local = chrono::Local::now();
-    let wait = scheduler::duration_until_next_hour(local.minute(), local.second());
-    glib::timeout_add_local_once(wait, move || {
-        if !quitting.get() && !muted.get() && timers.borrow().chat_session.is_none() {
-            speak_event(&book, &ui, &timers, phrases::EventKind::Chime, started_at);
-        }
-        schedule_chime(
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            started_at,
-        );
-    });
-}
-
 fn register_actions(
     app: &gtk::Application,
-    book: &Rc<phrases::PhraseBook>,
-    ui: &Rc<ui::MascotUi>,
-    timers: &Rc<RefCell<Timers>>,
-    muted: &Rc<Cell<bool>>,
-    quitting: &Rc<Cell<bool>>,
+    core: AppCtx,
     book_id_cache: &Rc<RefCell<Option<String>>>,
     chat_book_id_cache: &Rc<RefCell<Option<String>>>,
     news_digest: &Rc<RefCell<Option<news::Digest>>>,
-    recalls: &Rc<RefCell<Vec<String>>>,
-    started_at: Instant,
 ) {
     let chat_ctx = ChatCtx {
         app: app.clone(),
-        book: book.clone(),
-        ui: ui.clone(),
-        timers: timers.clone(),
-        muted: muted.clone(),
-        quitting: quitting.clone(),
+        core: core.clone(),
         chat_book_cache: chat_book_id_cache.clone(),
         chat_window: Rc::new(RefCell::new(None)),
-        recalls: recalls.clone(),
-        started_at,
     };
 
     let speak_now = gio::SimpleAction::new("speak-now", None);
     {
-        let (book, ui, timers, muted_r, quitting, recalls) = (
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            recalls.clone(),
-        );
+        let core = core.clone();
         speak_now.connect_activate(move |_, _| {
-            if quitting.get() || timers.borrow().chat_session.is_some() {
+            if core.quitting.get() || core.timers.borrow().chat_session.is_some() {
                 return;
             }
-            speak(&book, &ui, &timers, started_at);
-            schedule_next_speech(
-                book.clone(),
-                ui.clone(),
-                timers.clone(),
-                muted_r.clone(),
-                quitting.clone(),
-                recalls.clone(),
-                started_at,
-            );
+            core.speak();
+            core.schedule_next_speech();
         });
     }
     app.add_action(&speak_now);
 
     let mute = gio::SimpleAction::new_stateful("mute", None, &false.to_variant());
     {
-        let muted = muted.clone();
+        let muted = core.muted.clone();
         mute.connect_activate(move |action, _| {
             let next = !muted.get();
             muted.set(next);
@@ -1236,17 +994,16 @@ fn register_actions(
     let quit_request = gio::SimpleAction::new("quit-request", None);
     {
         let app_weak = app.downgrade();
-        let (book, ui, timers, quitting) =
-            (book.clone(), ui.clone(), timers.clone(), quitting.clone());
+        let core = core.clone();
         let ctx = chat_ctx.clone();
         quit_request.connect_activate(move |_, _| {
-            if quitting.get() {
+            if core.quitting.get() {
                 return;
             }
             // 会話が残っていれば quitting を立てる前に保存を開始する
             let saving = close_chat_session(&ctx);
-            quitting.set(true);
-            let spoke = speak_event(&book, &ui, &timers, phrases::EventKind::Quit, started_at);
+            core.quitting.set(true);
+            let spoke = core.speak_event(phrases::EventKind::Quit);
             let app_weak = app_weak.clone();
             if spoke || saving {
                 // 保存中は台詞なしでも 2 秒待つ (localhost POST のベストエフォート完走待ち)
@@ -1265,16 +1022,9 @@ fn register_actions(
     // 外部発話: miryam-ctl say <text>
     let say = gio::SimpleAction::new("say", Some(glib::VariantTy::STRING));
     {
-        let (book, ui, timers, muted_r, quitting, recalls) = (
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            recalls.clone(),
-        );
+        let core = core.clone();
         say.connect_activate(move |_, param| {
-            if quitting.get() {
+            if core.quitting.get() {
                 return;
             }
             let Some(raw) = param.and_then(|v| v.get::<String>()) else {
@@ -1283,16 +1033,7 @@ fn register_actions(
             let Some(text) = llm::postprocess(&raw) else {
                 return;
             };
-            external_speak(
-                &book,
-                &ui,
-                &timers,
-                &muted_r,
-                &quitting,
-                &recalls,
-                started_at,
-                &text,
-            );
+            core.external_speak(&text);
         });
     }
     app.add_action(&say);
@@ -1300,17 +1041,10 @@ fn register_actions(
     // 外部タイマー: miryam-ctl timer <duration> [message...]
     let timer_action = gio::SimpleAction::new("timer", Some(glib::VariantTy::STRING));
     {
-        let (book, ui, timers, muted_r, quitting, recalls) = (
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            recalls.clone(),
-        );
+        let core = core.clone();
         let app_weak = app.downgrade();
         timer_action.connect_activate(move |_, param| {
-            if quitting.get() {
+            if core.quitting.get() {
                 return;
             }
             let Some(spec) = param.and_then(|v| v.get::<String>()) else {
@@ -1320,29 +1054,13 @@ fn register_actions(
                 Ok((wait, message)) => {
                     let text = llm::postprocess(&message)
                         .unwrap_or_else(|| control::DEFAULT_TIMER_MESSAGE.to_string());
-                    let (book, ui, timers, muted_r, quitting, recalls) = (
-                        book.clone(),
-                        ui.clone(),
-                        timers.clone(),
-                        muted_r.clone(),
-                        quitting.clone(),
-                        recalls.clone(),
-                    );
+                    let core_c = core.clone();
                     let app_weak = app_weak.clone();
                     glib::timeout_add_local_once(wait, move || {
-                        if quitting.get() {
+                        if core_c.quitting.get() {
                             return;
                         }
-                        external_speak(
-                            &book,
-                            &ui,
-                            &timers,
-                            &muted_r,
-                            &quitting,
-                            &recalls,
-                            started_at,
-                            &text,
-                        );
+                        core_c.external_speak(&text);
                         if let Some(app) = app_weak.upgrade() {
                             let n = gio::Notification::new("miryam");
                             n.set_body(Some(&text));
@@ -1351,16 +1069,7 @@ fn register_actions(
                     });
                 }
                 Err(_) => {
-                    external_speak(
-                        &book,
-                        &ui,
-                        &timers,
-                        &muted_r,
-                        &quitting,
-                        &recalls,
-                        started_at,
-                        "タイマーの指定がわかりません",
-                    );
+                    core.external_speak("タイマーの指定がわかりません");
                 }
             }
         });
@@ -1370,17 +1079,10 @@ fn register_actions(
     // Inkdrop キャプチャ: miryam-ctl memo <text>
     let memo = gio::SimpleAction::new("memo", Some(glib::VariantTy::STRING));
     {
-        let (book, ui, timers, muted_r, quitting, cache, recalls) = (
-            book.clone(),
-            ui.clone(),
-            timers.clone(),
-            muted.clone(),
-            quitting.clone(),
-            book_id_cache.clone(),
-            recalls.clone(),
-        );
+        let core = core.clone();
+        let cache = book_id_cache.clone();
         memo.connect_activate(move |_, param| {
-            if quitting.get() || book.inkdrop().is_none() {
+            if core.quitting.get() || core.book.inkdrop().is_none() {
                 return;
             }
             let Some(text) = param.and_then(|v| v.get::<String>()) else {
@@ -1389,23 +1091,13 @@ fn register_actions(
             if text.trim().is_empty() {
                 return;
             }
-            capture_to_inkdrop(
-                book.clone(),
-                ui.clone(),
-                timers.clone(),
-                muted_r.clone(),
-                quitting.clone(),
-                recalls.clone(),
-                cache.clone(),
-                started_at,
-                text,
-            );
+            capture_to_inkdrop(&core, cache.clone(), text);
         });
     }
     app.add_action(&memo);
 
     // チャット: メニュー「話しかける」(トグル) + Entry の Enter / Esc
-    if book.chat().is_some() {
+    if core.book.chat().is_some() {
         let chat_toggle = gio::SimpleAction::new("chat-toggle", None);
         {
             let ctx = chat_ctx.clone();
@@ -1414,11 +1106,12 @@ fn register_actions(
         app.add_action(&chat_toggle);
         {
             let ctx = chat_ctx.clone();
-            ui.connect_chat_submitted(move |text| send_chat_message(&ctx, text));
+            core.ui
+                .connect_chat_submitted(move |text| send_chat_message(&ctx, text));
         }
         {
             let ctx = chat_ctx.clone();
-            ui.connect_chat_escape(move || {
+            core.ui.connect_chat_escape(move || {
                 close_chat_session(&ctx);
             });
         }
@@ -1431,7 +1124,7 @@ fn register_actions(
                 let Some(name) = param.and_then(|v| v.get::<String>()) else {
                     return;
                 };
-                let Some(cfg) = ctx.book.chat() else { return };
+                let Some(cfg) = ctx.core.book.chat() else { return };
                 let Some(mode) = cfg.modes().into_iter().find(|m| m.name == name) else {
                     return; // 未知のモード名 (メニューと設定の不整合) は無視
                 };
@@ -1449,7 +1142,8 @@ fn register_actions(
     // アクション自体は無条件登録でよい (外部から叩かれても「まだありません」で安全)
     let news_show = gio::SimpleAction::new("news-show", None);
     {
-        let (ui, timers, digest) = (ui.clone(), timers.clone(), news_digest.clone());
+        let core = core.clone();
+        let digest = news_digest.clone();
         let app = app.clone();
         let news_window: Rc<RefCell<Option<gtk::Window>>> = Rc::new(RefCell::new(None));
         news_show.connect_activate(move |_, _| {
@@ -1460,9 +1154,9 @@ fn register_actions(
                     &news_window,
                     &format!("{}時のニュース", d.made_at.hour()),
                     &d.body,
-                    &ui.backdrop_texture(),
+                    &core.ui.backdrop_texture(),
                 ),
-                None => show_text(&ui, &timers, "まだニュースがありません"),
+                None => show_text(&core.ui, &core.timers, "まだニュースがありません"),
             }
         });
     }
@@ -1471,16 +1165,14 @@ fn register_actions(
     // 本棚: メニュー「本棚」。[reader] が無ければアクション自体を登録しない
     // (走査対象フォルダが無いため news-show のような無条件登録はしない)
     let library_slot: Rc<RefCell<Option<gtk::Window>>> = Rc::new(RefCell::new(None));
-    if let Some(cfg) = book.reader() {
+    if let Some(cfg) = core.book.reader() {
         let dir = cfg.dir_path();
         let recursive = cfg.recursive;
         let recall_probability = cfg.recall_probability;
         let library_show = gio::SimpleAction::new("library-show", None);
         let slot = library_slot.clone();
-        let ui_for_library = ui.clone();
+        let library_core = core.clone();
         let app_for_library = app.clone();
-        let timers_for_library = timers.clone();
-        let muted_for_library = muted.clone();
         let running: Rc<RefCell<std::collections::HashSet<std::path::PathBuf>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         library_show.connect_activate(move |_, _| {
@@ -1489,8 +1181,8 @@ fn register_actions(
                 Err(e) => {
                     eprintln!("miryam: 本棚を読めません: {e:#}");
                     show_text(
-                        &ui_for_library,
-                        &timers_for_library,
+                        &library_core.ui,
+                        &library_core.timers,
                         "本棚のフォルダが見つかりません",
                     );
                     return;
@@ -1501,7 +1193,7 @@ fn register_actions(
                 .iter()
                 .flat_map(|e| e.remarks.iter().cloned())
                 .collect();
-            if !muted_for_library.get() {
+            if !library_core.muted.get() {
                 use rand::RngExt;
                 let remark = scheduler::pick_recall(
                     &pool,
@@ -1512,11 +1204,8 @@ fn register_actions(
                 if let Some(remark) = remark {
                     // 思い出し発話も既存のキャンセル規則に従う: in-flight の LLM 台詞が
                     // この吹き出しを数秒後に上書きしないよう、先に cancel しておく
-                    let pending = timers_for_library.borrow_mut().llm_request.take();
-                    if let Some(req) = pending {
-                        req.cancel();
-                    }
-                    show_text(&ui_for_library, &timers_for_library, &remark);
+                    library_core.cancel_pending_llm();
+                    show_text(&library_core.ui, &library_core.timers, &remark);
                 }
             }
             // 再開時 (open コールバック) 用に、パス → 感想の対応表を先に作っておく
@@ -1528,17 +1217,15 @@ fn register_actions(
                 .map(|e| (e.path.clone(), e.remarks.clone()))
                 .collect();
             let running = running.clone();
-            let ui_for_open = ui_for_library.clone();
-            let timers_for_open = timers_for_library.clone();
-            let muted_for_open = muted_for_library.clone();
+            let open_core = library_core.clone();
             ui::show_library_window(
                 &app_for_library,
                 &slot,
                 entries,
-                &ui_for_library.backdrop_texture(),
+                &library_core.ui.backdrop_texture(),
                 move |path| {
                     if !running.borrow_mut().insert(path.to_path_buf()) {
-                        show_text(&ui_for_open, &timers_for_open, "それはもう開いています");
+                        show_text(&open_core.ui, &open_core.timers, "それはもう開いています");
                         return;
                     }
                     let exe = std::env::current_exe().unwrap_or_else(|_| "miryam".into());
@@ -1547,7 +1234,7 @@ fn register_actions(
                     match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
                         Ok(proc) => {
                             // 過去に読んだ PDF: その本の感想を 1 本話す (自動発話 — ミュート中は黙る)
-                            if !muted_for_open.get() {
+                            if !open_core.muted.get() {
                                 use rand::RngExt;
                                 let remark = remarks_by_path.get(path).and_then(|remarks| {
                                     scheduler::pick_recall(
@@ -1560,11 +1247,8 @@ fn register_actions(
                                 if let Some(remark) = remark {
                                     // 思い出し発話も既存のキャンセル規則に従う: in-flight の
                                     // LLM 台詞がこの吹き出しを数秒後に上書きしないよう先に cancel
-                                    let pending = timers_for_open.borrow_mut().llm_request.take();
-                                    if let Some(req) = pending {
-                                        req.cancel();
-                                    }
-                                    show_text(&ui_for_open, &timers_for_open, &remark);
+                                    open_core.cancel_pending_llm();
+                                    show_text(&open_core.ui, &open_core.timers, &remark);
                                 }
                             }
                             let running = running.clone();
@@ -1577,8 +1261,8 @@ fn register_actions(
                             eprintln!("miryam: reader を起動できません: {e}");
                             running.borrow_mut().remove(path);
                             show_text(
-                                &ui_for_open,
-                                &timers_for_open,
+                                &open_core.ui,
+                                &open_core.timers,
                                 "リーダーを起動できませんでした",
                             );
                         }
@@ -1614,9 +1298,9 @@ fn register_actions(
     // data-control プロトコルを使う wl-paste に読み取りを委譲する
     let add_link = gio::SimpleAction::new("add-link-from-clipboard", None);
     {
-        let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+        let core = core.clone();
         add_link.connect_activate(move |_, _| {
-            if quitting.get() {
+            if core.quitting.get() {
                 return;
             }
             let argv: [&std::ffi::OsStr; 2] = ["wl-paste".as_ref(), "--no-newline".as_ref()];
@@ -1629,16 +1313,16 @@ fn register_actions(
                     eprintln!(
                         "miryam: wl-paste を起動できませんでした (wl-clipboard は必須です): {e}"
                     );
-                    show_text(&ui, &timers, "クリップボードを読み取れませんでした");
+                    show_text(&core.ui, &core.timers, "クリップボードを読み取れませんでした");
                     return;
                 }
             };
-            let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+            let core = core.clone();
             let subprocess_c = subprocess.clone();
             // wl-paste はローカルで即応するためタイムアウトは張らない (llm.rs とは異なり
             // ハング時も次のクリックが新プロセスを起こすだけで実害がない)
             subprocess.communicate_utf8_async(None, None::<&gio::Cancellable>, move |result| {
-                if quitting.get() {
+                if core.quitting.get() {
                     return;
                 }
                 let text = match &result {
@@ -1660,7 +1344,7 @@ fn register_actions(
                         String::new()
                     }
                 };
-                add_link_from_text(&ui, &timers, &text);
+                add_link_from_text(&core.ui, &core.timers, &text);
             });
         });
     }
@@ -1669,29 +1353,31 @@ fn register_actions(
     // ドラッグで動かした位置を既定 (右下) に戻す
     let reset_position = gio::SimpleAction::new("reset-position", None);
     {
-        let ui = ui.clone();
-        reset_position.connect_activate(move |_, _| ui.reset_position());
+        let core = core.clone();
+        reset_position.connect_activate(move |_, _| core.ui.reset_position());
     }
     app.add_action(&reset_position);
 
     // リンク集: 指定 URL のリンクを削除 (メニュー「リンクを削除」から)
     let remove_link = gio::SimpleAction::new("remove-link", Some(glib::VariantTy::STRING));
     {
-        let (ui, timers, quitting) = (ui.clone(), timers.clone(), quitting.clone());
+        let core = core.clone();
         remove_link.connect_activate(move |_, param| {
-            if quitting.get() {
+            if core.quitting.get() {
                 return;
             }
             let Some(url) = param.and_then(|v| v.get::<String>()) else {
                 return;
             };
             match links::remove_link(&links::links_path(), &url) {
-                Ok(Some(label)) => show_text(&ui, &timers, &format!("{label} を削除しました")),
+                Ok(Some(label)) => {
+                    show_text(&core.ui, &core.timers, &format!("{label} を削除しました"))
+                }
                 // メニュー表示後に links.toml が変わった場合など: 黙って何もしない
                 Ok(None) => {}
                 Err(e) => {
                     eprintln!("miryam: {e:#}");
-                    show_text(&ui, &timers, "links.toml を更新できませんでした");
+                    show_text(&core.ui, &core.timers, "links.toml を更新できませんでした");
                 }
             }
         });
@@ -1700,13 +1386,15 @@ fn register_actions(
 
     // リンク集サブメニュー: 右クリックのたびに links.toml を読み直す
     {
-        let (ui_c, timers_c) = (ui.clone(), timers.clone());
-        ui.connect_menu(
-            book.chat()
+        let ui_c = core.ui.clone();
+        let timers_c = core.timers.clone();
+        core.ui.connect_menu(
+            core.book
+                .chat()
                 .map(|c| c.modes().iter().map(|m| m.name.clone()).collect())
                 .unwrap_or_default(),
-            book.news().is_some(),
-            book.reader().is_some(),
+            core.book.news().is_some(),
+            core.book.reader().is_some(),
             move || match links::load(&links::links_path()) {
                 Ok(list) => links::build_submenu(&list),
                 Err(e) => {
