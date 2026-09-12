@@ -18,6 +18,31 @@ fn default_recall_probability() -> f64 {
     0.1
 }
 
+/// ハーフ表示のときに画面のどちら側へ寄せるか
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HalfSide {
+    #[default]
+    Left,
+    Right,
+}
+
+/// 発表モード (`[present]`)。未指定なら既定値 (左半分) を使う
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresentConfig {
+    /// ハーフ表示の配置。`left` (既定) か `right`
+    #[serde(default)]
+    pub half_side: HalfSide,
+}
+
+impl PresentConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // 現状は列挙型で受けるので値の検証は不要 (未知の値はパース時に弾かれる)
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReaderConfig {
@@ -110,6 +135,37 @@ impl ReaderSettings {
             }
         }
     }
+}
+
+/// 発表モード側で使う設定を読む。
+/// **読み込みに失敗しても発表はできなければならない**ので、既定値へ落とす (理由は stderr)
+pub fn load_present() -> PresentConfig {
+    match crate::phrases::PhraseBook::load() {
+        Ok(book) => book.present().cloned().unwrap_or_default(),
+        Err(e) => {
+            eprintln!("miryam-reader: 設定を読めないため発表モードの既定値を使います: {e:#}");
+            PresentConfig::default()
+        }
+    }
+}
+
+/// `[reader]` 未設定のユーザー向けの既定本棚フォルダ。
+/// アプリのデータディレクトリ配下に作り、同梱のサンプル PDF を 1 つ置く。
+/// これで設定なしでも「本棚」「PDF を発表する…」から試せる
+pub fn prepare_default_library() -> std::path::PathBuf {
+    let dir = gtk4::glib::user_data_dir().join("miryam").join("library");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("miryam: 既定の本棚フォルダを作れません ({}): {e}", dir.display());
+        return dir;
+    }
+    let sample = dir.join("miryam-sample.pdf");
+    if !sample.exists() {
+        const SAMPLE: &[u8] = include_bytes!("../../assets/library/sample.pdf");
+        if let Err(e) = std::fs::write(&sample, SAMPLE) {
+            eprintln!("miryam: サンプル PDF を置けません ({}): {e}", sample.display());
+        }
+    }
+    dir
 }
 
 /// 色名 → RGB (0.0〜1.0)。未知の名前は既定色 (PALETTE 先頭 = yellow) に落とす
@@ -215,5 +271,24 @@ colors = ["yellow", "green", "blue", "pink", "yellow", "green", "blue", "pink", 
         // 設定は PALETTE で検証済みなので通常は来ないが、
         // サイドカーに古い色名が残っている場合に備える
         assert_eq!(color_rgb("mauve"), color_rgb("yellow"));
+    }
+
+    #[test]
+    fn present_defaults_to_left_half() {
+        let cfg: PresentConfig = toml::from_str("").expect("空でも既定が入る");
+        assert_eq!(cfg.half_side, HalfSide::Left);
+        cfg.validate().expect("既定値は妥当");
+    }
+
+    #[test]
+    fn present_reads_half_side() {
+        let cfg: PresentConfig = toml::from_str(r#"half_side = "right""#).expect("パースできる");
+        assert_eq!(cfg.half_side, HalfSide::Right);
+    }
+
+    #[test]
+    fn present_rejects_unknown_values_and_keys() {
+        assert!(toml::from_str::<PresentConfig>(r#"half_side = "center""#).is_err());
+        assert!(toml::from_str::<PresentConfig>("unknown = 1").is_err());
     }
 }

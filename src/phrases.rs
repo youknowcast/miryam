@@ -25,6 +25,8 @@ struct PhrasesFile {
     speech: Option<SpeechConfig>,
     #[serde(default)]
     reader: Option<crate::reader::config::ReaderConfig>,
+    #[serde(default)]
+    present: Option<crate::reader::config::PresentConfig>,
 }
 
 /// 定期発話の間隔設定。未指定は scheduler の既定 (30〜90 秒)
@@ -248,6 +250,7 @@ pub struct PhraseBook {
     news: Option<crate::news::NewsConfig>,
     speech: Option<SpeechConfig>,
     reader: Option<crate::reader::config::ReaderConfig>,
+    present: Option<crate::reader::config::PresentConfig>,
 }
 
 impl PhraseBook {
@@ -263,6 +266,7 @@ impl PhraseBook {
             news,
             speech,
             reader,
+            present,
         } = file;
         if let Some(cfg) = &llm {
             cfg.validate().context("[llm] の設定が不正です")?;
@@ -287,6 +291,9 @@ impl PhraseBook {
         }
         if let Some(cfg) = &reader {
             cfg.validate().context("[reader] の設定が不正です")?;
+        }
+        if let Some(cfg) = &present {
+            cfg.validate().context("[present] の設定が不正です")?;
         }
         let groups = match (top_level, group.is_empty()) {
             (Some(_), false) => {
@@ -326,6 +333,7 @@ impl PhraseBook {
             news,
             speech,
             reader,
+            present,
         })
     }
 
@@ -351,6 +359,10 @@ impl PhraseBook {
 
     pub fn reader(&self) -> Option<&crate::reader::config::ReaderConfig> {
         self.reader.as_ref()
+    }
+
+    pub fn present(&self) -> Option<&crate::reader::config::PresentConfig> {
+        self.present.as_ref()
     }
 
     /// 定期発話間隔の (下限, 上限) 秒。[speech] 未指定は既定の 30〜90 秒
@@ -1201,6 +1213,40 @@ dir = ""
             panic!("dir が空の [reader] が通ってしまった");
         };
         assert!(err.to_string().contains("[reader]"));
+    }
+
+    #[test]
+    fn present_section_is_parsed() {
+        let book = PhraseBook::from_toml_str(
+            r#"
+[[group]]
+phrases = ["やあ"]
+
+[present]
+half_side = "right"
+"#,
+        )
+        .expect("読み込めること");
+        assert_eq!(
+            book.present().expect("[present] がある").half_side,
+            crate::reader::config::HalfSide::Right
+        );
+
+        let Err(err) = PhraseBook::from_toml_str(
+            r#"
+[[group]]
+phrases = ["やあ"]
+
+[present]
+half_side = "center"
+"#,
+        ) else {
+            panic!("未知の half_side が通ってしまった");
+        };
+        assert!(
+            format!("{err:#}").contains("center"),
+            "未知の値が原因と分かること: {err:#}"
+        );
     }
 
     #[test]

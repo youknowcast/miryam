@@ -9,6 +9,7 @@ usage() {
     echo "usage: miryam-ctl say <text...>" >&2
     echo "       miryam-ctl timer <duration(s|m|h)> [message...]" >&2
     echo "       miryam-ctl memo <text...>" >&2
+    echo "       miryam-ctl present <path/to.pdf>" >&2
     exit 2
 }
 
@@ -16,7 +17,7 @@ usage() {
 action=$1
 shift
 case "$action" in
-    say | timer | memo) ;;
+    say | timer | memo | present) ;;
     *) usage ;;
 esac
 text="$*"

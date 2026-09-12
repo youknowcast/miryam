@@ -130,6 +130,24 @@ impl MascotUi {
         self.bubble.set_opacity(0.0);
     }
 
+    /// マスコット本体 (layer-shell 窓) の表示/非表示。発表モードの切替で使う。
+    /// 隠すときは吹き出しも一緒に消す
+    pub fn set_mascot_visible(&self, visible: bool) {
+        if visible {
+            self.window.present();
+        } else {
+            self.hide_bubble();
+            self.window.set_visible(false);
+        }
+    }
+
+    /// 発表ウィンドウ (layer-shell の Top) より手前にマスコットを出すためのレイヤー切替。
+    /// 発表中に表示するときだけ Overlay へ上げ、通常は Top に戻す
+    pub fn set_layer_above_presentation(&self, above: bool) {
+        self.window
+            .set_layer(if above { Layer::Overlay } else { Layer::Top });
+    }
+
     /// 表情を切り替える。None = 通常 (character.png)。
     /// 表情画像は初回使用時に読み込んでキャッシュし、失敗した表情は
     /// 一度だけ警告して以後は通常にフォールバックする ([skin] 未設定も通常のまま)
@@ -244,7 +262,6 @@ impl MascotUi {
         &self,
         chat_modes: Vec<String>,
         news_enabled: bool,
-        library_enabled: bool,
         links_submenu: impl Fn() -> gio::Menu + 'static,
     ) {
         let popover = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
@@ -271,9 +288,8 @@ impl MascotUi {
             if news_enabled {
                 menu.append(Some("ニュースを見る"), Some("app.news-show"));
             }
-            if library_enabled {
-                menu.append(Some("本棚"), Some("app.library-show"));
-            }
+            menu.append(Some("本棚"), Some("app.library-show"));
+            menu.append(Some("PDF を発表する…"), Some("app.present-pick"));
             menu.append_submenu(Some("リンク集"), &links_submenu());
             menu.append(Some("自動発話を停止"), Some("app.mute"));
             menu.append(Some("位置をリセット"), Some("app.reset-position"));
@@ -497,7 +513,16 @@ pub fn show_news_popup(
     window.present();
 }
 
-/// 本棚ウィンドウ (layer shell ではないフロート窓)。行を選ぶと on_open が呼ばれる。
+/// 一覧ウィンドウの目的。読むための本棚か、発表する PDF を選ぶための一覧か
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LibraryPurpose {
+    Read,
+    Present,
+}
+
+/// 本棚/発表 PDF 選択ウィンドウ (layer shell ではないフロート窓)。
+/// タイトルをクリックすると purpose に応じて on_open (読む) / on_present (発表) が呼ばれ、
+/// 行末のボタンで反対側の操作もできる。PDF の置き場 ([reader] dir) はどちらも共通。
 /// slot で同時 1 枚を保証する: 開き直しは前の窓を閉じてから (show_news_window と同じ)
 pub fn show_library_window(
     app: &gtk::Application,
@@ -505,6 +530,8 @@ pub fn show_library_window(
     entries: Vec<crate::reader::library::LibraryEntry>,
     backdrop: &gdk::Texture,
     on_open: impl Fn(&std::path::Path) + 'static,
+    on_present: impl Fn(&std::path::Path) + 'static,
+    purpose: LibraryPurpose,
 ) {
     // 借りを先に手放す (理由は show_news_window と同じ)
     let previous = slot.borrow_mut().take();
@@ -520,14 +547,46 @@ pub fn show_library_window(
         empty.set_margin_bottom(16);
         list.append(&empty);
     }
-    let on_open = std::rc::Rc::new(on_open);
+    let on_open: EntryCallback = std::rc::Rc::new(on_open);
+    let on_present: EntryCallback = std::rc::Rc::new(on_present);
     for e in entries {
-        let button = gtk::Button::with_label(&crate::reader::library::format_entry(&e));
-        button.set_has_frame(false);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let title = gtk::Button::with_label(&crate::reader::library::format_entry(&e));
+        title.set_has_frame(false);
+        title.set_hexpand(true);
+        // タイトルは左寄せにすると一覧として読みやすい (既定は中央寄せ)
+        if let Some(label) = title.child().and_downcast::<gtk::Label>() {
+            label.set_xalign(0.0);
+        }
+        // タイトルをクリックしたときの動作は目的で変わる (本棚=読む / 発表選択=発表)
+        let primary = match purpose {
+            LibraryPurpose::Read => on_open.clone(),
+            LibraryPurpose::Present => on_present.clone(),
+        };
         let path = e.path.clone();
-        let on_open = on_open.clone();
-        button.connect_clicked(move |_| on_open(&path));
-        list.append(&button);
+        title.connect_clicked(move |_| primary(&path));
+
+        // 反対側の操作を小さく添える (本棚なら「発表」、発表選択なら「読む」)
+        let (label, tip, secondary) = match purpose {
+            LibraryPurpose::Read => (
+                "発表",
+                "この PDF を発表モードで開きます",
+                on_present.clone(),
+            ),
+            LibraryPurpose::Present => (
+                "読む",
+                "この PDF をリーダーで開きます",
+                on_open.clone(),
+            ),
+        };
+        let button = gtk::Button::with_label(label);
+        button.set_tooltip_text(Some(tip));
+        let path = e.path.clone();
+        button.connect_clicked(move |_| secondary(&path));
+
+        row.append(&title);
+        row.append(&button);
+        list.append(&row);
     }
 
     let scrolled = gtk::ScrolledWindow::new();
@@ -536,7 +595,10 @@ pub fn show_library_window(
 
     let window = gtk::Window::new();
     window.set_application(Some(app));
-    window.set_title(Some("本棚"));
+    window.set_title(Some(match purpose {
+        LibraryPurpose::Read => "本棚",
+        LibraryPurpose::Present => "発表する PDF を選ぶ",
+    }));
     window.set_default_size(520, 480);
     window.set_child(Some(&with_backdrop(backdrop, &scrolled)));
 
@@ -566,6 +628,9 @@ pub fn reader_exe_path(current_exe: &std::path::Path) -> std::path::PathBuf {
         _ => std::path::PathBuf::from("miryam-reader"),
     }
 }
+
+/// 一覧の行から呼ばれる「パスを受け取る」コールバック (読む / 発表で共通の型)
+type EntryCallback = std::rc::Rc<dyn Fn(&std::path::Path)>;
 
 /// Entry と選択肢ボタン共通の送信コールバックの型 (clippy::type_complexity 回避)
 type SubmitCallback = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(String)>>>>;
