@@ -1086,8 +1086,7 @@ fn run_export(
             return;
         }
         let Some(book_id) = book_id else {
-            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
-            on_done();
+            export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
             return;
         };
 
@@ -1102,13 +1101,11 @@ fn run_export(
                 state_for_llm.borrow_mut().untrack_request(t);
             }
             let Some(raw) = raw else {
-                notify_miryam(&format!("『{name}』の抄訳を作れませんでした"));
-                on_done();
+                export_failed(&name, "の抄訳を作れませんでした", &on_done);
                 return;
             };
             let Some((digest_body, remarks)) = crate::reader::digest::split(&raw) else {
-                notify_miryam(&format!("『{name}』の抄訳を作れませんでした"));
-                on_done();
+                export_failed(&name, "の抄訳を作れませんでした", &on_done);
                 return;
             };
             let title = crate::reader::export::title_for(doc_title.as_deref(), &name);
@@ -1185,8 +1182,7 @@ fn update_note(
     crate::inkdrop::get_status(&cfg, &path, move |res| match res {
         Ok((200, json)) => {
             let Some(rev) = crate::reader::export::rev_from(&json) else {
-                notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
-                on_done();
+                export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
                 return;
             };
             let payload =
@@ -1195,8 +1191,7 @@ fn update_note(
             crate::inkdrop::request(&cfg_for_rev, "PUT", &path_for_put, Some(payload), move |res| {
                 let ok = res.is_ok();
                 if !ok {
-                    notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
-                    on_done();
+                    export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
                     return;
                 }
                 save_digest_and_notify(
@@ -1227,12 +1222,10 @@ fn update_note(
         }
         Ok((status, _)) => {
             eprintln!("miryam-reader: GET /notes/{id} が {status} を返しました");
-            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
-            on_done();
+            export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
         }
         Err(_) => {
-            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
-            on_done();
+            export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
         }
     });
     None
@@ -1257,14 +1250,12 @@ fn create_note(
         let json = match res {
             Ok(json) => json,
             Err(_) => {
-                notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
-                on_done();
+                export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
                 return;
             }
         };
         let Some(id) = crate::reader::export::id_from(&json) else {
-            notify_miryam(&format!("『{name}』を Inkdrop に送れませんでした"));
-            on_done();
+            export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
             return;
         };
         save_digest_and_notify(&state, id, digest_body, remarks, name, closed, on_done);
@@ -1298,6 +1289,12 @@ fn save_digest_and_notify(
     // 保存の失敗を黙って捨てない (state を借りていない状態で呼ぶ)
     ReaderState::show_save_error(state);
     notify_miryam(&format!("『{name}』を Inkdrop に送りました"));
+    on_done();
+}
+
+/// 書き出し失敗の共通処理: 通知して busy を解除する (`what` は「の抄訳を…」等)
+fn export_failed(name: &str, what: &str, on_done: &Rc<dyn Fn()>) {
+    notify_miryam(&format!("『{name}』{what}"));
     on_done();
 }
 

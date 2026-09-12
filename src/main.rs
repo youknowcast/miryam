@@ -84,6 +84,27 @@ impl AppCtx {
         show_text(&self.ui, &self.timers, text);
     }
 
+    /// 作り置きの感想 (recalls) から 1 本抽選して発話する (自動発話 — ミュート中は黙る)。
+    /// 当たって表示したら true。LLM 呼び出しは発生しない。
+    fn speak_recall(&self, remarks: &[String], probability: f64) -> bool {
+        if self.muted.get() {
+            return false;
+        }
+        use rand::RngExt;
+        let remark = scheduler::pick_recall(
+            remarks,
+            probability,
+            rand::rng().random_range(0.0..1.0),
+            rand::rng().random_range(0..usize::MAX),
+        );
+        let Some(remark) = remark else { return false };
+        // 思い出し発話も既存のキャンセル規則に従う: in-flight の LLM 台詞が
+        // この吹き出しを数秒後に上書きしないよう、先に cancel しておく
+        self.cancel_pending_llm();
+        show_text(&self.ui, &self.timers, &remark);
+        true
+    }
+
     /// イベント台詞を選んで表示する。プールが空なら何もせず false
     fn speak_event(&self, event: phrases::EventKind) -> bool {
         let now = phrases::Snapshot::current(self.started_at);
@@ -101,21 +122,10 @@ impl AppCtx {
     /// 確率に当選かつ in-flight なし なら LLM、それ以外は辞書
     fn scheduled_speak(&self) {
         use rand::RngExt;
-        let remark = {
-            let probability = self.book.reader().map(|c| c.recall_probability).unwrap_or(0.0);
-            let remarks = self.recalls.borrow();
-            scheduler::pick_recall(
-                &remarks,
-                probability,
-                rand::rng().random_range(0.0..1.0),
-                rand::rng().random_range(0..usize::MAX),
-            )
-        };
-        if let Some(remark) = remark {
-            // 思い出し発話も既存のキャンセル規則に従う: 発話前に in-flight の LLM を cancel
-            // しないと、返ってきた LLM 台詞がこの吹き出しを数秒後に上書きしてしまう
-            self.cancel_pending_llm();
-            show_text(&self.ui, &self.timers, &remark);
+        let probability = self.book.reader().map(|c| c.recall_probability).unwrap_or(0.0);
+        // 思い出し台詞: 作り置き (サイドカーの digest.remarks) からの抽選。
+        // LLM 呼び出しは発生しないので即座に喋れる。外れたら [llm] の抽選へ進む (仕様書)
+        if self.speak_recall(&self.recalls.borrow(), probability) {
             return;
         }
         let use_llm = self.book.llm().is_some_and(|cfg| {
@@ -1193,21 +1203,7 @@ fn register_actions(
                 .iter()
                 .flat_map(|e| e.remarks.iter().cloned())
                 .collect();
-            if !library_core.muted.get() {
-                use rand::RngExt;
-                let remark = scheduler::pick_recall(
-                    &pool,
-                    recall_probability,
-                    rand::rng().random_range(0.0..1.0),
-                    rand::rng().random_range(0..usize::MAX),
-                );
-                if let Some(remark) = remark {
-                    // 思い出し発話も既存のキャンセル規則に従う: in-flight の LLM 台詞が
-                    // この吹き出しを数秒後に上書きしないよう、先に cancel しておく
-                    library_core.cancel_pending_llm();
-                    show_text(&library_core.ui, &library_core.timers, &remark);
-                }
-            }
+            library_core.speak_recall(&pool, recall_probability);
             // 再開時 (open コールバック) 用に、パス → 感想の対応表を先に作っておく
             let remarks_by_path: std::collections::HashMap<
                 std::path::PathBuf,
@@ -1234,22 +1230,8 @@ fn register_actions(
                     match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
                         Ok(proc) => {
                             // 過去に読んだ PDF: その本の感想を 1 本話す (自動発話 — ミュート中は黙る)
-                            if !open_core.muted.get() {
-                                use rand::RngExt;
-                                let remark = remarks_by_path.get(path).and_then(|remarks| {
-                                    scheduler::pick_recall(
-                                        remarks,
-                                        recall_probability,
-                                        rand::rng().random_range(0.0..1.0),
-                                        rand::rng().random_range(0..usize::MAX),
-                                    )
-                                });
-                                if let Some(remark) = remark {
-                                    // 思い出し発話も既存のキャンセル規則に従う: in-flight の
-                                    // LLM 台詞がこの吹き出しを数秒後に上書きしないよう先に cancel
-                                    open_core.cancel_pending_llm();
-                                    show_text(&open_core.ui, &open_core.timers, &remark);
-                                }
+                            if let Some(remarks) = remarks_by_path.get(path) {
+                                open_core.speak_recall(remarks, recall_probability);
                             }
                             let running = running.clone();
                             let path = path.to_path_buf();
