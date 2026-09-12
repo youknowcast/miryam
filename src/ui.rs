@@ -308,6 +308,22 @@ fn with_backdrop(texture: &gdk::Texture, content: &impl IsA<gtk::Widget>) -> gtk
     overlay
 }
 
+/// Esc でウィンドウを閉じるキーコントローラを付ける。
+/// Hyprland にはサーバーサイドのタイトルバーが無く、Esc が無いと閉じられない窓がある
+fn connect_escape_close(window: &gtk::Window) {
+    let key = gtk::EventControllerKey::new();
+    let win = window.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gdk::Key::Escape {
+            win.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key);
+}
+
 /// ニュースダイジェスト用の通常ウィンドウ (layer shell ではないフロート窓)。
 /// slot で同時 1 枚を保証する: 開き直しは前の窓を閉じてから
 pub fn show_news_window(
@@ -344,17 +360,7 @@ pub fn show_news_window(
     window.set_default_size(520, 640);
     window.set_child(Some(&with_backdrop(backdrop, &scrolled)));
 
-    let key = gtk::EventControllerKey::new();
-    let win_c = window.clone();
-    key.connect_key_pressed(move |_, keyval, _, _| {
-        if keyval == gdk::Key::Escape {
-            win_c.close();
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    window.add_controller(key);
+    connect_escape_close(&window);
 
     // 閉じられたら slot を空に (Esc・タイトルバー双方この経路を通る)
     let slot_c = slot.clone();
@@ -539,17 +545,7 @@ pub fn show_library_window(
     let header = gtk::HeaderBar::new();
     window.set_titlebar(Some(&header));
 
-    let key = gtk::EventControllerKey::new();
-    let window_for_key = window.clone();
-    key.connect_key_pressed(move |_, keyval, _, _| {
-        if keyval == gdk::Key::Escape {
-            window_for_key.close();
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    window.add_controller(key);
+    connect_escape_close(&window);
 
     // 閉じられたら slot を空に (Esc・タイトルバー双方この経路を通る)
     let slot_for_close = slot.clone();
@@ -628,17 +624,7 @@ pub fn build_chat_window(
     window.set_default_size(520, 640);
     window.set_child(Some(&with_backdrop(backdrop, &root)));
 
-    let key = gtk::EventControllerKey::new();
-    let win_c = window.clone();
-    key.connect_key_pressed(move |_, keyval, _, _| {
-        if keyval == gdk::Key::Escape {
-            win_c.close();
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    window.add_controller(key);
+    connect_escape_close(&window);
 
     let on_submit: SubmitCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
     {

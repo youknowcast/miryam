@@ -69,10 +69,25 @@ pub fn build_prompt(config: &LlmConfig, now: &Snapshot) -> String {
     format!("{persona}\n{}", situation_line(now))
 }
 
+/// 最初の非空行 (trim 済み) を返す。空出力なら None。
+/// `postprocess` (台詞) と `news::postprocess_news` が共用する
+pub fn first_nonempty_line(stdout: &str) -> Option<&str> {
+    stdout.lines().map(str::trim).find(|l| !l.is_empty())
+}
+
+/// 全体を trim し、空なら None、max 文字に切り詰める (複数行は保持)。
+/// `chat::postprocess_chat` と `reader::ask::postprocess` が共用する
+pub fn trim_capped(stdout: &str, max: usize) -> Option<String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(max).collect())
+}
+
 /// CLI 出力から台詞を抽出する。trim → 最初の非空行 → 60 文字切り詰め。空なら None
 pub fn postprocess(stdout: &str) -> Option<String> {
-    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
-    Some(line.chars().take(60).collect())
+    Some(first_nonempty_line(stdout)?.chars().take(60).collect())
 }
 
 /// 進行中の LLM リクエストのハンドル。cancel() すると結果は破棄され on_done は呼ばれない
@@ -97,7 +112,7 @@ impl LlmRequest {
 fn failure_head(stderr: Option<&str>, stdout: Option<&str>) -> String {
     [stderr, stdout]
         .into_iter()
-        .filter_map(|s| s)
+        .flatten()
         .find_map(|s| s.lines().map(str::trim).find(|l| !l.is_empty()))
         .unwrap_or("")
         .to_string()

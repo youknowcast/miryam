@@ -18,13 +18,6 @@ pub struct Sidebar {
     stack: gtk::Stack,
     annotations: Rc<annotations::Annotations>,
     search: Rc<search::SearchTab>,
-    // stack.add_titled は widget を親子付けして強い GObject 参照を取るため、
-    // ここで Outline を手放しても widget (行のクロージャ含む) 自体は消えない。
-    // それでも持たせているのは stack と同じ理由 (今は使わないが、目次タブを
-    // あとから操作する制御に要るため器の時点で持たせておく) で、破棄防止が
-    // 目的ではない
-    #[allow(dead_code)]
-    outline: Option<outline::Outline>,
 }
 
 impl Sidebar {
@@ -40,14 +33,13 @@ impl Sidebar {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
 
-        // annotations が on_jump を消費する前に、目次タブ用に複製しておく
-        let outline = if outline_items.is_empty() {
-            None
-        } else {
+        // annotations が on_jump を消費する前に、目次タブ用に複製しておく。
+        // stack.add_titled が widget を強い GObject 参照で保持するため、
+        // Outline 自体をここで持ち続ける必要はない
+        if !outline_items.is_empty() {
             let tab = outline::Outline::new(&outline_items, on_jump.clone());
             stack.add_titled(tab.widget(), Some("outline"), "目次");
-            Some(tab)
-        };
+        }
 
         // 検索タブも on_jump を使うので、annotations が消費する前に複製しておく
         let search = search::SearchTab::new(on_jump.clone());
@@ -76,7 +68,7 @@ impl Sidebar {
         root.append(&switcher);
         root.append(&stack);
 
-        Rc::new(Self { root, stack, annotations, search, outline })
+        Rc::new(Self { root, stack, annotations, search })
     }
 
     pub fn widget(&self) -> &gtk::Box {

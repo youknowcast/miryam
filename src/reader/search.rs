@@ -65,10 +65,6 @@ impl Search {
         }
         self.hits.push(Hit { page, rects });
     }
-
-    pub fn hits_for(&self, page: usize) -> Vec<&Hit> {
-        self.hits.iter().filter(|h| h.page == page).collect()
-    }
 }
 
 #[cfg(test)]
@@ -121,17 +117,6 @@ mod tests {
         let mut s = Search::new("x".into(), 3);
         s.push_hits(1, vec![]);
         assert!(s.hits.is_empty());
-    }
-
-    #[test]
-    fn hits_for_a_page_picks_only_that_page() {
-        let mut s = Search::new("x".into(), 3);
-        s.push_hits(0, vec![[0.0, 0.0, 0.1, 0.1]]);
-        s.push_hits(2, vec![[0.0, 0.2, 0.1, 0.3]]);
-        s.push_hits(0, vec![[0.0, 0.6, 0.1, 0.7]]);
-        assert_eq!(s.hits_for(0).len(), 2);
-        assert_eq!(s.hits_for(1).len(), 0);
-        assert_eq!(s.hits_for(2).len(), 1);
     }
 
     #[test]
