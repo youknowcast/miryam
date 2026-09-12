@@ -360,8 +360,8 @@ fn clamp_outline(
 /// 走査が全部終わるのを待たずに結果が並び始める
 ///
 /// **借用の約束:** `current` (`Search`) を借りたまま `find_text` も UI 更新も呼ばない。
-/// `Search::hits_for` のように借用を返す API を歩いている最中に `push_hits` を呼ぶと
-/// `BorrowMutError` になり、idle (= FFI の向こう) から呼ばれているので abort する。
+/// 借用を返す API を歩いている最中に `push_hits` を呼ぶと `BorrowMutError` になり、
+/// idle (= FFI の向こう) から呼ばれているので abort する。
 /// 借用は「範囲を取り出すブロック」と「結果を積んで写し取るブロック」の 2 つに閉じ、
 /// どちらもコピーした値だけを外へ渡す
 fn install_search(

@@ -49,10 +49,6 @@ impl PageRenderCache {
             self.entries.remove(0);
         }
     }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
 }
 
 #[cfg(test)]
@@ -137,11 +133,4 @@ mod tests {
         assert!(c.get(0, 1.0).is_some(), "触ったものは残る");
     }
 
-    #[test]
-    fn clear_empties_the_cache() {
-        let mut c = PageRenderCache::new(2);
-        c.insert(0, 1.0, surface(10, 10));
-        c.clear();
-        assert!(c.get(0, 1.0).is_none());
-    }
 }

@@ -92,11 +92,7 @@ fn translate_prompt(quote: &str, _history: &[LlmQa], _question: &str) -> String 
 /// 判定に使う指標 (文字数かバイト数か) を変えても出力が変わらない等価な分岐を残さないよう、
 /// 常に文字数で切り詰める 1 本の式にしてある。
 pub fn postprocess(stdout: &str) -> Option<String> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.chars().take(ANSWER_MAX_CHARS).collect())
+    crate::llm::trim_capped(stdout, ANSWER_MAX_CHARS)
 }
 
 /// 注釈タブの行に出す問答の見出し。`action` は `find(&qa.kind)` の結果。

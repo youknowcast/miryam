@@ -1187,7 +1187,7 @@ dir = "~/Documents/library"
 "#,
         )
         .expect("読み込めること");
-        assert_eq!(book.reader().expect("[reader] がある").recursive, false);
+        assert!(!book.reader().expect("[reader] がある").recursive);
 
         let Err(err) = PhraseBook::from_toml_str(
             r#"
@@ -1385,24 +1385,6 @@ dir = ""
             "22時。もう22時"
         );
         assert_eq!(substitute_placeholders("そのまま", &now), "そのまま");
-    }
-
-    #[test]
-    fn face_key_is_parsed() {
-        let book = PhraseBook::from_toml_str(
-            r#"
-            [[group]]
-            phrases = ["通常"]
-
-            [[group]]
-            cpu = ["high"]
-            face = "troubled"
-            phrases = ["困り"]
-        "#,
-        )
-        .unwrap();
-        // pick 経由の検証は Task 2。ここではパースが通ることのみ確認する
-        drop(book);
     }
 
     #[test]

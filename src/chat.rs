@@ -155,11 +155,7 @@ pub fn build_mode_prompt(
 /// チャット返答の後処理: 全体 trim → 300 字キャップ → 空なら None。複数行は保持する
 /// (自動発話用 llm::postprocess の「最初の 1 行・60 字」とは別物)
 pub fn postprocess_chat(stdout: &str) -> Option<String> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.chars().take(REPLY_MAX_CHARS).collect())
+    crate::llm::trim_capped(stdout, REPLY_MAX_CHARS)
 }
 
 /// 会話窓モードの選択肢マーカー (行頭)

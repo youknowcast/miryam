@@ -138,10 +138,17 @@ pub fn build_news_prompt(cfg: &NewsConfig, sources: &[(String, String)]) -> Stri
 /// LLM 出力を (吹き出し一言, 本文) に分ける。
 /// 1 行目 (最初の非空行、60 字切詰め) が一言、残りが本文。本文が空なら一言を本文にも使う
 pub fn postprocess_news(stdout: &str) -> Option<(String, String)> {
-    let mut lines = stdout.lines().map(str::trim).skip_while(|l| l.is_empty());
-    let first = lines.next()?;
+    let first = crate::llm::first_nonempty_line(stdout)?;
     let bubble: String = first.chars().take(60).collect();
-    let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    let body = stdout
+        .lines()
+        .map(str::trim)
+        .skip_while(|l| l.is_empty())
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
     if body.is_empty() {
         return Some((bubble, first.to_string()));
     }
