@@ -53,10 +53,10 @@ pub struct ReaderState {
     /// 画面上部の警告バー。保存に失敗したことを黙って握り潰さないために持つ
     warn_bar: Option<gtk::Label>,
     /// `[llm]` が読めない・無ければ None。None なら LLM 操作はメニューに出ない
-    /// (フェーズ 2 の `config::load_colors` と同じ考え方: 辞書の問題で本が読めなくならないこと)
+    /// (`ReaderSettings::load` と同じ考え方: 辞書の問題で本が読めなくならないこと)
     pub llm: Option<crate::llm::LlmConfig>,
     /// `[inkdrop]` が読めない・無ければ None。None なら「Inkdrop に送る」ボタンが出ない
-    /// (load_colors / load_llm と同じ考え方: 辞書の問題で本が読めなくならないこと)
+    /// (`ReaderSettings::load` と同じ考え方: 辞書の問題で本が読めなくならないこと)
     pub inkdrop: Option<crate::inkdrop::InkdropConfig>,
     /// 注釈ごとの「投げてまだ返っていない」件数。1 つの注釈に複数投げられる
     pending: HashMap<String, usize>,
@@ -593,10 +593,9 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("ページがありません");
     }
 
-    let colors = crate::reader::config::load_colors();
-    let llm = crate::reader::config::load_llm();
-    let inkdrop = crate::reader::config::load_inkdrop();
-    let (state, warning) = ReaderState::open(path.clone(), colors, llm, inkdrop)?;
+    let settings = crate::reader::config::ReaderSettings::load();
+    let (state, warning) =
+        ReaderState::open(path.clone(), settings.colors, settings.llm, settings.inkdrop)?;
     let state = Rc::new(RefCell::new(state));
 
     // 窓が閉じたかどうかの共有フラグ。書き出しが GET /books や curl の途中で閉じられた
@@ -767,7 +766,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
         // outline_items は次の行で Sidebar::new に渡す (ムーブ済み)。ここでは clone を使う
         let outline = Rc::new(outline_items.clone());
         let doc_title = doc.title().map(|t| t.to_string());
-        let book_name = crate::reader::config::load_book_name();
+        let book_name = settings.book_name.clone();
         // 実行中は二重に押せないようにする。返ってきたら on_done が解除する
         let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let on_done = {
