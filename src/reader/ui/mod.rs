@@ -653,7 +653,7 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     search_entry.set_width_chars(20);
     toolbar.append(&search_entry);
 
-    let apply_zoom = {
+    let apply_zoom: Rc<dyn Fn(f64)> = {
         let view = view.clone();
         let zoom_label = zoom_label.clone();
         Rc::new(move |z: f64| {
@@ -895,59 +895,8 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     // 実際に描画される内容は追従しない。呼び出しスタックを抜けてから
     // (`changed` の中で `glib::idle_add_local_once` により次の 1 ターン後に) 設定することで
     // GTK 自身の後処理が終わってから安全に反映できる
-    let apply = apply_zoom.clone();
-    let view2 = view.clone();
-    let scrolled2 = scrolled.clone();
     let bookmark = state.borrow().sidecar.bookmark_page;
-    glib::idle_add_local_once(move || {
-        let (w, _) = view2.page_sizes()[0];
-        let viewport_w = scrolled2.width();
-        let scale = geom::fit_width_scale(w, viewport_w as f64);
-        let old_zoom = view2.zoom();
-        apply(scale);
-
-        if bookmark == 0 {
-            return;
-        }
-
-        let will_resize = geom::resize_queued(&view2.page_sizes(), old_zoom, scale);
-        if viewport_w > 0 && !will_resize {
-            schedule_bookmark_scroll(&view2, &scrolled2, bookmark);
-            return;
-        }
-
-        let vadj = scrolled2.vadjustment();
-        // ScrolledWindow (延いては vadjustment) が持つハンドラなので、view/scrolled を強参照で
-        // 掴むと ScrolledWindow → vadjustment → ハンドラ → scrolled の循環になる。弱参照で持つ
-        let view3 = Rc::downgrade(&view2);
-        let scrolled3 = scrolled2.downgrade();
-        let handler: Rc<Cell<Option<glib::SignalHandlerId>>> = Rc::new(Cell::new(None));
-        let handler_for_closure = handler.clone();
-        let id = vadj.connect_changed(move |adj| {
-            // ゲートの結果に関わらず、最初の changed で無条件に disarm する。connect は
-            // apply() の後で行っているので、これが最初の changed であれば「まだレイアウト
-            // 途中」ではなく「これが確定形」。幅合わせの結果ドキュメント全体がビューポートに
-            // 収まる (ページが短い/窓が縦に大きい) 場合はこの先のゲートを一度も通らないが、
-            // それは単にスクロールする先が無いだけで、レイアウトは確定している。ここで
-            // disconnect せずに return すると、ハンドラがセッション中ずっと生き残り、あとで
-            // ユーザーがズームや窓のリサイズで changed を再発火させたときにゲートを通って
-            // しまい、読んでいた場所から古いしおりへ視点を飛ばしてしまう (実際に発生を確認)
-            let Some(id) = handler_for_closure.take() else {
-                return;
-            };
-            adj.disconnect(id);
-
-            // upper が可視領域とほぼ同じ = ドキュメント全体が収まっていてスクロール不要
-            if adj.upper() <= adj.page_size() + 1.0 {
-                return;
-            }
-            let (Some(view), Some(scrolled)) = (view3.upgrade(), scrolled3.upgrade()) else {
-                return;
-            };
-            schedule_bookmark_scroll(&view, &scrolled, bookmark);
-        });
-        handler.set(Some(id));
-    });
+    restore_bookmark(&view, &scrolled, &apply_zoom, bookmark);
 
     // 閉じるときにしおりと最終閲覧日時を書き、マスコットへ読了を知らせる
     {
@@ -998,6 +947,69 @@ fn build_window(app: &gtk::Application, path: &PathBuf) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// 開いた直後に幅合わせ (fit-width) し、しおりのページへ飛ぶ。
+/// レイアウト確定を待つ必要があるため idle + `changed` シグナルで遅延させる
+/// (詳しい理由は build_window のコメント参照)。`bookmark` は 0 始まり。
+fn restore_bookmark(
+    view: &Rc<pages::PageView>,
+    scrolled: &gtk::ScrolledWindow,
+    apply_zoom: &Rc<dyn Fn(f64)>,
+    bookmark: usize,
+) {
+    let apply = apply_zoom.clone();
+    let view2 = view.clone();
+    let scrolled2 = scrolled.clone();
+    glib::idle_add_local_once(move || {
+        let (w, _) = view2.page_sizes()[0];
+        let viewport_w = scrolled2.width();
+        let scale = geom::fit_width_scale(w, viewport_w as f64);
+        let old_zoom = view2.zoom();
+        apply(scale);
+
+        if bookmark == 0 {
+            return;
+        }
+
+        let will_resize = geom::resize_queued(&view2.page_sizes(), old_zoom, scale);
+        if viewport_w > 0 && !will_resize {
+            schedule_bookmark_scroll(&view2, &scrolled2, bookmark);
+            return;
+        }
+
+        let vadj = scrolled2.vadjustment();
+        // ScrolledWindow (延いては vadjustment) が持つハンドラなので、view/scrolled を強参照で
+        // 掴むと ScrolledWindow → vadjustment → ハンドラ → scrolled の循環になる。弱参照で持つ
+        let view3 = Rc::downgrade(&view2);
+        let scrolled3 = scrolled2.downgrade();
+        let handler: Rc<Cell<Option<glib::SignalHandlerId>>> = Rc::new(Cell::new(None));
+        let handler_for_closure = handler.clone();
+        let id = vadj.connect_changed(move |adj| {
+            // ゲートの結果に関わらず、最初の changed で無条件に disarm する。connect は
+            // apply() の後で行っているので、これが最初の changed であれば「まだレイアウト
+            // 途中」ではなく「これが確定形」。幅合わせの結果ドキュメント全体がビューポートに
+            // 収まる (ページが短い/窓が縦に大きい) 場合はこの先のゲートを一度も通らないが、
+            // それは単にスクロールする先が無いだけで、レイアウトは確定している。ここで
+            // disconnect せずに return すると、ハンドラがセッション中ずっと生き残り、あとで
+            // ユーザーがズームや窓のリサイズで changed を再発火させたときにゲートを通って
+            // しまい、読んでいた場所から古いしおりへ視点を飛ばしてしまう (実際に発生を確認)
+            let Some(id) = handler_for_closure.take() else {
+                return;
+            };
+            adj.disconnect(id);
+
+            // upper が可視領域とほぼ同じ = ドキュメント全体が収まっていてスクロール不要
+            if adj.upper() <= adj.page_size() + 1.0 {
+                return;
+            }
+            let (Some(view), Some(scrolled)) = (view3.upgrade(), scrolled3.upgrade()) else {
+                return;
+            };
+            schedule_bookmark_scroll(&view, &scrolled, bookmark);
+        });
+        handler.set(Some(id));
+    });
 }
 
 /// 書き出し先ノートブックの ID を解決して cont に渡す。失敗・名前不一致は cont(None)。
@@ -1110,19 +1122,20 @@ fn run_export(
             };
             let title = crate::reader::export::title_for(doc_title.as_deref(), &name);
             let body = crate::reader::export::compose_body(&digest_body, &highlights_md);
-            let _ = finish_export(
-                &state_for_llm,
-                inkdrop.clone(),
-                book_id.clone(),
-                note_id.clone(),
+            ExportCtx {
+                state: state_for_llm,
+                cfg: inkdrop.clone(),
+                book_id,
+                note_id,
                 title,
                 body,
                 digest_body,
                 remarks,
                 name,
-                closed_for_llm,
+                closed: closed_for_llm,
                 on_done,
-            );
+            }
+            .finish();
         });
         // 単独文 (窓を閉じたら cancel_all_requests でキャンセルされる — run_export の doc 参照)。
         // 識別子はコールバックの先頭で untrack_request に使うため、ここで共有しておく
@@ -1131,11 +1144,10 @@ fn run_export(
     });
 }
 
-/// 5〜6: Inkdrop への作成/更新とサイドカー保存。
-/// 返り値は「成功して保存できた新しい note_id」か None (実用はしない — 通知は内側でやる)
-#[allow(clippy::too_many_arguments)]
-fn finish_export(
-    state: &Rc<RefCell<ReaderState>>,
+/// 5〜6: Inkdrop への作成/更新とサイドカー保存が共有する材料の束。
+/// 位置引数の取り違えを防ぐため、連鎖の各段はこの構造体を受け取る。
+struct ExportCtx {
+    state: Rc<RefCell<ReaderState>>,
     cfg: crate::inkdrop::InkdropConfig,
     book_id: String,
     note_id: Option<String>,
@@ -1146,121 +1158,100 @@ fn finish_export(
     name: String,
     closed: Rc<Cell<bool>>,
     on_done: Rc<dyn Fn()>,
-) -> Option<String> {
-    match note_id {
-        Some(id) => update_note(
-            state, cfg, book_id, id, title, body, digest_body, remarks, name, closed, on_done,
-        ),
-        None => create_note(
-            state, cfg, book_id, title, body, digest_body, remarks, name, closed, on_done,
-        ),
-    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update_note(
-    state: &Rc<RefCell<ReaderState>>,
-    cfg: crate::inkdrop::InkdropConfig,
-    book_id: String,
-    id: String,
-    title: String,
-    body: String,
-    digest_body: String,
-    remarks: Vec<String>,
-    name: String,
-    closed: Rc<Cell<bool>>,
-    on_done: Rc<dyn Fn()>,
-) -> Option<String> {
-    // コールバック (全て 'static) に掴ませるためにここで写し取る。以後の state はこれを使う
-    let state = state.clone();
-    let path = format!("/notes/{id}");
-    // cfg は get_status の呼び出しで借りたまま、コールバック (404 → 新規作成の切り替え) には
-    // ムーブで入れられないので、コールバック用の clone を先に作っておく。path も同じ理由で
-    // PUT の URL 用の clone を取る
-    let cfg_for_rev = cfg.clone();
-    let path_for_put = path.clone();
-    crate::inkdrop::get_status(&cfg, &path, move |res| match res {
-        Ok((200, json)) => {
-            let Some(rev) = crate::reader::export::rev_from(&json) else {
-                export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
-                return;
-            };
-            let payload =
-                crate::reader::export::update_payload(&book_id, &id, &rev, &title, &body);
-            let closed_for_put = closed.clone();
-            crate::inkdrop::request(&cfg_for_rev, "PUT", &path_for_put, Some(payload), move |res| {
-                let ok = res.is_ok();
-                if !ok {
+impl ExportCtx {
+    /// 既存ノートなら更新、無ければ新規作成へ分岐する
+    fn finish(self) {
+        match self.note_id.clone() {
+            Some(id) => self.update(id),
+            None => self.create(),
+        }
+    }
+
+    /// GET /notes/<id> で `_rev` を取って PUT する。404 なら新規作成に切り替える
+    fn update(self, id: String) {
+        // コールバック (全て 'static) に掴ませるためにここで写し取る
+        let state = self.state.clone();
+        let cfg_for_rev = self.cfg.clone();
+        let path = format!("/notes/{id}");
+        let path_for_put = path.clone();
+        let (book_id, title, body) = (self.book_id.clone(), self.title.clone(), self.body.clone());
+        let (digest_body, remarks) = (self.digest_body.clone(), self.remarks.clone());
+        let (name, closed, on_done) =
+            (self.name.clone(), self.closed.clone(), self.on_done.clone());
+        crate::inkdrop::get_status(&self.cfg, &path, move |res| match res {
+            Ok((200, json)) => {
+                let Some(rev) = crate::reader::export::rev_from(&json) else {
                     export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
                     return;
-                }
-                save_digest_and_notify(
-                    &state,
-                    id,
+                };
+                let payload =
+                    crate::reader::export::update_payload(&book_id, &id, &rev, &title, &body);
+                let closed_for_put = closed.clone();
+                let (digest_body, remarks, name, on_done) =
+                    (digest_body.clone(), remarks.clone(), name.clone(), on_done.clone());
+                crate::inkdrop::request(&cfg_for_rev, "PUT", &path_for_put, Some(payload), move |res| {
+                    if res.is_err() {
+                        export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
+                        return;
+                    }
+                    save_digest_and_notify(&state, id, digest_body, remarks, name, closed_for_put, on_done);
+                });
+            }
+            Ok((404, _)) => {
+                // ノートが消えている。新規作成に切り替える (仕様書)
+                ExportCtx {
+                    state,
+                    cfg: cfg_for_rev,
+                    book_id,
+                    note_id: None,
+                    title,
+                    body,
                     digest_body,
                     remarks,
                     name,
-                    closed_for_put,
+                    closed,
                     on_done,
-                );
-            });
-        }
-        Ok((404, _)) => {
-            // ノートが消えている。新規作成に切り替える (仕様書)
-            let _ = create_note(
-                &state,
-                cfg_for_rev,
-                book_id,
-                title,
-                body,
-                digest_body,
-                remarks,
-                name,
-                closed,
-                on_done,
-            );
-        }
-        Ok((status, _)) => {
-            eprintln!("miryam-reader: GET /notes/{id} が {status} を返しました");
-            export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
-        }
-        Err(_) => {
-            export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
-        }
-    });
-    None
-}
-
-#[allow(clippy::too_many_arguments)]
-fn create_note(
-    state: &Rc<RefCell<ReaderState>>,
-    cfg: crate::inkdrop::InkdropConfig,
-    book_id: String,
-    title: String,
-    body: String,
-    digest_body: String,
-    remarks: Vec<String>,
-    name: String,
-    closed: Rc<Cell<bool>>,
-    on_done: Rc<dyn Fn()>,
-) -> Option<String> {
-    let state = state.clone();
-    let payload = crate::reader::export::create_payload(&book_id, &title, &body);
-    crate::inkdrop::request(&cfg, "POST", "/notes", Some(payload), move |res| {
-        let json = match res {
-            Ok(json) => json,
+                }
+                .create();
+            }
+            Ok((status, _)) => {
+                eprintln!("miryam-reader: GET /notes/{id} が {status} を返しました");
+                export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
+            }
             Err(_) => {
                 export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
-                return;
             }
-        };
-        let Some(id) = crate::reader::export::id_from(&json) else {
-            export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
-            return;
-        };
-        save_digest_and_notify(&state, id, digest_body, remarks, name, closed, on_done);
-    });
-    None
+        });
+    }
+
+    /// POST /notes で新規作成し、応答の `_id` を次回用に保存する
+    fn create(self) {
+        let state = self.state.clone();
+        let payload = crate::reader::export::create_payload(&self.book_id, &self.title, &self.body);
+        let (digest_body, remarks, name, closed, on_done) = (
+            self.digest_body.clone(),
+            self.remarks.clone(),
+            self.name.clone(),
+            self.closed.clone(),
+            self.on_done.clone(),
+        );
+        crate::inkdrop::request(&self.cfg, "POST", "/notes", Some(payload), move |res| {
+            let json = match res {
+                Ok(json) => json,
+                Err(_) => {
+                    export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
+                    return;
+                }
+            };
+            let Some(id) = crate::reader::export::id_from(&json) else {
+                export_failed(&name, "を Inkdrop に送れませんでした", &on_done);
+                return;
+            };
+            save_digest_and_notify(&state, id, digest_body, remarks, name, closed, on_done);
+        });
+    }
 }
 
 /// 成功: サイドカーに digest を保存し、保存失敗は警告バーで、成功は吹き出しで知らせる
