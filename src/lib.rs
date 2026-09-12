@@ -3,6 +3,7 @@
 
 pub mod chat;
 pub mod control;
+pub mod curl;
 pub mod inkdrop;
 pub mod links;
 pub mod llm;

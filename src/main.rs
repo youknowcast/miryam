@@ -380,7 +380,7 @@ fn capture_to_inkdrop(ctx: &AppCtx, cache: Rc<RefCell<Option<String>>>, text: St
             Err(ResolveError::Request(err)) => {
                 eprintln!(
                     "miryam: Inkdrop への接続に失敗しました (curl exit {:?}): {}",
-                    err.curl_exit, err.detail
+                    err.exit, err.detail
                 );
                 ctx.external_speak("Inkdrop に届きませんでした");
                 return;
@@ -400,7 +400,7 @@ fn capture_to_inkdrop(ctx: &AppCtx, cache: Rc<RefCell<Option<String>>>, text: St
                 Err(err) => {
                     eprintln!(
                         "miryam: Inkdrop への保存に失敗しました (curl exit {:?}): {}",
-                        err.curl_exit, err.detail
+                        err.exit, err.detail
                     );
                     ctx_c.external_speak("Inkdrop に届きませんでした");
                 }
@@ -461,7 +461,7 @@ fn run_inbox_check(
                 return;
             }
             Err(ResolveError::Request(err)) => {
-                warn_inbox_once(&format!("curl exit {:?}: {}", err.curl_exit, err.detail));
+                warn_inbox_once(&format!("curl exit {:?}: {}", err.exit, err.detail));
                 return;
             }
         };
@@ -926,7 +926,7 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                 Err(ResolveError::Request(err)) => {
                     eprintln!(
                         "miryam: 会話ログの保存に失敗しました (curl exit {:?}): {}",
-                        err.curl_exit, err.detail
+                        err.exit, err.detail
                     );
                     if !ctx_c.core.quitting.get() {
                         ctx_c.core.external_speak("会話ログを Inkdrop に残せませんでした");
@@ -941,7 +941,7 @@ fn save_chat_log(ctx: &ChatCtx, session: chat::ChatSession) -> bool {
                 if let Err(err) = res {
                     eprintln!(
                         "miryam: 会話ログの保存に失敗しました (curl exit {:?}): {}",
-                        err.curl_exit, err.detail
+                        err.exit, err.detail
                     );
                     if !ctx_d.core.quitting.get() {
                         ctx_d.core.external_speak("会話ログを Inkdrop に残せませんでした");

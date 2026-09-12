@@ -91,51 +91,31 @@ pub fn compose_body(digest_body: &str, highlights_md: &str) -> String {
     )
 }
 
-/// POST /notes のボディ (既存 `note_payload` と同じフィールド。reader 用に再公開するのは
-/// 更新ペイロードと対でこのモジュールに揃えるため)
+/// POST /notes のボディ (本体の `inkdrop::note_payload` と同一)
 pub fn create_payload(book_id: &str, title: &str, body: &str) -> String {
-    serde_json::json!({
-        "doctype": "markdown",
-        "bookId": book_id,
-        "status": "none",
-        "share": "private",
-        "title": title,
-        "body": body,
-    })
-    .to_string()
+    crate::inkdrop::note_payload(book_id, title, body)
 }
 
 /// PUT /notes/<id> のボディ。Inkdrop の更新は `_id` と `_rev` が要る (仕様書)
 pub fn update_payload(book_id: &str, id: &str, rev: &str, title: &str, body: &str) -> String {
-    serde_json::json!({
-        "_id": id,
-        "_rev": rev,
-        "doctype": "markdown",
-        "bookId": book_id,
-        "status": "none",
-        "share": "private",
-        "title": title,
-        "body": body,
-    })
-    .to_string()
+    let payload = crate::inkdrop::note_payload(book_id, title, body);
+    let mut v: serde_json::Value =
+        serde_json::from_str(&payload).expect("note_payload は常に有効な JSON");
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("_id".into(), id.into());
+        obj.insert("_rev".into(), rev.into());
+    }
+    v.to_string()
 }
 
 /// GET /notes/<id> の応答から `_rev` を取る。無ければ None (更新を諦めて失敗扱い)
 pub fn rev_from(note_json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(note_json)
-        .ok()?
-        .get("_rev")?
-        .as_str()
-        .map(str::to_string)
+    crate::inkdrop::json_str_field(note_json, "_rev")
 }
 
 /// POST /notes の応答から `_id` を取る (次回の更新に `note_id` として覚える)
 pub fn id_from(note_json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(note_json)
-        .ok()?
-        .get("_id")?
-        .as_str()
-        .map(str::to_string)
+    crate::inkdrop::json_str_field(note_json, "_id")
 }
 
 #[cfg(test)]
